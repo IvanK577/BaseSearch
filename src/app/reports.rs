@@ -27,7 +27,7 @@ pub(super) fn report_hint(lang: Lang) -> &'static str {
             "Короткий підсумок для роботи: головні цифри, компанії, товари, країни і ціни. HTML-звіт можна зберегти як PDF через друк у браузері."
         }
         _ => {
-            "A clean working summary: headline numbers, companies, goods, countries, and prices. The HTML report can be saved as PDF from the browser print dialog."
+            "A clean working summary: headline numbers, companies, goods, countries, and prices. The HTML report can be saved as PDF from the system print dialog."
         }
     }
 }

@@ -63,6 +63,7 @@ pub(super) fn decode_stored_queries(raw: &str) -> Vec<StoredQuery> {
                     origin_country: fields[11].clone(),
                 },
                 advanced: None,
+                record_scope: Default::default(),
             };
             if query.is_empty() {
                 return None;
@@ -180,7 +181,7 @@ fn legacy_query_summary(query: &Query, t: &Tr) -> String {
     {
         parts.push(fmt(t.v2_query_summary, &["Advanced"]));
     }
-    parts.join(" В· ")
+    parts.join(" · ")
 }
 
 #[cfg(test)]
@@ -204,6 +205,7 @@ mod tests {
                 ..Filters::default()
             },
             advanced: None,
+            record_scope: Default::default(),
         };
         let stored = vec![StoredQuery {
             name: "Widget saved".into(),
@@ -229,6 +231,7 @@ mod tests {
                 value: ConditionValue::Single("Widget".into()),
                 negated: true,
             })),
+            record_scope: Default::default(),
         };
         let stored = vec![StoredQuery {
             name: "No Widget suppliers".into(),
@@ -252,6 +255,7 @@ mod tests {
                 ..Filters::default()
             },
             advanced: None,
+            record_scope: Default::default(),
         };
         let legacy = vec![StoredQuery {
             name: "Legacy".into(),

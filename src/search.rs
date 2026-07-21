@@ -2,7 +2,9 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::domain::table::{ColumnRole, ColumnStorage, SourceColumn, TableShape};
+use crate::domain::table::{
+    ColumnRole, ColumnStorage, SemanticField, SourceColumn, SourceSchemaField, TableShape,
+};
 use crate::schema::{RESULT_COLUMNS, header_for};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -94,6 +96,7 @@ impl QueryCondition {
 pub enum FieldRef {
     Column(String),
     Extra(String),
+    SourceField(String),
 }
 
 impl FieldRef {
@@ -101,6 +104,7 @@ impl FieldRef {
         match self {
             FieldRef::Column(name) => name.clone(),
             FieldRef::Extra(header) => format!("extra:{header}"),
+            FieldRef::SourceField(field_id) => field_id.clone(),
         }
     }
 }
@@ -278,6 +282,60 @@ pub fn result_field_catalog_for_shape(
     fields
 }
 
+pub fn field_catalog_for_source_fields(
+    fields: impl IntoIterator<Item = SourceSchemaField>,
+    include_legacy: impl IntoIterator<Item = FieldInfo>,
+) -> Vec<FieldInfo> {
+    let mut catalog = vec![field_info("year", "Year".to_string(), FieldKind::Year)];
+    catalog.extend(result_field_catalog_for_source_fields(
+        fields,
+        include_legacy,
+    ));
+    catalog
+}
+
+pub fn result_field_catalog_for_source_fields(
+    fields: impl IntoIterator<Item = SourceSchemaField>,
+    include_legacy: impl IntoIterator<Item = FieldInfo>,
+) -> Vec<FieldInfo> {
+    // Fold the physical fields into legacy-id compatibility columns first
+    // (the same algorithm as the stored shape), so field ids stay the stable
+    // header-derived ones ("source:value_usd") and repeated columns across
+    // schemas collapse into a single searchable field.
+    let mut columns: Vec<SourceColumn> = Vec::new();
+    for field in fields {
+        let incoming = SourceColumn {
+            id: crate::domain::table::stable_column_id(&field.header, field.source_index),
+            header: field.header.clone(),
+            source_index: field.source_index,
+            role: field.role,
+            semantic: field.semantic,
+            storage: field.storage.clone(),
+        };
+        crate::storage::table_shape::merge_column(&mut columns, &incoming);
+    }
+    let mut catalog = columns
+        .iter()
+        .map(source_column_field_info)
+        .collect::<Vec<_>>();
+    for field in include_legacy {
+        if !catalog.iter().any(|existing| existing.id == field.id) {
+            catalog.push(field);
+        }
+    }
+    if !catalog
+        .iter()
+        .any(|field| matches!(&field.source, FieldRef::Column(name) if name == "source_file"))
+    {
+        catalog.push(field_info(
+            "source_file",
+            header_for("source_file").to_string(),
+            field_kind_for_column("source_file"),
+        ));
+    }
+    catalog
+}
+
 pub fn default_field_catalog() -> Vec<FieldInfo> {
     field_catalog(Vec::<String>::new())
 }
@@ -449,10 +507,97 @@ fn source_column_field_info(column: &SourceColumn) -> FieldInfo {
     }
 }
 
+/// Schema-exact result fields for a query that addresses registered source
+/// fields directly: one entry per physical field, ids are the stable
+/// `field_id`s, and values resolve scoped to the owning schema. Used when a
+/// query pins specific schemas, where the folded compatibility catalog would
+/// blur same-named columns of unrelated files together.
+pub fn schema_exact_field_infos(fields: &[SourceSchemaField]) -> Vec<FieldInfo> {
+    let mut catalog: Vec<FieldInfo> = fields
+        .iter()
+        .map(|field| {
+            let kind = field_kind_for_source_schema_field(field);
+            FieldInfo {
+                id: field.field_id.clone(),
+                label: field.header.clone(),
+                kind,
+                source: FieldRef::SourceField(field.field_id.clone()),
+                operators: operators_for_kind(kind).to_vec(),
+            }
+        })
+        .collect();
+    catalog.push(field_info(
+        "source_file",
+        header_for("source_file").to_string(),
+        field_kind_for_column("source_file"),
+    ));
+    catalog
+}
+
+/// Every source-field id referenced anywhere in a query expression.
+pub fn source_field_ids(expr: &QueryExpr) -> Vec<String> {
+    let mut ids = Vec::new();
+    collect_source_field_ids(expr, &mut ids);
+    ids
+}
+
+fn collect_source_field_ids(expr: &QueryExpr, ids: &mut Vec<String>) {
+    match expr {
+        QueryExpr::Group(group) => {
+            for child in &group.children {
+                collect_source_field_ids(child, ids);
+            }
+        }
+        QueryExpr::Condition(condition) => {
+            if let FieldRef::SourceField(field_id) = &condition.field
+                && !ids.contains(field_id)
+            {
+                ids.push(field_id.clone());
+            }
+        }
+    }
+}
+
+pub fn field_kind_for_source_schema_field(field: &SourceSchemaField) -> FieldKind {
+    if let Some(semantic) = field.semantic {
+        return field_kind_for_semantic(semantic);
+    }
+    match &field.storage {
+        ColumnStorage::SchemaColumn(name) => field_kind_for_column(name),
+        ColumnStorage::SourceJson => field_kind_for_role(field.role),
+    }
+}
+
 fn field_kind_for_source_column(column: &SourceColumn) -> FieldKind {
+    if let Some(semantic) = column.semantic {
+        return field_kind_for_semantic(semantic);
+    }
     match &column.storage {
         ColumnStorage::SchemaColumn(name) => field_kind_for_column(name),
         ColumnStorage::SourceJson => field_kind_for_role(column.role),
+    }
+}
+
+fn field_kind_for_semantic(semantic: SemanticField) -> FieldKind {
+    match semantic {
+        SemanticField::Date => FieldKind::Date,
+        SemanticField::DeclarationNumber
+        | SemanticField::CompanyCode
+        | SemanticField::ProductCode
+        | SemanticField::Currency
+        | SemanticField::WeightUnit => FieldKind::Code,
+        SemanticField::Country
+        | SemanticField::OriginCountry
+        | SemanticField::DispatchCountry
+        | SemanticField::TradeCountry => FieldKind::Country,
+        SemanticField::Quantity
+        | SemanticField::NetWeight
+        | SemanticField::GrossWeight
+        | SemanticField::Value => FieldKind::Number,
+        SemanticField::Sender
+        | SemanticField::Recipient
+        | SemanticField::Description
+        | SemanticField::Trademark => FieldKind::Text,
     }
 }
 
@@ -469,6 +614,12 @@ fn field_kind_for_role(role: ColumnRole) -> FieldKind {
 
 fn infer_extra_field_kind(header: &str) -> FieldKind {
     let lower = header.to_lowercase();
+    if lower == "year" || lower.contains("year") || lower.contains("rik") || lower.contains("god") {
+        return FieldKind::Year;
+    }
+    if lower.contains("sum") || lower.contains("total") || lower.contains("suma") {
+        return FieldKind::Number;
+    }
     if lower.contains("date") || lower.contains("дата") {
         FieldKind::Date
     } else if lower.contains("country") || lower.contains("кра") || lower.contains("стра") {

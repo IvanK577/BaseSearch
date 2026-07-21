@@ -12,6 +12,7 @@ pub(super) fn start_search(app: &mut App, reset_page: bool) {
         text: app.query_text.clone(),
         filters: app.filters.clone(),
         advanced: app.advanced_query.clone(),
+        record_scope: Default::default(),
     };
     let query_to_remember = app.active_query.clone();
     if reset_page {

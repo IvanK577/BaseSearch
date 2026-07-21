@@ -1,12 +1,16 @@
 use rusqlite::{Connection, params_from_iter};
 
-use crate::db::{DynamicSearchPage, Query, RecordCard, SearchPage};
+use crate::db::{DynamicSearchPage, Query, RecordCard, ResultSort, SearchPage};
 use crate::schema::{COLUMNS, RESULT_COLUMNS};
-use crate::search::FieldInfo;
+use crate::search::{FieldInfo, FieldKind};
+use crate::storage::derived;
+use crate::storage::effective_rows;
 use crate::storage::extra::parse_extra;
 use crate::storage::query_plan::FilterPlan;
 use crate::storage::search_text::product_code_search_prefix;
 use crate::storage::source_fields;
+use crate::storage::source_fields::ResolvedRef;
+use crate::storage::source_schemas::SourceFieldLookup;
 
 pub(crate) fn count(conn: &Connection, plan: FilterPlan) -> rusqlite::Result<u64> {
     let sql = format!(
@@ -24,8 +28,12 @@ pub(crate) fn legacy_search_page(
     limit: u64,
     offset: u64,
 ) -> rusqlite::Result<SearchPage> {
-    let select: Vec<String> = RESULT_COLUMNS.iter().map(|c| format!("r.{c}")).collect();
-    let order = result_order(q);
+    let payload_alias = plan.payload_alias;
+    let select: Vec<String> = RESULT_COLUMNS
+        .iter()
+        .map(|column| effective_rows::result_column(payload_alias, column))
+        .collect();
+    let order = result_order(q, payload_alias);
     let sql = format!(
         "SELECT r.id, {select}, r.dup_first_file FROM records r{joins}{where_sql} ORDER BY {order} LIMIT ? OFFSET ?",
         select = select.join(", "),
@@ -58,9 +66,14 @@ pub(crate) fn dynamic_search_page(
     plan: FilterPlan,
     limit: u64,
     offset: u64,
+    sort: Option<&ResultSort>,
+    lookup: &SourceFieldLookup,
 ) -> rusqlite::Result<DynamicSearchPage> {
-    let field_select = source_fields::select_for_fields(&fields, "r");
-    let order = result_order(q);
+    let payload_alias = plan.payload_alias;
+    let field_select = source_fields::select_for_fields(&fields, payload_alias, lookup);
+    let order = sort
+        .and_then(|sort| sort_order_sql(&fields, sort, payload_alias, lookup))
+        .unwrap_or_else(|| result_order(q, payload_alias));
     let sql = format!(
         "SELECT r.id, {select}, r.dup_first_file FROM records r{joins}{where_sql} ORDER BY {order} LIMIT ? OFFSET ?",
         select = field_select.expressions.join(", "),
@@ -94,7 +107,11 @@ pub(crate) fn legacy_export_batch(
     last_id: i64,
     limit: u64,
 ) -> rusqlite::Result<(i64, Vec<Vec<String>>)> {
-    let select: Vec<String> = COLUMNS.iter().map(|c| format!("r.{}", c.name)).collect();
+    let payload_alias = plan.payload_alias;
+    let select: Vec<String> = COLUMNS
+        .iter()
+        .map(|column| effective_rows::payload_column(payload_alias, column.name))
+        .collect();
     let cond = keyset_condition_prefix(&plan.where_sql);
     let sql = format!(
         "SELECT r.id, {select}, r.source_file FROM records r{joins}{where_sql}{cond} r.id > ? ORDER BY r.id LIMIT ?",
@@ -125,8 +142,9 @@ pub(crate) fn export_batch_fields(
     plan: FilterPlan,
     last_id: i64,
     limit: u64,
+    lookup: &SourceFieldLookup,
 ) -> rusqlite::Result<(i64, Vec<Vec<String>>)> {
-    let field_select = source_fields::select_for_fields(fields, "r");
+    let field_select = source_fields::select_for_fields(fields, plan.payload_alias, lookup);
     let cond = keyset_condition_prefix(&plan.where_sql);
     let sql = format!(
         "SELECT r.id, {select} FROM records r{joins}{where_sql}{cond} r.id > ? ORDER BY r.id LIMIT ?",
@@ -153,19 +171,61 @@ pub(crate) fn export_batch_fields(
     Ok((max_id, data))
 }
 
+pub(crate) fn visit_export_rows_fields(
+    conn: &Connection,
+    q: &Query,
+    fields: &[FieldInfo],
+    sort_catalog: &[FieldInfo],
+    plan: FilterPlan,
+    sort: Option<&ResultSort>,
+    mut visit: impl FnMut(Vec<String>) -> bool,
+    lookup: &SourceFieldLookup,
+) -> rusqlite::Result<u64> {
+    let payload_alias = plan.payload_alias;
+    let field_select = source_fields::select_for_fields(fields, payload_alias, lookup);
+    let order = sort
+        .and_then(|sort| sort_order_sql(sort_catalog, sort, payload_alias, lookup))
+        .unwrap_or_else(|| result_order(q, payload_alias));
+    let sql = format!(
+        "SELECT {select} FROM records r{joins}{where_sql} ORDER BY {order}",
+        select = field_select.expressions.join(", "),
+        joins = plan.joins,
+        where_sql = plan.where_sql,
+    );
+    let mut final_params = field_select.params;
+    final_params.extend(plan.params);
+    let mut statement = conn.prepare(&sql)?;
+    let mut rows = statement.query(params_from_iter(final_params))?;
+    let mut visited = 0_u64;
+    while let Some(row) = rows.next()? {
+        let mut values = Vec::with_capacity(fields.len());
+        for index in 0..fields.len() {
+            values.push(row.get::<_, Option<String>>(index)?.unwrap_or_default());
+        }
+        if !visit(values) {
+            break;
+        }
+        visited += 1;
+    }
+    Ok(visited)
+}
+
 pub(crate) fn record_card(
     conn: &Connection,
     fields: Vec<FieldInfo>,
     id: i64,
+    lookup: &SourceFieldLookup,
 ) -> rusqlite::Result<RecordCard> {
     let card_fields: Vec<FieldInfo> = fields
         .into_iter()
         .filter(|field| !source_fields::is_source_file_field(field))
         .collect();
-    let field_select = source_fields::select_for_fields(&card_fields, "r");
+    let field_select =
+        source_fields::select_for_fields(&card_fields, effective_rows::PAYLOAD_ALIAS, lookup);
     let sql = format!(
-        "SELECT {}, r.source_file FROM records r WHERE r.id = ?",
-        field_select.expressions.join(", ")
+        "SELECT {}, r.source_file FROM records r{} WHERE r.id = ?",
+        field_select.expressions.join(", "),
+        effective_rows::payload_join()
     );
     let mut params = field_select.params;
     params.push(id.into());
@@ -187,10 +247,14 @@ pub(crate) fn record_card(
 }
 
 pub(crate) fn legacy_record_card(conn: &Connection, id: i64) -> rusqlite::Result<RecordCard> {
-    let select: Vec<String> = COLUMNS.iter().map(|c| c.name.to_string()).collect();
+    let select: Vec<String> = COLUMNS
+        .iter()
+        .map(|column| effective_rows::payload_column(effective_rows::PAYLOAD_ALIAS, column.name))
+        .collect();
     let sql = format!(
-        "SELECT {}, source_file, extra FROM records WHERE id = ?1",
-        select.join(", ")
+        "SELECT {}, r.source_file, p.extra FROM records r{} WHERE r.id = ?1",
+        select.join(", "),
+        effective_rows::payload_join()
     );
     conn.query_row(&sql, [id], |row| {
         let mut fields = Vec::with_capacity(COLUMNS.len());
@@ -218,11 +282,74 @@ fn keyset_condition_prefix(where_sql: &str) -> &'static str {
     }
 }
 
-fn result_order(q: &Query) -> &'static str {
+/// Builds an `ORDER BY` expression for a user-chosen result column, or `None`
+/// when the field id is unknown. Numeric and year columns sort on their
+/// materialized/typed value so "1 250" outranks "999"; ISO dates sort as text
+/// (which is chronological); everything else sorts case-insensitively. A stable
+/// `r.id` tiebreaker keeps paging deterministic.
+pub(crate) fn sort_order_sql(
+    fields: &[FieldInfo],
+    sort: &ResultSort,
+    payload_alias: &str,
+    lookup: &SourceFieldLookup,
+) -> Option<String> {
+    let field = fields.iter().find(|field| field.id == sort.field)?;
+    // Source-schema fields sort exactly like the column or extra header that
+    // physically stores them, scoped to their schema's rows.
+    let resolved = source_fields::resolve_ref(&field.source, lookup);
+    let base = match &resolved {
+        ResolvedRef::Column { name, schema_id } => source_fields::schema_guard(
+            effective_rows::result_column(payload_alias, name),
+            payload_alias,
+            *schema_id,
+        ),
+        ResolvedRef::Extra { header, schema_id } => source_fields::schema_guard(
+            format!(
+                "extra_value({payload_alias}.extra, '{}')",
+                header.replace('\'', "''")
+            ),
+            payload_alias,
+            *schema_id,
+        ),
+    };
+    let expr = match field.kind {
+        FieldKind::Number | FieldKind::Year => numeric_sort_expr(&resolved, &base, payload_alias),
+        // Dates are stored normalized to ISO "YYYY-MM-DD", which sorts
+        // chronologically as text.
+        FieldKind::Date => base,
+        FieldKind::Text | FieldKind::Code | FieldKind::Country => {
+            format!("{base} COLLATE NOCASE")
+        }
+    };
+    let direction = if sort.descending { "DESC" } else { "ASC" };
+    Some(format!("{expr} {direction}, r.id DESC"))
+}
+
+fn numeric_sort_expr(source: &ResolvedRef, base: &str, payload_alias: &str) -> String {
+    match source {
+        ResolvedRef::Column { name, schema_id } => {
+            if let Some(column) = derived::num_column_for(name) {
+                // Exact materialized numeric value (same one analytics sums).
+                source_fields::schema_guard(
+                    format!("{payload_alias}.{column}"),
+                    payload_alias,
+                    *schema_id,
+                )
+            } else if name == "year" {
+                format!("{payload_alias}.year")
+            } else {
+                format!("num_value_grouped({base})")
+            }
+        }
+        ResolvedRef::Extra { .. } => format!("num_value_grouped({base})"),
+    }
+}
+
+fn result_order(q: &Query, payload_alias: &str) -> String {
     if uses_fast_result_order(q) {
-        "r.id DESC"
+        "r.id DESC".to_string()
     } else {
-        "r.declaration_date DESC, r.id DESC"
+        format!("{payload_alias}.declaration_date DESC, r.id DESC")
     }
 }
 
@@ -250,7 +377,93 @@ fn uses_fast_result_order(q: &Query) -> bool {
 #[cfg(test)]
 mod tests {
     use super::uses_fast_result_order;
-    use crate::db::{Filters, Query};
+    use crate::db::{Filters, Query, ResultSort};
+    use crate::search::{FieldInfo, FieldKind, FieldRef};
+
+    /// Test shim: these fields never resolve through a source-schema lookup.
+    fn sort_order_sql(fields: &[FieldInfo], sort: &ResultSort, alias: &str) -> Option<String> {
+        super::sort_order_sql(fields, sort, alias, &Default::default())
+    }
+
+    fn field(id: &str, kind: FieldKind, source: FieldRef) -> FieldInfo {
+        FieldInfo {
+            id: id.to_string(),
+            label: id.to_string(),
+            kind,
+            source,
+            operators: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn sort_order_uses_typed_expressions_per_field_kind() {
+        let fields = [
+            field(
+                "currency_control_value",
+                FieldKind::Number,
+                FieldRef::Column("currency_control_value".to_string()),
+            ),
+            field(
+                "recipient",
+                FieldKind::Text,
+                FieldRef::Column("recipient".to_string()),
+            ),
+            field(
+                "extra:Price",
+                FieldKind::Number,
+                FieldRef::Extra("Price".to_string()),
+            ),
+        ];
+
+        // A materialized numeric column is sorted by its typed value, not text.
+        assert_eq!(
+            sort_order_sql(
+                &fields,
+                &ResultSort {
+                    field: "currency_control_value".to_string(),
+                    descending: true,
+                },
+                "r",
+            ),
+            Some("r.value_num DESC, r.id DESC".to_string())
+        );
+        // Text sorts case-insensitively.
+        assert_eq!(
+            sort_order_sql(
+                &fields,
+                &ResultSort {
+                    field: "recipient".to_string(),
+                    descending: false,
+                },
+                "r",
+            ),
+            Some("r.recipient COLLATE NOCASE ASC, r.id DESC".to_string())
+        );
+        // Extra numeric columns parse localized numbers for ordering.
+        assert_eq!(
+            sort_order_sql(
+                &fields,
+                &ResultSort {
+                    field: "extra:Price".to_string(),
+                    descending: true,
+                },
+                "r",
+            ),
+            Some("num_value_grouped(extra_value(r.extra, 'Price')) DESC, r.id DESC".to_string())
+        );
+        // An unknown field falls back to the default order.
+        assert_eq!(
+            sort_order_sql(
+                &fields,
+                &ResultSort {
+                    field: "nope".to_string(),
+                    descending: false,
+                },
+                "r",
+            ),
+            None
+        );
+    }
 
     #[test]
     fn fast_order_is_only_used_for_structural_queries() {

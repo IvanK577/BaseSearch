@@ -19,10 +19,11 @@ pub enum ColumnRole {
 
 /// Optional semantic meaning attached by a profile.
 ///
-/// A public Base Search import must work without any semantic field. Profiles
-/// can add these hints for better analytics, but the raw columns remain the
-/// source of truth.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+/// A public Base Search import must preserve every source column even when no
+/// semantic field is known. Conservative header inference and profiles can add
+/// these hints for better analytics, but the raw columns remain the source of
+/// truth.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum SemanticField {
     Date,
     DeclarationNumber,
@@ -40,6 +41,8 @@ pub enum SemanticField {
     NetWeight,
     GrossWeight,
     Value,
+    Currency,
+    WeightUnit,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -65,6 +68,49 @@ pub struct TableShape {
     pub columns: Vec<SourceColumn>,
 }
 
+/// Durable identity and storage contract for one column in one source schema.
+///
+/// `field_id` is safe to expose in saved queries. It is never used as a SQL
+/// identifier; canonical storage names are validated against the built-in
+/// schema before SQL is generated.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SourceSchemaField {
+    pub field_id: String,
+    pub schema_id: i64,
+    pub source_index: usize,
+    pub raw_header: String,
+    pub header: String,
+    pub normalized_header: String,
+    pub role: ColumnRole,
+    pub semantic: Option<SemanticField>,
+    pub storage: ColumnStorage,
+}
+
+/// One stable interpretation of an ordered source table.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SourceSchema {
+    pub id: i64,
+    pub public_id: String,
+    pub fingerprint: String,
+    pub fingerprint_version: u32,
+    pub fixed_currency: Option<String>,
+    pub fixed_weight_unit: Option<String>,
+    pub columns: Vec<SourceSchemaField>,
+}
+
+/// Provenance for one successfully imported file sheet or delimited table.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImportSource {
+    pub id: i64,
+    pub public_id: String,
+    pub schema_id: i64,
+    pub schema_public_id: String,
+    pub source_file: String,
+    pub table_name: String,
+    pub import_fingerprint: String,
+    pub imported_at: String,
+}
+
 impl TableShape {
     pub fn from_headers(headers: impl IntoIterator<Item = String>) -> Self {
         let mut seen = std::collections::HashMap::<String, usize>::new();
@@ -72,22 +118,24 @@ impl TableShape {
             .into_iter()
             .enumerate()
             .map(|(source_index, header)| {
-                let header = normalize_header_for_display(&header, source_index);
+                let mut header = normalize_header_for_display(&header, source_index);
                 let base_id = stable_column_id(&header, source_index);
                 let count = seen.entry(base_id.clone()).or_insert(0);
                 let id = if *count == 0 {
                     base_id
                 } else {
+                    header = format!("{header} ({})", *count + 1);
                     format!("{base_id}_{}", *count + 1)
                 };
                 *count += 1;
                 let role = infer_role(&header);
+                let semantic = infer_semantic(&id, role);
                 SourceColumn {
                     id,
                     header,
                     source_index,
                     role,
-                    semantic: None,
+                    semantic,
                     storage: ColumnStorage::SourceJson,
                 }
             })
@@ -120,7 +168,10 @@ fn normalize_header_for_display(header: &str, source_index: usize) -> String {
     }
 }
 
-fn stable_column_id(header: &str, source_index: usize) -> String {
+/// Historical header-based column id ("Value USD" -> "value_usd"). The source
+/// schema registry reuses this exact algorithm so its compatibility shape keeps
+/// the ids the rest of the app (and saved semantics) were built around.
+pub(crate) fn stable_column_id(header: &str, source_index: usize) -> String {
     let mut out = String::new();
     let mut last_sep = false;
     for ch in header.chars().flat_map(char::to_lowercase) {
@@ -172,9 +223,77 @@ fn infer_role(header: &str) -> ColumnRole {
     }
 }
 
+fn infer_semantic(id: &str, role: ColumnRole) -> Option<SemanticField> {
+    match id {
+        "date" | "order_date" | "document_date" | "declaration_date" | "clearance_date" => {
+            Some(SemanticField::Date)
+        }
+        "declaration" | "declaration_no" | "declaration_number" | "declaration_id" | "invoice"
+        | "invoice_no" | "invoice_number" | "document_no" | "document_number" => {
+            Some(SemanticField::DeclarationNumber)
+        }
+        "sender" | "sender_name" | "supplier" | "supplier_name" | "exporter" | "exporter_name"
+        | "shipper" | "shipper_name" | "seller" | "seller_name" => Some(SemanticField::Sender),
+        "recipient" | "recipient_name" | "receiver" | "receiver_name" | "buyer" | "buyer_name"
+        | "customer" | "customer_name" | "importer" | "importer_name" | "consignee"
+        | "consignee_name" => Some(SemanticField::Recipient),
+        "edrpou" | "company_code" | "company_id" | "recipient_code" | "recipient_id"
+        | "buyer_code" | "buyer_id" | "importer_code" | "importer_id" => {
+            Some(SemanticField::CompanyCode)
+        }
+        "product_code" | "goods_code" | "commodity_code" | "item_code" | "sku" | "hs_code"
+        | "hscode" | "hs" | "uktzed" | "ukt_zed" | "uktzed_code" | "tnved" | "tnved_code" => {
+            Some(SemanticField::ProductCode)
+        }
+        "description"
+        | "product_description"
+        | "goods_description"
+        | "item_description"
+        | "commodity_description"
+        | "product_name"
+        | "goods_name"
+        | "item_name" => Some(SemanticField::Description),
+        "trademark" | "trade_mark" | "brand" | "brand_name" | "mark" | "manufacturer_brand" => {
+            Some(SemanticField::Trademark)
+        }
+        "country" => Some(SemanticField::Country),
+        "origin" | "origin_country" | "country_origin" | "country_of_origin" => {
+            Some(SemanticField::OriginCountry)
+        }
+        "dispatch_country"
+        | "country_dispatch"
+        | "country_of_dispatch"
+        | "ship_from"
+        | "shipping_country"
+        | "departure_country"
+        | "source_country" => Some(SemanticField::DispatchCountry),
+        "trade_country" | "trading_country" | "country_of_trade" | "seller_country" => {
+            Some(SemanticField::TradeCountry)
+        }
+        "quantity" | "qty" | "count" | "units" | "unit_count" => Some(SemanticField::Quantity),
+        "net_kg" | "net_weight" | "net_weight_kg" | "weight_net" | "weight_net_kg" => {
+            Some(SemanticField::NetWeight)
+        }
+        "gross_kg" | "gross_weight" | "gross_weight_kg" | "weight_gross" | "weight_gross_kg" => {
+            Some(SemanticField::GrossWeight)
+        }
+        "value" | "value_usd" | "amount" | "amount_usd" | "total_value" | "total_value_usd"
+        | "invoice_value" | "invoice_value_usd" | "customs_value" | "customs_value_usd" => {
+            Some(SemanticField::Value)
+        }
+        "currency" | "currency_code" | "value_currency" | "amount_currency" | "ccy"
+        | "iso_currency" => Some(SemanticField::Currency),
+        "weight_unit" | "net_weight_unit" | "mass_unit" | "weight_uom" | "mass_uom" => {
+            Some(SemanticField::WeightUnit)
+        }
+        _ if role == ColumnRole::Year => Some(SemanticField::Date),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{ColumnRole, TableShape};
+    use super::{ColumnRole, SemanticField, TableShape};
 
     #[test]
     fn table_shape_keeps_every_source_column_first_class() {
@@ -192,5 +311,30 @@ mod tests {
         assert_eq!(shape.columns[2].role, ColumnRole::Country);
         assert_eq!(shape.columns[3].id, "sku_2");
         assert_eq!(shape.columns[4].header, "Column 5");
+    }
+
+    #[test]
+    fn common_business_headers_get_conservative_semantics() {
+        let shape = TableShape::from_headers([
+            "Brand".to_string(),
+            "Recipient".to_string(),
+            "Product code".to_string(),
+            "Value USD".to_string(),
+            "Net kg".to_string(),
+        ]);
+
+        let semantics = shape
+            .columns
+            .iter()
+            .map(|column| (column.id.as_str(), column.semantic))
+            .collect::<Vec<_>>();
+        assert_eq!(semantics[0], ("brand", Some(SemanticField::Trademark)));
+        assert_eq!(semantics[1], ("recipient", Some(SemanticField::Recipient)));
+        assert_eq!(
+            semantics[2],
+            ("product_code", Some(SemanticField::ProductCode))
+        );
+        assert_eq!(semantics[3], ("value_usd", Some(SemanticField::Value)));
+        assert_eq!(semantics[4], ("net_kg", Some(SemanticField::NetWeight)));
     }
 }

@@ -4,16 +4,27 @@ use crate::search::{FieldInfo, QueryExpr};
 
 /// Filter values; an empty string means the filter is not set.
 #[derive(Default, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Filters {
+    #[serde(default)]
     pub year: String,
+    #[serde(default)]
     pub product_code: String,
+    #[serde(default)]
     pub trademark: String,
+    #[serde(default)]
     pub description: String,
+    #[serde(default)]
     pub sender: String,
+    #[serde(default)]
     pub recipient: String,
+    #[serde(default)]
     pub edrpou: String,
+    #[serde(default)]
     pub trade_country: String,
+    #[serde(default)]
     pub dispatch_country: String,
+    #[serde(default)]
     pub origin_country: String,
 }
 
@@ -40,12 +51,24 @@ impl Filters {
     }
 }
 
+#[derive(Default, Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecordScope {
+    #[default]
+    Canonical,
+    Occurrences,
+}
+
 #[derive(Default, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Query {
+    #[serde(default)]
     pub text: String,
+    #[serde(default)]
     pub filters: Filters,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub advanced: Option<QueryExpr>,
+    #[serde(default)]
+    pub record_scope: RecordScope,
 }
 
 impl Query {
@@ -64,6 +87,59 @@ pub struct ImportRecord {
     /// Source columns not stored in compatibility schema fields. JSON array of
     /// [header, value] pairs.
     pub extra: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FtsRepairIssue {
+    MissingIndex,
+    VersionStale,
+    IntegrityCheckFailed,
+    ContentMismatch,
+    WatermarkMismatch,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FtsRepairReport {
+    pub rebuilt: bool,
+    pub cancelled: bool,
+    pub indexed_rows: u64,
+    pub watermark: i64,
+    pub schema_version: String,
+    pub issues: Vec<FtsRepairIssue>,
+}
+
+#[derive(Debug)]
+pub enum FtsRepairError {
+    Database(rusqlite::Error),
+    SourceChanged,
+    Validation(String),
+}
+
+impl std::fmt::Display for FtsRepairError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Database(error) => write!(formatter, "{error}"),
+            Self::SourceChanged => {
+                formatter.write_str("records changed during FTS rebuild; the live index was kept")
+            }
+            Self::Validation(message) => formatter.write_str(message),
+        }
+    }
+}
+
+impl std::error::Error for FtsRepairError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Database(error) => Some(error),
+            Self::SourceChanged | Self::Validation(_) => None,
+        }
+    }
+}
+
+impl From<rusqlite::Error> for FtsRepairError {
+    fn from(error: rusqlite::Error) -> Self {
+        Self::Database(error)
+    }
 }
 
 pub struct RecordCard {
@@ -131,7 +207,105 @@ pub struct ImportLogWrite<'a> {
     pub quality: &'a ImportQuality,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct AnalyticsCurrencyTotal {
+    /// Normalized ISO-like currency code, or `unknown` when the source value is
+    /// missing or cannot be interpreted safely.
+    pub currency: String,
+    pub known: bool,
+    pub valued_rows: u64,
+    pub total_value: f64,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct AnalyticsWeightTotal {
+    /// Normalized source unit (`kg`, `g`, `tonne`, `lb`) or the preserved
+    /// unknown source label.
+    pub source_unit: String,
+    pub known: bool,
+    pub normalized_unit: Option<String>,
+    pub factor_to_kg: Option<f64>,
+    pub weighted_rows: u64,
+    pub total_source_weight: f64,
+    pub total_kg: Option<f64>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct AnalyticsValuePerWeight {
+    pub currency: String,
+    pub normalized_weight_unit: String,
+    pub source_weight_units: Vec<String>,
+    pub paired_rows: u64,
+    pub total_value: f64,
+    pub total_weight: f64,
+    pub value_per_weight: Option<f64>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AnalyticsMeasureExclusions {
+    pub value_without_known_currency: u64,
+    pub net_weight_without_known_unit: u64,
+    pub gross_weight_without_known_unit: u64,
+    pub ratio_without_known_currency: u64,
+    pub ratio_without_known_weight_unit: u64,
+    pub ratio_with_zero_or_missing_weight: u64,
+}
+
+/// Currency- and unit-safe measures shared by overview, group, and monthly
+/// analytics. Money is never added across currency buckets. Recognized mass
+/// units are normalized to kilograms; unknown units remain explicit buckets.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct AnalyticsMeasures {
+    pub currency_totals: Vec<AnalyticsCurrencyTotal>,
+    pub net_weight_totals: Vec<AnalyticsWeightTotal>,
+    pub gross_weight_totals: Vec<AnalyticsWeightTotal>,
+    pub value_per_net_weight: Vec<AnalyticsValuePerWeight>,
+    pub compatible_value_total: Option<AnalyticsCurrencyTotal>,
+    pub compatible_value_per_net_weight: Option<AnalyticsValuePerWeight>,
+    pub exclusions: AnalyticsMeasureExclusions,
+}
+
+impl AnalyticsMeasures {
+    pub fn total_net_kg(&self) -> f64 {
+        self.net_weight_totals
+            .iter()
+            .filter_map(|total| total.total_kg)
+            .sum()
+    }
+
+    pub fn total_gross_kg(&self) -> f64 {
+        self.gross_weight_totals
+            .iter()
+            .filter_map(|total| total.total_kg)
+            .sum()
+    }
+
+    pub fn compatible_usd_total(&self) -> Option<f64> {
+        self.compatible_value_total
+            .as_ref()
+            .filter(|total| total.known && total.currency == "USD")
+            .map(|total| total.total_value)
+    }
+
+    pub fn compatible_usd_per_net_kg(&self) -> Option<f64> {
+        self.compatible_value_per_net_weight
+            .as_ref()
+            .filter(|metric| metric.currency == "USD")
+            .and_then(|metric| metric.value_per_weight)
+    }
+}
+
+/// Wire-compatible USD fields. This object is flattened only when the query
+/// has one known USD currency cohort. The old scalar names are intentionally
+/// absent for EUR, mixed-currency, and unknown-currency results.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct AnalyticsUsdCompatibility {
+    pub total_value_usd: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub avg_value_per_net_kg: Option<f64>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct AnalyticsOverview {
     pub row_count: u64,
     pub declaration_count: u64,
@@ -143,14 +317,24 @@ pub struct AnalyticsOverview {
     pub distinct_origin_countries: u64,
     pub distinct_dispatch_countries: u64,
     pub distinct_trade_countries: u64,
+    /// Deprecated in-memory compatibility value for the legacy desktop UI.
+    /// It is not serialized; use `measures.currency_totals` instead.
+    #[serde(skip)]
     pub total_value_usd: f64,
+    #[serde(flatten, skip_serializing_if = "Option::is_none")]
+    pub compatible_usd: Option<AnalyticsUsdCompatibility>,
     pub total_gross_kg: f64,
     pub total_net_kg: f64,
     pub total_quantity: f64,
+    /// Deprecated in-memory compatibility value for the legacy desktop UI.
+    /// It is not serialized; use `measures.value_per_net_weight` instead.
+    #[serde(skip)]
     pub avg_value_per_net_kg: f64,
+    pub measures: AnalyticsMeasures,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum AnalyticsFilterField {
     Recipient,
     Sender,
@@ -163,28 +347,34 @@ pub enum AnalyticsFilterField {
     Description,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AnalyticsFilterAction {
     pub field: AnalyticsFilterField,
     pub value: String,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct AnalyticsGroupRow {
     pub label: String,
     pub rows: u64,
     pub declarations: u64,
     pub companies: u64,
+    #[serde(skip)]
     pub total_value_usd: f64,
+    #[serde(flatten, skip_serializing_if = "Option::is_none")]
+    pub compatible_usd: Option<AnalyticsUsdCompatibility>,
     pub total_net_kg: f64,
     pub total_gross_kg: f64,
     pub total_quantity: f64,
     pub share_percent: f64,
+    #[serde(skip)]
     pub avg_value_per_net_kg: f64,
+    pub measures: AnalyticsMeasures,
     pub filter_action: Option<AnalyticsFilterAction>,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum AnalyticsSectionKind {
     #[default]
     Recipients,
@@ -198,13 +388,14 @@ pub enum AnalyticsSectionKind {
     TradeCountries,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct AnalyticsSection {
     pub kind: AnalyticsSectionKind,
     pub rows: Vec<AnalyticsGroupRow>,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum PriceMetricKind {
     #[default]
     ValuePerNetKg,
@@ -215,7 +406,7 @@ pub enum PriceMetricKind {
     MinBaseUsdKg,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct AnalyticsPriceMetric {
     pub kind: PriceMetricKind,
     pub count: u64,
@@ -228,11 +419,31 @@ pub struct AnalyticsPriceMetric {
     pub median: f64,
     pub p25: f64,
     pub p75: f64,
+    pub cohorts: Vec<AnalyticsPriceCohort>,
+    pub excluded_rows: u64,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct AnalyticsPriceCohort {
+    pub currency: String,
+    pub normalized_weight_unit: String,
+    pub source_weight_units: Vec<String>,
+    pub count: u64,
+    pub average: f64,
+    pub minimum: f64,
+    pub maximum: f64,
+    pub weighted_average: Option<f64>,
+    pub median: f64,
+    pub p25: f64,
+    pub p75: f64,
+    pub numerator_total: f64,
+    pub denominator_total: f64,
 }
 
 /// Analytics category computed independently, so the GUI can load only
 /// the visible one.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum AnalyticsScope {
     #[default]
     Companies,
@@ -260,17 +471,21 @@ impl AnalyticsScope {
 }
 
 /// One month of import dynamics (chart data).
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct AnalyticsMonthRow {
     /// "2024-03"
     pub month: String,
     pub rows: u64,
     pub declarations: u64,
+    #[serde(skip)]
     pub total_value_usd: f64,
+    #[serde(flatten, skip_serializing_if = "Option::is_none")]
+    pub compatible_usd: Option<AnalyticsUsdCompatibility>,
     pub total_net_kg: f64,
+    pub measures: AnalyticsMeasures,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Analytics {
     pub overview: AnalyticsOverview,
     pub months: Vec<AnalyticsMonthRow>,
@@ -285,9 +500,74 @@ pub struct Analytics {
     pub top_origin_countries: Vec<AnalyticsGroupRow>,
 }
 
-/// One row flagged as potentially undervalued: its price per kg is well below
-/// the median for the same product code.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RiskConfidence {
+    #[default]
+    Low,
+    Medium,
+    High,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RiskLimitation {
+    pub code: String,
+    pub message: String,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct RiskCohort {
+    pub product_code: String,
+    pub period: String,
+    pub currency: String,
+    pub weight_unit: String,
+    pub brand: Option<String>,
+    pub country: Option<String>,
+    pub dimensions: Vec<String>,
+    pub sample_count: u64,
+    pub median: f64,
+    pub p25: f64,
+    pub p75: f64,
+    pub iqr: f64,
+    pub lower_fence: f64,
+    pub median_ratio_cutoff: f64,
+    pub robust_cutoff: f64,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct PriceRiskContract {
+    pub price_basis: String,
+    pub period_granularity: String,
+    pub required_dimensions: Vec<String>,
+    pub optional_dimensions: Vec<String>,
+    pub min_samples: u64,
+    pub max_median_ratio: f64,
+    pub iqr_multiplier: f64,
+    pub includes_subject_record: bool,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct RiskExclusions {
+    pub query_rows: u64,
+    pub missing_product_code: u64,
+    pub missing_period: u64,
+    pub missing_currency: u64,
+    pub missing_weight_unit: u64,
+    pub invalid_value: u64,
+    pub invalid_weight: u64,
+    pub insufficient_cohort: u64,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct RiskCurrencyTotal {
+    pub currency: String,
+    pub flagged_rows: u64,
+    pub flagged_value: f64,
+    pub estimated_gap: f64,
+}
+
+/// One row flagged by the explainable price-risk heuristic.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct UndervaluedRow {
     pub id: i64,
     pub declaration_date: String,
@@ -307,10 +587,16 @@ pub struct UndervaluedRow {
     pub estimated_gap: f64,
     /// price_per_kg / code_median (0.3 means 30% of the typical price).
     pub ratio: f64,
+    pub cohort: RiskCohort,
+    pub deviation_percent: f64,
+    pub confidence: RiskConfidence,
+    pub reason: String,
+    pub limitations: Vec<RiskLimitation>,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Undervaluation {
+    pub available: bool,
     pub rows: Vec<UndervaluedRow>,
     /// Number of distinct product codes that had enough samples to judge.
     pub checked_codes: u64,
@@ -320,10 +606,18 @@ pub struct Undervaluation {
     pub flagged_codes: u64,
     pub flagged_value: f64,
     pub estimated_gap: f64,
+    pub eligible_rows: u64,
+    pub evaluated_rows: u64,
+    pub checked_cohorts: u64,
+    pub contract: PriceRiskContract,
+    pub exclusions: RiskExclusions,
+    pub limitations: Vec<RiskLimitation>,
+    pub currency_totals: Vec<RiskCurrencyTotal>,
 }
 
 /// Dimension for the pivot table (rows or columns).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum PivotDim {
     Recipient,
     Sender,
@@ -364,29 +658,57 @@ pub fn pivot_filter_action(
     })
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum PivotMetric {
     Value,
     Rows,
     NetKg,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PivotLimits {
     pub rows: usize,
     pub cols: usize,
 }
 
 /// Cross-tab: a matrix of one dimension by another for a chosen metric.
-#[derive(Clone, Debug, Default)]
-pub struct PivotResult {
-    pub row_labels: Vec<String>,
-    pub col_labels: Vec<String>,
-    /// cells[row][col].
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct PivotMeasurePartition {
+    pub key: String,
+    pub known: bool,
+    pub unit: String,
     pub cells: Vec<Vec<f64>>,
     pub row_totals: Vec<f64>,
     pub col_totals: Vec<f64>,
     pub grand_total: f64,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct PivotCompatibilityMatrix {
+    pub cells: Vec<Vec<f64>>,
+    pub row_totals: Vec<f64>,
+    pub col_totals: Vec<f64>,
+    pub grand_total: f64,
+    pub metric_unit: String,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct PivotResult {
+    pub row_labels: Vec<String>,
+    pub col_labels: Vec<String>,
+    /// cells[row][col].
+    #[serde(skip)]
+    pub cells: Vec<Vec<f64>>,
+    #[serde(skip)]
+    pub row_totals: Vec<f64>,
+    #[serde(skip)]
+    pub col_totals: Vec<f64>,
+    #[serde(skip)]
+    pub grand_total: f64,
+    #[serde(flatten, skip_serializing_if = "Option::is_none")]
+    pub compatible_matrix: Option<PivotCompatibilityMatrix>,
+    pub partitions: Vec<PivotMeasurePartition>,
     /// True when low-ranked rows/columns were folded into an "others" bucket.
     pub rows_truncated: bool,
     pub cols_truncated: bool,
@@ -399,7 +721,7 @@ pub struct PivotResult {
 
 /// Single-company dossier built for one EDRPOU: everything an analyst needs
 /// to answer "tell me everything about this importer" on one screen.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct CompanyProfile {
     pub edrpou: String,
     /// All recipient-name variants seen for this EDRPOU.
@@ -414,6 +736,16 @@ pub struct CompanyProfile {
     pub price_sections: Vec<AnalyticsPriceMetric>,
 }
 
+/// Optional ordering for a result page: a result-field id and a direction.
+/// When absent, the default recency order is used.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ResultSort {
+    /// Result field id (matches `FieldInfo::id` from the schema/results).
+    pub field: String,
+    #[serde(default)]
+    pub descending: bool,
+}
+
 pub type SearchPage = (Vec<i64>, Vec<Vec<String>>, Vec<Option<String>>);
 pub type DynamicSearchPage = (
     Vec<FieldInfo>,
@@ -424,4 +756,26 @@ pub type DynamicSearchPage = (
 
 pub fn analytics_should_run(q: &Query) -> bool {
     !q.is_empty()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Filters, Query};
+
+    #[test]
+    fn query_deserializes_partial_filters() {
+        let empty: Query = serde_json::from_str(r#"{"text":"","filters":{}}"#).unwrap();
+        assert!(empty.filters.is_empty());
+
+        let partial: Query =
+            serde_json::from_str(r#"{"text":"","filters":{"year":"2026"}}"#).unwrap();
+        assert_eq!(partial.filters.year, "2026");
+        assert_eq!(
+            partial.filters,
+            Filters {
+                year: "2026".to_string(),
+                ..Filters::default()
+            }
+        );
+    }
 }

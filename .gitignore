@@ -1,5 +1,8 @@
 # Rust build output
 /target/
+/target-*/
+
+/output/
 
 # Packaged application builds. Keep the public Windows binaries in the repo,
 # but never commit local databases created beside the executable.
@@ -45,6 +48,14 @@
 # Local planning drafts and internal audits
 /docs/
 /audit/
+
+# Browser workspace frontend: dependencies and build output are produced
+# locally by `npm install` / `npm run build`; the compiled assets are embedded
+# into the Rust binary at release build time.
+/web-ui/node_modules/
+/web-ui/dist/
+/web-ui/test-results/
+/web-ui/playwright-report/
 
 # Editor and OS files
 .claude/

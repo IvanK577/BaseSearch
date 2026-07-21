@@ -39,6 +39,7 @@ pub(super) fn save_current_query(app: &mut App) {
         text: app.query_text.clone(),
         filters: app.filters.clone(),
         advanced: app.advanced_query.clone(),
+        record_scope: Default::default(),
     };
     if query.is_empty() {
         return;

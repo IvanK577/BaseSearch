@@ -6,9 +6,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use base_search::db::{
     AnalyticsFilterField, AnalyticsScope, AnalyticsSectionKind, Db, Filters, ImportRecord,
-    PivotDim, PivotLimits, PivotMetric, PriceMetricKind, Query, analytics_should_run,
+    PivotDim, PivotLimits, PivotMetric, PriceMetricKind, Query, RecordScope, analytics_should_run,
     build_fts_query, canonical_record_hash, extract_year, fts_prefix_terms, parse_number,
-    pivot_filter_action,
+    parse_number_grouped, pivot_filter_action,
 };
 use base_search::domain::table::{ColumnRole, ColumnStorage, SemanticField};
 use base_search::export;
@@ -68,6 +68,18 @@ fn database_storage_maintenance_reports_and_compacts_without_deleting_rows() {
     assert_eq!(db.total_rows(), 0);
     assert_eq!(after.wal_bytes, 0);
     assert!(after.total_file_bytes() <= before.total_file_bytes());
+}
+
+#[test]
+fn runtime_connection_opens_while_import_transaction_is_active() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("runtime-open-during-import.db");
+    let mut writer = Db::open(&db_path).unwrap();
+
+    writer.begin_import_file().unwrap();
+    let reader = Db::open_runtime(&db_path).expect("runtime connection should not rerun schema");
+    assert_eq!(reader.total_rows(), 0);
+    writer.rollback_import_file();
 }
 
 #[test]
@@ -421,6 +433,47 @@ fn v2_search_ast_supports_logic_ranges_empty_and_validation() {
 }
 
 #[test]
+fn value_filter_uses_the_same_number_style_as_analytics() {
+    // A value cell "1.250" is a thousands group (1250) — the way analytics
+    // aggregates it. A filter value = 1250 must find that row, and value =
+    // 1.25 must not: the filter and the stored/aggregated value must parse
+    // the same number style, or the total cannot be reproduced by filtering.
+    let dir = tempfile::tempdir().unwrap();
+    let xlsx = dir.path().join("value.xlsx");
+    let db_path = dir.path().join("value.db");
+    write_test_xlsx(
+        &xlsx,
+        &[vec![
+            ("declaration_number", "24UA0000009U9"),
+            ("declaration_date", "15.01.2024"),
+            ("sender", "ALPHA SUPPLY"),
+            ("recipient", "A IMPORT"),
+            ("product_code", "8504405500"),
+            ("origin_country", "CN"),
+            ("net_kg", "10"),
+            ("currency_control_value", "1.250"),
+        ]],
+    );
+    let cancel = AtomicBool::new(false);
+    let mut db = Db::open(&db_path).unwrap();
+    import::import_file(&mut db, &xlsx, &cancel, &mut |_, _, _| {});
+
+    let grouped = advanced_query(advanced_condition(
+        "currency_control_value",
+        ConditionOp::Equals,
+        ConditionValue::Single("1250".into()),
+    ));
+    assert_eq!(db.count(&grouped).unwrap(), 1);
+
+    let decimal = advanced_query(advanced_condition(
+        "currency_control_value",
+        ConditionOp::Equals,
+        ConditionValue::Single("1.25".into()),
+    ));
+    assert_eq!(db.count(&decimal).unwrap(), 0);
+}
+
+#[test]
 fn import_search_filter_export() {
     let dir = tempfile::tempdir().unwrap();
     let xlsx = dir.path().join("test.xlsx");
@@ -434,7 +487,7 @@ fn import_search_filter_export() {
     assert_eq!(summary.total_rows, 3);
     assert_eq!(summary.imported, 3);
     assert_eq!(summary.duplicates, 0);
-    assert_eq!(summary.quality.layout, "recognized profile");
+    assert_eq!(summary.quality.layout, "generic table");
     assert_eq!(summary.quality.header_row, 1);
     assert_eq!(summary.quality.source_columns, COLUMNS.len() as u64);
     assert_eq!(summary.quality.recognized_columns, COLUMNS.len() as u64);
@@ -492,6 +545,7 @@ fn import_search_filter_export() {
     // FTS: exact word matching, case-insensitive for Cyrillic text.
     let q = |text: &str| Query {
         text: text.into(),
+        record_scope: RecordScope::Occurrences,
         ..Default::default()
     };
     assert_eq!(db.count(&q("виноградне")).unwrap(), 2);
@@ -520,10 +574,11 @@ fn import_search_filter_export() {
         text: String::new(),
         filters: filters.clone(),
         advanced: None,
+        record_scope: RecordScope::Occurrences,
     };
     assert_eq!(db.count(&fq).unwrap(), 7);
     let analytics = db.analytics(&fq, 10).unwrap();
-    assert_eq!(analytics.overview.row_count, 4);
+    assert_eq!(analytics.overview.row_count, 7);
 
     // Recipient filter: Cyrillic text in a different case.
     let filters = Filters {
@@ -535,6 +590,7 @@ fn import_search_filter_export() {
             text: String::new(),
             filters,
             advanced: None,
+            record_scope: RecordScope::Occurrences,
         })
         .unwrap(),
         2
@@ -550,6 +606,7 @@ fn import_search_filter_export() {
             text: String::new(),
             filters,
             advanced: None,
+            record_scope: RecordScope::Occurrences,
         })
         .unwrap(),
         2
@@ -565,6 +622,7 @@ fn import_search_filter_export() {
             text: String::new(),
             filters,
             advanced: None,
+            record_scope: RecordScope::Occurrences,
         })
         .unwrap(),
         2
@@ -580,6 +638,7 @@ fn import_search_filter_export() {
             text: "вино".into(),
             filters,
             advanced: None,
+            record_scope: RecordScope::Occurrences,
         })
         .unwrap(),
         2
@@ -594,6 +653,7 @@ fn import_search_filter_export() {
             text: "вино".into(),
             filters,
             advanced: None,
+            record_scope: RecordScope::Occurrences,
         })
         .unwrap(),
         0
@@ -610,9 +670,13 @@ fn import_search_filter_export() {
             .any(|(h, v)| h == "Опис товару" && v.contains("Перетворювач"))
     );
 
-    // CSV export: BOM plus all rows.
+    // CSV export: BOM plus every imported occurrence.
+    let all_rows_query = Query {
+        record_scope: RecordScope::Occurrences,
+        ..Default::default()
+    };
     let csv_path = dir.path().join("out.csv");
-    let n = export::export(&db, &Query::default(), &csv_path, &cancel, |_, _| {}).unwrap();
+    let n = export::export(&db, &all_rows_query, &csv_path, &cancel, |_, _| {}).unwrap();
     assert_eq!(n, 7);
     let bytes = std::fs::read(&csv_path).unwrap();
     assert_eq!(&bytes[..3], b"\xEF\xBB\xBF");
@@ -622,11 +686,263 @@ fn import_search_filter_export() {
 
     // XLSX export: opens successfully and contains all data rows.
     let xlsx_out = dir.path().join("out.xlsx");
-    let n = export::export(&db, &Query::default(), &xlsx_out, &cancel, |_, _| {}).unwrap();
+    let n = export::export(&db, &all_rows_query, &xlsx_out, &cancel, |_, _| {}).unwrap();
     assert_eq!(n, 7);
     let mut wb: calamine::Xlsx<_> = calamine::open_workbook(&xlsx_out).unwrap();
     let range = wb.worksheet_range_at(0).unwrap().unwrap();
     assert_eq!(range.height(), 8); // header + 7 rows
+}
+
+#[test]
+fn record_scope_is_consistent_across_search_analytics_and_export() {
+    let dir = tempfile::tempdir().unwrap();
+    let first = dir.path().join("first.xlsx");
+    let second = dir.path().join("second.xlsx");
+    let db_path = dir.path().join("scope.db");
+    let row_a = vec![
+        ("declaration_number", "24UA100000000201U1"),
+        ("declaration_date", "15.03.2024"),
+        ("sender", "ALPHA SUPPLY"),
+        ("recipient", "ALPHA IMPORT"),
+        ("product_code", "8504405500"),
+        ("description", "Scope fixture alpha"),
+        ("net_kg", "10"),
+        ("currency_control_value", "100"),
+    ];
+    let row_b = vec![
+        ("declaration_number", "24UA100000000202U2"),
+        ("declaration_date", "16.03.2024"),
+        ("sender", "BETA SUPPLY"),
+        ("recipient", "BETA IMPORT"),
+        ("product_code", "8517130000"),
+        ("description", "Scope fixture beta"),
+        ("net_kg", "20"),
+        ("currency_control_value", "300"),
+    ];
+    write_test_xlsx(&first, &[row_a.clone(), row_b]);
+    write_test_xlsx(&second, &[row_a]);
+
+    let cancel = AtomicBool::new(false);
+    let mut db = Db::open(&db_path).unwrap();
+    let first_summary = import::import_file(&mut db, &first, &cancel, &mut |_, _, _| {});
+    let second_summary = import::import_file(&mut db, &second, &cancel, &mut |_, _, _| {});
+    assert_eq!(first_summary.imported, 2);
+    assert_eq!(second_summary.imported, 1);
+    assert_eq!(second_summary.duplicates, 1);
+
+    let canonical = Query::default();
+    assert_eq!(db.count(&canonical).unwrap(), 2);
+    assert_eq!(db.search_page(&canonical, 10, 0).unwrap().0.len(), 2);
+    assert_eq!(db.analytics(&canonical, 10).unwrap().overview.row_count, 2);
+    let canonical_export = dir.path().join("canonical.csv");
+    assert_eq!(
+        export::export(&db, &canonical, &canonical_export, &cancel, |_, _| {}).unwrap(),
+        2
+    );
+
+    let occurrences = Query {
+        record_scope: RecordScope::Occurrences,
+        ..Default::default()
+    };
+    assert_eq!(db.count(&occurrences).unwrap(), 3);
+    assert_eq!(db.search_page(&occurrences, 10, 0).unwrap().0.len(), 3);
+    assert_eq!(
+        db.analytics(&occurrences, 10).unwrap().overview.row_count,
+        3
+    );
+    let occurrence_export = dir.path().join("occurrences.csv");
+    assert_eq!(
+        export::export(&db, &occurrences, &occurrence_export, &cancel, |_, _| {},).unwrap(),
+        3
+    );
+}
+
+#[test]
+fn multi_sheet_workbook_imports_every_non_empty_sheet() {
+    let dir = tempfile::tempdir().unwrap();
+    let xlsx = dir.path().join("multi-sheet.xlsx");
+    let db_path = dir.path().join("multi-sheet.db");
+    let mut workbook = rust_xlsxwriter::Workbook::new();
+    {
+        let sheet = workbook.add_worksheet();
+        sheet.set_name("January").unwrap();
+        for (column, def) in COLUMNS.iter().enumerate() {
+            sheet.write_string(0, column as u16, def.header).unwrap();
+        }
+        for (name, value) in [
+            ("declaration_number", "24UA100000000301U1"),
+            ("declaration_date", "15.01.2024"),
+            ("sender", "JANUARY SUPPLY"),
+            ("recipient", "MULTI IMPORT"),
+            ("product_code", "8504405500"),
+            ("description", "January sheet item"),
+        ] {
+            sheet
+                .write_string(1, col_index(name).unwrap() as u16, value)
+                .unwrap();
+        }
+    }
+    {
+        let sheet = workbook.add_worksheet();
+        sheet.set_name("February").unwrap();
+        for (column, def) in COLUMNS.iter().enumerate() {
+            sheet.write_string(0, column as u16, def.header).unwrap();
+        }
+        for (name, value) in [
+            ("declaration_number", "24UA100000000302U2"),
+            ("declaration_date", "16.02.2024"),
+            ("sender", "FEBRUARY SUPPLY"),
+            ("recipient", "MULTI IMPORT"),
+            ("product_code", "8517130000"),
+            ("description", "February sheet item"),
+        ] {
+            sheet
+                .write_string(1, col_index(name).unwrap() as u16, value)
+                .unwrap();
+        }
+    }
+    workbook.add_worksheet().set_name("Empty").unwrap();
+    workbook.save(&xlsx).unwrap();
+
+    let cancel = AtomicBool::new(false);
+    let mut db = Db::open(&db_path).unwrap();
+    let summary = import::import_file(&mut db, &xlsx, &cancel, &mut |_, _, _| {});
+    assert_eq!(summary.error, None);
+    assert_eq!(summary.imported, 2);
+    assert_eq!(summary.total_rows, 2);
+    assert_eq!(summary.quality.layout, "multi-sheet workbook");
+
+    let january = Query {
+        text: "January sheet item".into(),
+        ..Default::default()
+    };
+    let february = Query {
+        text: "February sheet item".into(),
+        ..Default::default()
+    };
+    let (january_ids, _, _) = db.search_page(&january, 10, 0).unwrap();
+    let (february_ids, _, _) = db.search_page(&february, 10, 0).unwrap();
+    assert_eq!(january_ids.len(), 1);
+    assert_eq!(february_ids.len(), 1);
+    assert!(
+        db.record_card(january_ids[0])
+            .unwrap()
+            .source_file
+            .contains("January")
+    );
+    assert!(
+        db.record_card(february_ids[0])
+            .unwrap()
+            .source_file
+            .contains("February")
+    );
+}
+
+#[test]
+fn selected_sheets_can_be_imported_separately_without_false_file_deduplication() {
+    let dir = tempfile::tempdir().unwrap();
+    let xlsx = dir.path().join("selected-sheets.xlsx");
+    let db_path = dir.path().join("selected-sheets.db");
+    let mut workbook = rust_xlsxwriter::Workbook::new();
+    for (sheet_name, sku, description) in [
+        ("January", "JAN-1", "January selected row"),
+        ("February", "FEB-1", "February selected row"),
+    ] {
+        let sheet = workbook.add_worksheet().set_name(sheet_name).unwrap();
+        for (column, header) in ["SKU", "Description"].iter().enumerate() {
+            sheet.write_string(0, column as u16, *header).unwrap();
+        }
+        sheet.write_string(1, 0, sku).unwrap();
+        sheet.write_string(1, 1, description).unwrap();
+    }
+    workbook.save(&xlsx).unwrap();
+
+    let mut db = Db::open(&db_path).unwrap();
+    let cancel = AtomicBool::new(false);
+    let january = import::import_file_with_options(
+        &mut db,
+        &xlsx,
+        &import::ImportOptions::selected_sheets(["January"]),
+        &cancel,
+        &mut |_, _, _| {},
+    );
+    assert_eq!(january.error, None);
+    assert_eq!(january.imported, 1);
+    assert_eq!(db.total_rows(), 1);
+
+    let february = import::import_file_with_options(
+        &mut db,
+        &xlsx,
+        &import::ImportOptions::selected_sheets(["February"]),
+        &cancel,
+        &mut |_, _, _| {},
+    );
+    assert_eq!(february.error, None);
+    assert_eq!(february.imported, 1);
+    assert_eq!(db.total_rows(), 2);
+
+    let january_retry = import::import_file_with_options(
+        &mut db,
+        &xlsx,
+        &import::ImportOptions::selected_sheets(["January"]),
+        &cancel,
+        &mut |_, _, _| {},
+    );
+    assert_eq!(january_retry.imported, 0);
+    assert!(january_retry.skipped_duplicate_of.is_some());
+    assert_eq!(db.total_rows(), 2);
+}
+
+#[test]
+fn delimited_text_import_detects_csv_and_tsv_without_losing_quoted_values() {
+    let dir = tempfile::tempdir().unwrap();
+    let csv_path = dir.path().join("orders.csv");
+    let tsv_path = dir.path().join("inventory.tsv");
+    let db_path = dir.path().join("delimited.db");
+    std::fs::write(
+        &csv_path,
+        "\u{feff}Order Date;Product Name;Amount EUR;Origin Country\n\
+         2024-01-15;\"Laptop, Pro\";1299.50;DE\n\
+         2024-01-16;\"Desk\nstand\";49.90;PL\n",
+    )
+    .unwrap();
+    std::fs::write(
+        &tsv_path,
+        "Date\tSKU\tDescription\tQuantity\n2024-02-01\tSKU-77\tMonitor arm\t5\n",
+    )
+    .unwrap();
+
+    let cancel = AtomicBool::new(false);
+    let mut db = Db::open(&db_path).unwrap();
+    let csv_summary = import::import_file(&mut db, &csv_path, &cancel, &mut |_, _, _| {});
+    let tsv_summary = import::import_file(&mut db, &tsv_path, &cancel, &mut |_, _, _| {});
+    assert_eq!(csv_summary.error, None);
+    assert_eq!(csv_summary.imported, 2);
+    assert_eq!(tsv_summary.error, None);
+    assert_eq!(tsv_summary.imported, 1);
+
+    for text in ["Laptop", "Desk stand", "Monitor arm"] {
+        assert_eq!(
+            db.count(&Query {
+                text: text.into(),
+                ..Default::default()
+            })
+            .unwrap(),
+            1,
+            "missing imported delimited row for {text}"
+        );
+    }
+    assert_eq!(
+        db.count(&Query {
+            filters: Filters {
+                year: "2024".into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+        .unwrap(),
+        3
+    );
 }
 
 #[test]
@@ -774,6 +1090,7 @@ fn analytics_summarizes_filtered_rows_by_value_and_company() {
             ..Default::default()
         },
         advanced: None,
+        record_scope: Default::default(),
     };
     let analytics = db.analytics(&q, 5).unwrap();
     assert_eq!(analytics.overview.row_count, 2);
@@ -819,14 +1136,14 @@ fn analytics_summarizes_filtered_rows_by_value_and_company() {
     assert_eq!(analytics_all.months[1].rows, 1);
     assert_close(analytics_all.months[1].total_value_usd, 2400.0);
 
-    // Robust price stats: per-kg prices for the three Nimbus rows are
-    // 120.0, 120.05 and 120.1, so the median is the middle value.
+    // R-7 continuous percentiles for 120.0, 120.05 and 120.1 interpolate
+    // halfway between adjacent values at the first and third quartiles.
     let price = &analytics_all.price_sections[0];
     assert_eq!(price.kind, PriceMetricKind::ValuePerNetKg);
     assert_eq!(price.count, 3);
     assert_close(price.median, 120.05);
-    assert_close(price.p25, 120.05);
-    assert_close(price.p75, 120.1);
+    assert_close(price.p25, 120.025);
+    assert_close(price.p75, 120.075);
 
     // Product codes grouped at the 4-digit HS level.
     let products = db
@@ -919,24 +1236,85 @@ fn analytics_summarizes_filtered_rows_by_value_and_company() {
 }
 
 #[test]
+fn price_metric_weighted_averages_use_their_real_denominators() {
+    let dir = tempfile::tempdir().unwrap();
+    let xlsx = dir.path().join("metric-denominators.xlsx");
+    let db_path = dir.path().join("metric-denominators.db");
+    write_test_xlsx(
+        &xlsx,
+        &[
+            vec![
+                ("declaration_number", "24UA100000000101U1"),
+                ("declaration_date", "15.03.2024"),
+                ("description", "Metric denominator row A"),
+                ("quantity", "10"),
+                ("gross_kg", "100"),
+                ("net_kg", "1"),
+                ("rfv_usd_kg", "10"),
+                ("rmv_net_usd_kg", "20"),
+                ("rmv_usd_extra_unit", "100"),
+                ("rmv_gross_usd_kg", "10"),
+                ("min_base_usd_kg", "30"),
+            ],
+            vec![
+                ("declaration_number", "24UA100000000102U2"),
+                ("declaration_date", "16.03.2024"),
+                ("description", "Metric denominator row B"),
+                ("quantity", "1"),
+                ("gross_kg", "1"),
+                ("net_kg", "100"),
+                ("rfv_usd_kg", "20"),
+                ("rmv_net_usd_kg", "40"),
+                ("rmv_usd_extra_unit", "200"),
+                ("rmv_gross_usd_kg", "20"),
+                ("min_base_usd_kg", "60"),
+            ],
+        ],
+    );
+
+    let cancel = AtomicBool::new(false);
+    let mut db = Db::open(&db_path).unwrap();
+    let summary = import::import_file(&mut db, &xlsx, &cancel, &mut |_, _, _| {});
+    assert_eq!(summary.error, None);
+    assert_eq!(summary.imported, 2);
+
+    let analytics = db.analytics(&Query::default(), 10).unwrap();
+    assert_close(
+        price_metric(&analytics.price_sections, PriceMetricKind::RfvUsdKg).weighted_average,
+        (10.0 * 1.0 + 20.0 * 100.0) / 101.0,
+    );
+    assert_close(
+        price_metric(&analytics.price_sections, PriceMetricKind::RmvNetUsdKg).weighted_average,
+        (20.0 * 1.0 + 40.0 * 100.0) / 101.0,
+    );
+    assert_close(
+        price_metric(&analytics.price_sections, PriceMetricKind::RmvUsdExtraUnit).weighted_average,
+        (100.0 * 10.0 + 200.0 * 1.0) / 11.0,
+    );
+    assert_close(
+        price_metric(&analytics.price_sections, PriceMetricKind::RmvGrossUsdKg).weighted_average,
+        (10.0 * 100.0 + 20.0 * 1.0) / 101.0,
+    );
+    assert_close(
+        price_metric(&analytics.price_sections, PriceMetricKind::MinBaseUsdKg).weighted_average,
+        (30.0 * 1.0 + 60.0 * 100.0) / 101.0,
+    );
+}
+
+#[test]
 fn undervaluation_flags_rows_below_code_median() {
     let dir = tempfile::tempdir().unwrap();
     let xlsx = dir.path().join("under.xlsx");
     let db_path = dir.path().join("data").join("under.db");
-    // Six rows with the same product code: five around 10 $/kg and one at
-    // 1 $/kg (10 USD / 10 kg) which should be flagged.
+    // Twenty comparable baseline rows plus one extreme low-price row meet the
+    // production minimum sample contract.
     let mut rows = Vec::new();
-    for (i, (value, net)) in [
-        ("100", "10"),
-        ("105", "10"),
-        ("98", "10"),
-        ("102", "10"),
-        ("110", "10"),
-        ("10", "10"), // the outlier: 1 $/kg vs ~10 median
-    ]
-    .iter()
-    .enumerate()
-    {
+    for i in 0..=20 {
+        let value = if i == 20 {
+            "10"
+        } else {
+            Box::leak(format!("{}", 100 + i).into_boxed_str()) as &str
+        };
         rows.push(vec![
             (
                 "declaration_number",
@@ -948,8 +1326,10 @@ fn undervaluation_flags_rows_below_code_median() {
             ("recipient", "ТОВ «Тест»"),
             ("product_code", "1234567890"),
             ("description", "Тестовий товар"),
-            ("net_kg", net),
+            ("net_kg", "10"),
             ("currency_control_value", value),
+            ("contract", "USD"),
+            ("unit", "kg"),
         ]);
     }
     write_test_xlsx(&xlsx, &rows);
@@ -958,15 +1338,32 @@ fn undervaluation_flags_rows_below_code_median() {
     let mut db = Db::open(&db_path).unwrap();
     let summary = import::import_file(&mut db, &xlsx, &cancel, &mut |_, _, _| {});
     assert_eq!(summary.error, None);
-    assert_eq!(summary.imported, 6);
+    assert_eq!(summary.imported, 21);
 
-    let uv = db.undervaluation(&Query::default(), 0.5, 5, 100).unwrap();
+    let shape = db.table_shape().unwrap();
+    for (source, semantic) in [
+        ("contract", SemanticField::Currency),
+        ("unit", SemanticField::WeightUnit),
+    ] {
+        let id = shape
+            .columns
+            .iter()
+            .find(|column| {
+                matches!(&column.storage, ColumnStorage::SchemaColumn(name) if name == source)
+            })
+            .unwrap()
+            .id
+            .clone();
+        assert!(db.set_column_semantic(&id, Some(semantic)));
+    }
+
+    let uv = db.undervaluation(&Query::default(), 0.5, 20, 100).unwrap();
     assert_eq!(uv.checked_codes, 1);
     assert_eq!(uv.rows.len(), 1);
     let flagged = &uv.rows[0];
     assert_eq!(flagged.product_code, "1234567890");
     assert_close(flagged.price_per_kg, 1.0);
-    assert_close(flagged.code_median, 10.2); // median of {9.8,10,10.2,10.5,11,1} sorted -> index 3 = 10.2
+    assert_close(flagged.code_median, 10.9);
     assert!(flagged.ratio < 0.5);
 }
 
@@ -984,35 +1381,33 @@ fn generic_table_semantics_drive_undervaluation_scan() {
         "Buyer",
         "SKU",
         "Description",
-        "Amount USD",
-        "Net kg",
+        "Amount",
+        "Net weight",
+        "Currency",
+        "Weight unit",
     ];
     for (c, h) in headers.iter().enumerate() {
         sheet.write_string(0, c as u16, *h).unwrap();
     }
-    for (r, (value, net)) in [
-        ("100", "10"),
-        ("105", "10"),
-        ("98", "10"),
-        ("102", "10"),
-        ("110", "10"),
-        ("10", "10"),
-    ]
-    .iter()
-    .enumerate()
-    {
-        let row = [
-            "2024-03-15",
-            &format!("INV-{r:03}"),
-            "ACME SUPPLY",
-            "Buyer A",
-            "SKU-LOW",
-            "Generic widget",
-            value,
-            net,
+    for r in 0..=20 {
+        let row = vec![
+            "2024-03-15".to_string(),
+            format!("INV-{r:03}"),
+            "ACME SUPPLY".to_string(),
+            "Buyer A".to_string(),
+            "SKU-LOW".to_string(),
+            "Generic widget".to_string(),
+            if r == 20 {
+                "10".to_string()
+            } else {
+                (100 + r).to_string()
+            },
+            "10".to_string(),
+            "USD".to_string(),
+            "kg".to_string(),
         ];
         for (c, v) in row.iter().enumerate() {
-            sheet.write_string((r + 1) as u32, c as u16, *v).unwrap();
+            sheet.write_string((r + 1) as u32, c as u16, v).unwrap();
         }
     }
     workbook.save(&xlsx).unwrap();
@@ -1022,7 +1417,7 @@ fn generic_table_semantics_drive_undervaluation_scan() {
     let summary = import::import_file(&mut db, &xlsx, &cancel, &mut |_, _, _| {});
     assert_eq!(summary.error, None);
     assert_eq!(summary.quality.layout, "generic table");
-    assert_eq!(summary.imported, 6);
+    assert_eq!(summary.imported, 21);
 
     for (id, semantic) in [
         ("order_date", SemanticField::Date),
@@ -1031,8 +1426,10 @@ fn generic_table_semantics_drive_undervaluation_scan() {
         ("buyer", SemanticField::Recipient),
         ("sku", SemanticField::ProductCode),
         ("description", SemanticField::Description),
-        ("amount_usd", SemanticField::Value),
-        ("net_kg", SemanticField::NetWeight),
+        ("amount", SemanticField::Value),
+        ("net_weight", SemanticField::NetWeight),
+        ("currency", SemanticField::Currency),
+        ("weight_unit", SemanticField::WeightUnit),
     ] {
         assert!(
             db.set_column_semantic(id, Some(semantic)),
@@ -1040,7 +1437,7 @@ fn generic_table_semantics_drive_undervaluation_scan() {
         );
     }
 
-    let uv = db.undervaluation(&Query::default(), 0.5, 5, 100).unwrap();
+    let uv = db.undervaluation(&Query::default(), 0.5, 20, 100).unwrap();
     assert_eq!(uv.checked_codes, 1);
     assert_eq!(uv.rows.len(), 1);
     let flagged = &uv.rows[0];
@@ -1049,7 +1446,7 @@ fn generic_table_semantics_drive_undervaluation_scan() {
     assert_eq!(flagged.sender, "ACME SUPPLY");
     assert_eq!(flagged.declaration_date, "2024-03-15");
     assert_close(flagged.price_per_kg, 1.0);
-    assert_close(flagged.code_median, 10.2);
+    assert_close(flagged.code_median, 10.9);
     assert!(flagged.ratio < 0.5);
 }
 
@@ -1106,6 +1503,7 @@ fn analytics_section_can_load_all_group_rows_beyond_visible_top() {
             ..Default::default()
         },
         advanced: None,
+        record_scope: Default::default(),
     };
     let top = db
         .analytics_scoped(&q, 5, Some(AnalyticsScope::Companies), 10)
@@ -1187,6 +1585,7 @@ fn analytics_trademark_filter_is_field_specific() {
             ..Default::default()
         },
         advanced: None,
+        record_scope: Default::default(),
     };
     assert_eq!(db.count(&broad).unwrap(), 3);
 
@@ -1198,6 +1597,7 @@ fn analytics_trademark_filter_is_field_specific() {
             ..Default::default()
         },
         advanced: None,
+        record_scope: Default::default(),
     };
     let analytics = db.analytics(&exact_brand, 10).unwrap();
     assert_eq!(analytics.overview.row_count, 1);
@@ -1255,6 +1655,7 @@ fn analytics_country_sections_use_normalized_country_keys() {
             ..Default::default()
         },
         advanced: None,
+        record_scope: Default::default(),
     };
     let analytics = db.analytics(&q, 10).unwrap();
     assert_eq!(analytics.overview.distinct_origin_countries, 1);
@@ -1317,6 +1718,7 @@ fn analytics_ignores_placeholder_labels_in_business_groups() {
             ..Default::default()
         },
         advanced: None,
+        record_scope: Default::default(),
     };
     let analytics = db.analytics(&q, 10).unwrap();
 
@@ -1437,6 +1839,7 @@ fn analytics_builds_decision_sections_for_trade_questions() {
             ..Default::default()
         },
         advanced: None,
+        record_scope: Default::default(),
     };
     let analytics = db.analytics(&q, 10).unwrap();
     assert_eq!(analytics.overview.row_count, 3);
@@ -1535,7 +1938,7 @@ fn user_assigned_semantic_drives_generic_table_analytics() {
         "Одержувач",
         "Код товару",
         "Опис товару",
-        "Сума", // generic column, not part of the customs schema
+        "Custom metric X", // deliberately unknown until the user maps it
     ];
     for (c, h) in headers.iter().enumerate() {
         sheet.write_string(0, c as u16, *h).unwrap();
@@ -1593,12 +1996,12 @@ fn user_assigned_semantic_drives_generic_table_analytics() {
     let column = shape
         .columns
         .iter()
-        .find(|column| column.id == "сума")
-        .expect("сума column in shape");
+        .find(|column| column.id == "custom_metric_x")
+        .expect("custom metric column in shape");
     assert!(column.semantic.is_none());
 
     // The user assigns it the value meaning (what the column-mapping UI does).
-    assert!(db.set_column_semantic("сума", Some(SemanticField::Value)));
+    assert!(db.set_column_semantic("custom_metric_x", Some(SemanticField::Value)));
 
     // Analytics now sums the value from the extra JSON for this generic table.
     let after = db.analytics_scoped(&q, 10, None, 10).unwrap();
@@ -1714,7 +2117,7 @@ fn generic_table_semantics_drive_sections_and_months() {
     assert_eq!(recipients.rows.len(), 2);
     assert_eq!(recipients.rows[0].label, "Buyer A");
     assert_close(recipients.rows[0].total_value_usd, 1500.50);
-    assert!(recipients.rows[0].filter_action.is_none());
+    assert!(recipients.rows[0].filter_action.is_some());
 
     let products = analytics_section(
         &analytics.product_sections,
@@ -1752,7 +2155,7 @@ fn generic_table_semantics_drive_sections_and_months() {
     assert_close(pivot.grand_total, 2500.50);
     assert_close(pivot.cells[0][0], 1500.50);
     assert_close(pivot.cells[1][1], 1000.0);
-    assert!(!pivot.row_filterable);
+    assert!(pivot.row_filterable);
     assert!(!pivot.col_filterable);
 
     let value_per_kg = price_metric(&analytics.price_sections, PriceMetricKind::ValuePerNetKg);
@@ -1775,6 +2178,82 @@ fn generic_table_semantics_drive_sections_and_months() {
             .collect::<Vec<_>>(),
         vec!["2024-03"]
     );
+}
+
+#[test]
+fn common_generic_headers_auto_drive_analytics() {
+    let dir = tempfile::tempdir().unwrap();
+    let xlsx = dir.path().join("common_headers.xlsx");
+    let mut workbook = rust_xlsxwriter::Workbook::new();
+    let sheet = workbook.add_worksheet();
+    let headers = ["Brand", "Recipient", "Product code", "Value USD", "Net kg"];
+    for (c, h) in headers.iter().enumerate() {
+        sheet.write_string(0, c as u16, *h).unwrap();
+    }
+    let rows = [
+        ["Apple", "Alpha Import LLC", "851713", "1200", "10"],
+        ["Apple", "Beta Trade LLC", "851713", "900", "8"],
+        ["Samsung", "Alpha Import LLC", "851714", "700", "7"],
+        ["Apple", "Gamma Market LLC", "847130", "1500", "5"],
+    ];
+    for (r, row) in rows.iter().enumerate() {
+        for (c, v) in row.iter().enumerate() {
+            sheet.write_string(r as u32 + 1, c as u16, *v).unwrap();
+        }
+    }
+    workbook.save(&xlsx).unwrap();
+
+    let db_path = dir.path().join("common_headers.db");
+    let mut db = Db::open(&db_path).unwrap();
+    let cancel = AtomicBool::new(false);
+    let summary = import::import_file(&mut db, &xlsx, &cancel, &mut |_, _, _| {});
+    assert_eq!(summary.error, None);
+    assert_eq!(summary.quality.layout, "generic table");
+    assert_eq!(summary.imported, 4);
+
+    let shape = db.table_shape().expect("table shape recorded");
+    for (id, semantic) in [
+        ("brand", SemanticField::Trademark),
+        ("recipient", SemanticField::Recipient),
+        ("product_code", SemanticField::ProductCode),
+        ("value_usd", SemanticField::Value),
+        ("net_kg", SemanticField::NetWeight),
+    ] {
+        let column = shape
+            .columns
+            .iter()
+            .find(|column| column.id == id)
+            .unwrap_or_else(|| panic!("missing shape column {id}"));
+        assert_eq!(column.semantic, Some(semantic));
+    }
+
+    let query = Query {
+        text: "Apple".into(),
+        ..Default::default()
+    };
+    let analytics = db.analytics(&query, 10).unwrap();
+    assert_eq!(analytics.overview.row_count, 3);
+    assert_eq!(analytics.overview.distinct_recipients, 3);
+    assert_eq!(analytics.overview.distinct_product_codes, 2);
+    assert_eq!(analytics.overview.distinct_trademarks, 1);
+    assert_close(analytics.overview.total_value_usd, 3600.0);
+    assert_close(analytics.overview.total_net_kg, 23.0);
+
+    let recipients = analytics_section(
+        &analytics.company_sections,
+        AnalyticsSectionKind::Recipients,
+    );
+    assert_eq!(recipients.rows.len(), 3);
+    assert_eq!(recipients.rows[0].label, "Gamma Market LLC");
+    assert_close(recipients.rows[0].total_value_usd, 1500.0);
+
+    let products = analytics_section(
+        &analytics.product_sections,
+        AnalyticsSectionKind::ProductCodes,
+    );
+    assert_eq!(products.rows[0].label, "851713");
+    assert_eq!(products.rows[0].rows, 2);
+    assert_close(products.rows[0].total_value_usd, 2100.0);
 }
 
 fn assert_close(actual: f64, expected: f64) {
@@ -1878,12 +2357,14 @@ fn import_registry_format() {
         "UA209230/2024/102880"
     ); // declaration number joined
     assert_eq!(rows[0][result_col("edrpou")], "37642136"); // EDRPOU is read from the first recipient column
+    assert_eq!(rows[0][result_col("declaration_type")], "40/ДЕ");
 
     let card = db.record_card(ids[0]).unwrap();
     let has = |value: &str| card.fields.iter().any(|(_, v)| v == value);
     assert!(has("ТОВ ЮСК УКРАЇНА"));
     assert!(has("JYSK SP Z O O"));
-    assert!(has("40/ДЕ"));
+    assert!(has("40"));
+    assert!(has("ДЕ"));
     assert!(has("27.95"));
 
     // The year is extracted from the converted date.
@@ -1896,6 +2377,7 @@ fn import_registry_format() {
             text: String::new(),
             filters,
             advanced: None,
+            record_scope: Default::default(),
         })
         .unwrap(),
         1
@@ -1986,12 +2468,14 @@ fn import_registry_format_im12_variant() {
         "UA209060/2024/1479"
     ); // all 3 parts, including the typo column
     assert_eq!(rows[0][result_col("edrpou")], "32818783");
+    assert_eq!(rows[0][result_col("declaration_type")], "40/АА");
 
     let card = db.record_card(ids[0]).unwrap();
     let has = |value: &str| card.fields.iter().any(|(_, v)| v == value);
     assert!(has("ТОВ ГЮАЛОС"));
     assert!(has("GUARDIAN CZESTOCHOWA SP Z O O"));
-    assert!(has("40/АА"));
+    assert!(has("40"));
+    assert!(has("АА"));
     assert!(has("0.5756"));
     assert!(has("8473.2"));
     assert!(has("0"));
@@ -2369,6 +2853,140 @@ fn import_generic_format_with_title_rows() {
     assert!(card.fields.iter().any(|(_, v)| v == "ACME GMBH"));
 }
 
+#[test]
+fn import_preview_uses_the_same_detected_header_as_the_real_import() {
+    let dir = tempfile::tempdir().unwrap();
+    let xlsx = dir.path().join("preview-title-rows.xlsx");
+    let mut workbook = rust_xlsxwriter::Workbook::new();
+    let sheet = workbook.add_worksheet();
+    sheet
+        .write_string(0, 0, "Quarterly inventory report")
+        .unwrap();
+    sheet.write_string(1, 0, "Generated automatically").unwrap();
+    for (column, header) in ["SKU", "Product name", "Warehouse", "Quantity"]
+        .iter()
+        .enumerate()
+    {
+        sheet.write_string(2, column as u16, *header).unwrap();
+    }
+    for (column, value) in ["A-42", "Desktop monitor", "Kyiv", "12"].iter().enumerate() {
+        sheet.write_string(3, column as u16, *value).unwrap();
+    }
+    workbook.save(&xlsx).unwrap();
+
+    let preview = import::peek_file(&xlsx, 5).unwrap();
+    assert_eq!(preview.sheets.len(), 1);
+    assert_eq!(preview.sheets[0].header_row, 3);
+    assert_eq!(preview.sheets[0].layout, "generic table");
+    assert_eq!(
+        preview.sheets[0]
+            .columns
+            .iter()
+            .map(|column| column.header.as_str())
+            .collect::<Vec<_>>(),
+        vec!["SKU", "Product name", "Warehouse", "Quantity"]
+    );
+    assert_eq!(preview.sheets[0].columns[0].sample, "A-42");
+    assert_eq!(
+        preview.sheets[0].columns[0].semantic,
+        Some(SemanticField::ProductCode)
+    );
+    assert_eq!(preview.sheets[0].columns[0].role, ColumnRole::Code);
+}
+
+#[test]
+fn delimited_preview_and_import_detect_the_same_title_rows_and_semantics() {
+    let dir = tempfile::tempdir().unwrap();
+    let csv = dir.path().join("preview-title-rows.csv");
+    std::fs::write(
+        &csv,
+        "Quarterly inventory report;;;\nGenerated automatically;;;\nSKU;Product name;Warehouse;Quantity\nA-42;Desktop monitor;Kyiv;12\n",
+    )
+    .unwrap();
+
+    let preview = import::peek_file(&csv, 5).unwrap();
+    assert_eq!(preview.sheets[0].header_row, 3);
+    assert_eq!(preview.sheets[0].columns[0].header, "SKU");
+    assert_eq!(preview.sheets[0].columns[0].sample, "A-42");
+    assert_eq!(
+        preview.sheets[0].columns[3].semantic,
+        Some(SemanticField::Quantity)
+    );
+
+    let mut db = Db::open(&dir.path().join("preview-title-rows.db")).unwrap();
+    let summary = import::import_file(&mut db, &csv, &AtomicBool::new(false), &mut |_, _, _| {});
+    assert_eq!(summary.error, None);
+    assert_eq!(summary.quality.header_row, 3);
+    assert_eq!(summary.imported, 1);
+}
+
+#[test]
+fn manual_sheet_mapping_materializes_semantics_for_unknown_headers() {
+    let dir = tempfile::tempdir().unwrap();
+    let xlsx = dir.path().join("manual-mapping.xlsx");
+    let mut workbook = rust_xlsxwriter::Workbook::new();
+    let sheet = workbook.add_worksheet().set_name("Data").unwrap();
+    for (column, header) in ["Alpha", "Beta", "Gamma"].iter().enumerate() {
+        sheet.write_string(0, column as u16, *header).unwrap();
+    }
+    for (column, value) in ["2024-03-15", "ACME IMPORTS", "1,250.50"]
+        .iter()
+        .enumerate()
+    {
+        sheet.write_string(1, column as u16, *value).unwrap();
+    }
+    workbook.save(&xlsx).unwrap();
+
+    let preview = import::peek_file(&xlsx, 5).unwrap();
+    assert!(
+        preview.sheets[0]
+            .columns
+            .iter()
+            .all(|column| column.semantic.is_none())
+    );
+
+    let options = import::ImportOptions::selected_sheets(["Data"]).with_sheet_semantics(
+        "Data",
+        [
+            (0, Some(SemanticField::Date)),
+            (1, Some(SemanticField::Recipient)),
+            (2, Some(SemanticField::Value)),
+        ],
+    );
+    let mut db = Db::open(&dir.path().join("manual-mapping.db")).unwrap();
+    let summary = import::import_file_with_options(
+        &mut db,
+        &xlsx,
+        &options,
+        &AtomicBool::new(false),
+        &mut |_, _, _| {},
+    );
+    assert_eq!(summary.error, None);
+    assert_eq!(summary.imported, 1);
+
+    let query = Query {
+        filters: Filters {
+            year: "2024".to_string(),
+            recipient: "ACME IMPORTS".to_string(),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    assert_eq!(db.count(&query).unwrap(), 1);
+    let analytics = db.analytics(&query, 10).unwrap();
+    assert!((analytics.overview.total_value_usd - 1250.50).abs() < 0.001);
+
+    let retry = import::import_file_with_options(
+        &mut db,
+        &xlsx,
+        &options,
+        &AtomicBool::new(false),
+        &mut |_, _, _| {},
+    );
+    assert_eq!(retry.imported, 0);
+    assert!(retry.skipped_duplicate_of.is_some());
+}
+
 /// Universality: columns this build does not model are still imported verbatim
 /// into the `extra` store, shown on the record card, and reachable by search.
 #[test]
@@ -2498,28 +3116,47 @@ fn import_arbitrary_table_preserves_all_columns_in_results_filters_and_export() 
     assert_eq!(summary.quality.layout, "generic table");
     assert_eq!(summary.quality.header_row, 1);
     assert_eq!(summary.quality.source_columns, 5);
-    assert_eq!(summary.quality.recognized_columns, 0);
-    assert_eq!(summary.quality.extra_columns, 5);
+    assert_eq!(summary.quality.recognized_columns, 2);
+    assert_eq!(summary.quality.extra_columns, 3);
     assert_eq!(summary.quality.non_empty_cells, 10);
     assert_eq!(summary.quality.empty_cells, 0);
-    assert!(summary.quality.warnings.is_empty());
+    assert!(
+        summary
+            .quality
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("Only 2 semantic fields were recognized"))
+    );
 
     let log = db.import_log(1);
     assert_eq!(log.len(), 1);
     assert_eq!(log[0].quality.layout, "generic table");
     assert_eq!(log[0].quality.source_columns, 5);
-    assert_eq!(log[0].quality.extra_columns, 5);
+    assert_eq!(log[0].quality.extra_columns, 3);
 
     let shape = db.table_shape().unwrap();
     assert_eq!(shape.columns.len(), 5);
     assert_eq!(shape.columns[0].id, "sku");
     assert_eq!(shape.columns[0].header, "SKU");
     assert_eq!(shape.columns[0].role, ColumnRole::Code);
-    assert_eq!(shape.columns[0].storage, ColumnStorage::SourceJson);
+    assert_eq!(
+        shape.columns[0].storage,
+        ColumnStorage::SchemaColumn("product_code".to_string())
+    );
+    assert_eq!(
+        shape.columns[1].storage,
+        ColumnStorage::SchemaColumn("description".to_string())
+    );
     assert_eq!(shape.columns[3].id, "price_eur");
     assert_eq!(shape.columns[3].role, ColumnRole::Money);
     assert_eq!(shape.columns[4].header, "Warehouse");
-    assert!(shape.columns.iter().all(|column| column.semantic.is_none()));
+    assert_eq!(shape.columns[0].semantic, Some(SemanticField::ProductCode));
+    assert_eq!(shape.columns[1].semantic, Some(SemanticField::Description));
+    assert!(
+        shape.columns[2..]
+            .iter()
+            .all(|column| column.semantic.is_none())
+    );
 
     let q = Query {
         text: "Laptop".into(),
@@ -2569,6 +3206,94 @@ fn import_arbitrary_table_preserves_all_columns_in_results_filters_and_export() 
     let csv = std::fs::read_to_string(csv_path).unwrap();
     assert!(csv.contains("SKU;Product Name;Category;Price EUR;Warehouse"));
     assert!(csv.contains("SKU-42;Laptop Pro;Electronics;1299.50;Berlin"));
+}
+
+#[test]
+fn generic_excel_serial_date_drives_year_filters() {
+    let dir = tempfile::tempdir().unwrap();
+    let xlsx = dir.path().join("serial-date.xlsx");
+    let mut workbook = rust_xlsxwriter::Workbook::new();
+    let sheet = workbook.add_worksheet();
+    let headers = ["Order Date", "Product Name", "Value USD"];
+    for (c, header) in headers.iter().enumerate() {
+        sheet.write_string(0, c as u16, *header).unwrap();
+    }
+    sheet.write_number(1, 0, 45366.0).unwrap();
+    sheet.write_string(1, 1, "Serial date product").unwrap();
+    sheet.write_string(1, 2, "100").unwrap();
+    workbook.save(&xlsx).unwrap();
+
+    let db_path = dir.path().join("serial-date.db");
+    let mut db = Db::open(&db_path).unwrap();
+    let cancel = AtomicBool::new(false);
+    let summary = import::import_file(&mut db, &xlsx, &cancel, &mut |_, _, _| {});
+    assert_eq!(summary.error, None);
+    assert_eq!(summary.imported, 1);
+
+    let query = Query {
+        filters: Filters {
+            year: "2024".to_string(),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    assert_eq!(db.count(&query).unwrap(), 1);
+    let (ids, _rows, _dups) = db.search_page(&query, 10, 0).unwrap();
+    let card = db.record_card(ids[0]).unwrap();
+    assert!(
+        card.fields
+            .iter()
+            .any(|(header, value)| header == "Order Date" && value == "2024-03-15")
+    );
+}
+
+/// The database must not keep a WAL the size of the imported data: after an
+/// import completes, the write-ahead log is checkpointed and truncated back to
+/// a small bounded file.
+#[test]
+fn import_leaves_a_small_truncated_wal() {
+    let dir = tempfile::tempdir().unwrap();
+    let xlsx = dir.path().join("wal.xlsx");
+    let db_path = dir.path().join("wal.db");
+    // Enough rows to make the WAL clearly larger than the post-import bound.
+    let rows: Vec<Vec<(String, String)>> = (0..20_000)
+        .map(|i| {
+            vec![
+                (
+                    "declaration_number".to_string(),
+                    format!("24UA{:09}U{}", i, i % 10),
+                ),
+                ("declaration_date".to_string(), "15.03.2024".to_string()),
+                ("sender".to_string(), format!("WAL SENDER {i}")),
+                ("edrpou".to_string(), format!("{:08}", i % 100_000_000)),
+                ("recipient".to_string(), "WAL IMPORT LLC".to_string()),
+                ("product_code".to_string(), "8517130000".to_string()),
+                (
+                    "description".to_string(),
+                    format!("Bulk import row {i} with some descriptive text"),
+                ),
+                ("net_kg".to_string(), "1.5".to_string()),
+                ("currency_control_value".to_string(), "100".to_string()),
+            ]
+        })
+        .collect();
+    write_owned_test_xlsx(&xlsx, &rows);
+
+    let mut db = Db::open(&db_path).unwrap();
+    let cancel = AtomicBool::new(false);
+    let summary = import::import_file(&mut db, &xlsx, &cancel, &mut |_, _, _| {});
+    assert_eq!(summary.error, None);
+    assert_eq!(summary.imported, 20_000);
+    drop(db);
+
+    let wal_bytes = std::fs::metadata(dir.path().join("wal.db-wal"))
+        .map(|meta| meta.len())
+        .unwrap_or(0);
+    // journal_size_limit is 64 MB; a healthy post-import WAL is far below it.
+    assert!(
+        wal_bytes <= 64 * 1024 * 1024,
+        "WAL was not truncated after import: {wal_bytes} bytes"
+    );
 }
 
 /// Reimporting the same file is skipped by content hash without parsing Excel.
@@ -2857,6 +3582,7 @@ fn sender_filter_with_short_tokens_is_correct() {
         text: String::new(),
         filters,
         advanced: None,
+        record_scope: Default::default(),
     };
     assert_eq!(db.count(&q).unwrap(), 1);
     let (_, rows, _dups) = db.search_page(&q, 10, 0).unwrap();
@@ -2954,4 +3680,28 @@ fn value_normalization() {
     assert_eq!(parse_number("20560.176"), Some(20560.176));
     assert_eq!(parse_number("0.368"), Some(0.368));
     assert_eq!(parse_number(""), None);
+    // Scientific notation (Excel text renderings) must keep the exponent.
+    assert_eq!(parse_number("1.5E3"), Some(1500.0));
+    assert_eq!(parse_number("1.23E+08"), Some(123_000_000.0));
+    assert_eq!(parse_number("2e-3"), Some(0.002));
+    assert_eq!(parse_number("-1,5e2"), Some(-150.0));
+    // Exponent shape with trailing text must be rejected, not silently
+    // harvested into a wrong integer ("5e3 kg" must not become 53).
+    assert_eq!(parse_number("5e3 kg"), None);
+    assert_eq!(parse_number("2E-3 unit"), None);
+    assert_eq!(parse_number("1.5e2 kg"), None);
+    // Space groups make the remaining separator decimal even with 3 digits.
+    assert_eq!(parse_number("1 200,500"), Some(1200.5));
+    // Multiple same separators are thousands groups.
+    assert_eq!(parse_number("1.200.300"), Some(1_200_300.0));
+    // The ambiguous lone-separator-3-digits form is style-dependent:
+    // weights read decimals, totals/quantities read a thousands group.
+    assert_eq!(parse_number("1.250"), Some(1.25));
+    assert_eq!(parse_number_grouped("1.250"), Some(1250.0));
+    assert_eq!(parse_number_grouped("12,500"), Some(12500.0));
+    // Decisive shapes are identical in both styles.
+    assert_eq!(parse_number_grouped("0.368"), Some(0.368));
+    assert_eq!(parse_number_grouped("13804.656"), Some(13804.656));
+    assert_eq!(parse_number_grouped("1 234,56"), Some(1234.56));
+    assert_eq!(parse_number_grouped("$ 300,25"), Some(300.25));
 }

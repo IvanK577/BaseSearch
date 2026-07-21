@@ -1,0 +1,47 @@
+Base Search {{VERSION}}
+==================
+
+Package: {{PLATFORM}} / {{ARCH}}
+
+Start
+-----
+{{START_INSTRUCTIONS}}
+
+Base Search starts the local launcher by default. The launcher starts the
+embedded browser workspace, waits until it is healthy, and opens it in the
+default browser. The previous native workspace remains available as an
+explicit fallback with the --legacy-desktop option.
+
+Data
+----
+This public package contains no database, spreadsheet, import, export, or test
+data. The included data directory is intentionally empty. Base Search creates
+base_search.db on first use. It prefers the writable package data directory
+and falls back to the current user's home directory when the package location
+is read-only.
+
+Analytics engines
+-----------------
+This production package contains SQLite + FTS5 search and DuckDB OLAP. The
+server capability can be checked at /api/v2/engines while Base Search is
+running. A DuckDB projection is created only when the user requests an OLAP
+build; it is not bundled in this package.
+
+Command line
+------------
+{{CLI_INSTRUCTIONS}}
+
+Security
+--------
+Personal mode listens only on 127.0.0.1. LAN mode is an explicit trusted-network
+option and requires an owner account. Do not expose the unencrypted local LAN
+server directly to the public internet.
+
+Release provenance
+------------------
+Version: {{VERSION}}
+Source revision: {{GIT_SHA}}
+Features: browser, duckdb-olap
+Source date epoch: {{SOURCE_DATE_EPOCH}}
+
+{{PLATFORM_NOTE}}

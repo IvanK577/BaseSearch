@@ -1,3 +1,16 @@
 # Keep shell scripts LF-only so they run on macOS and Linux regardless of the
 # committer's core.autocrlf setting. A CRLF here would break the shebang.
 *.sh text eol=lf
+
+# Keep source and documentation line endings stable across Windows/macOS/Linux.
+*.rs text eol=lf
+*.toml text eol=lf
+*.lock text eol=lf
+*.md text eol=lf
+*.json text eol=lf
+*.ts text eol=lf
+*.tsx text eol=lf
+*.css text eol=lf
+*.html text eol=lf
+*.ps1 text eol=crlf
+*.cmd text eol=crlf

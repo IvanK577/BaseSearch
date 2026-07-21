@@ -1,8 +1,63 @@
+/// Preferred reading of the ambiguous "1-3 digits, one separator, exactly
+/// three trailing digits" form (`1.250` / `1,250`), which is a thousands
+/// group in some locales and a three-decimal value in others.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NumberStyle {
+    /// `1.250` reads as `1.25` — right for weights and per-unit prices,
+    /// where three decimal places are standard.
+    PreferDecimal,
+    /// `1.250` reads as `1250` — right for totals and quantities, where a
+    /// lone separator followed by exactly three digits is almost always a
+    /// thousands group.
+    PreferGrouped,
+}
+
 pub fn parse_number(value: &str) -> Option<f64> {
+    parse_number_styled(value, NumberStyle::PreferDecimal)
+}
+
+pub fn parse_number_grouped(value: &str) -> Option<f64> {
+    parse_number_styled(value, NumberStyle::PreferGrouped)
+}
+
+pub fn parse_number_styled(value: &str, style: NumberStyle) -> Option<f64> {
+    if let Some(number) = parse_scientific(value) {
+        return Some(number);
+    }
+    // A value that looks like scientific notation (a digit next to `e`/`E`)
+    // but failed the strict parse above is not a number — e.g. "5e3 kg".
+    // Falling through would strip the letters and concatenate the digits into
+    // a silently wrong integer (53), so reject it outright.
+    if looks_like_failed_scientific(value) {
+        return None;
+    }
+
+    // Spaces or apostrophes between digits are thousands groups; their
+    // presence marks the remaining dot/comma separator as the decimal point.
+    let mut has_group_spaces = false;
+    let mut digit_then_spaces = false;
+    let mut prev_digit = false;
     let mut compact = String::with_capacity(value.len());
     for ch in value.chars() {
-        if ch.is_ascii_digit() || matches!(ch, '.' | ',' | '-' | '+') {
+        if ch.is_ascii_digit() {
+            if digit_then_spaces {
+                has_group_spaces = true;
+            }
+            digit_then_spaces = false;
+            prev_digit = true;
             compact.push(ch);
+        } else if matches!(
+            ch,
+            ' ' | '\u{00A0}' | '\u{202F}' | '\u{2009}' | '\'' | '\u{2019}'
+        ) {
+            digit_then_spaces = digit_then_spaces || prev_digit;
+            prev_digit = false;
+        } else {
+            digit_then_spaces = false;
+            prev_digit = false;
+            if matches!(ch, '.' | ',' | '-' | '+') {
+                compact.push(ch);
+            }
         }
     }
     if !compact.chars().any(|ch| ch.is_ascii_digit()) {
@@ -13,8 +68,8 @@ pub fn parse_number(value: &str) -> Option<f64> {
     let comma_count = compact.matches(',').count();
     let decimal_sep = match (dot_count, comma_count) {
         (0, 0) => None,
-        (0, 1) => decimal_separator_for_single(&compact, ','),
-        (1, 0) => decimal_separator_for_single(&compact, '.'),
+        (0, 1) => single_separator_decimal(&compact, ',', has_group_spaces, style),
+        (1, 0) => single_separator_decimal(&compact, '.', has_group_spaces, style),
         (0, _) | (_, 0) => None,
         _ => {
             let last_dot = compact.rfind('.').unwrap_or(0);
@@ -224,12 +279,15 @@ pub(crate) fn clean_label_value(value: &str) -> String {
     }
 }
 
-/// Extracts a 20xx year from date text.
+/// Extracts a bounded 19xx/20xx year from date text.
 pub fn extract_year(value: &str) -> Option<i64> {
     let bytes = value.as_bytes();
     for window_start in 0..bytes.len().saturating_sub(3) {
         let w = &bytes[window_start..window_start + 4];
-        if w[0] == b'2' && w[1] == b'0' && w[2].is_ascii_digit() && w[3].is_ascii_digit() {
+        let plausible_year = ((w[0] == b'1' && w[1] == b'9') || (w[0] == b'2' && w[1] == b'0'))
+            && w[2].is_ascii_digit()
+            && w[3].is_ascii_digit();
+        if plausible_year {
             let before_digit = window_start > 0 && bytes[window_start - 1].is_ascii_digit();
             let after_digit =
                 window_start + 4 < bytes.len() && bytes[window_start + 4].is_ascii_digit();
@@ -241,11 +299,92 @@ pub fn extract_year(value: &str) -> Option<i64> {
     None
 }
 
-fn decimal_separator_for_single(value: &str, sep: char) -> Option<char> {
+fn single_separator_decimal(
+    value: &str,
+    sep: char,
+    has_group_spaces: bool,
+    style: NumberStyle,
+) -> Option<char> {
     let pos = value.rfind(sep)?;
     let after = value[pos + sep.len_utf8()..]
         .chars()
         .filter(|c| c.is_ascii_digit())
         .count();
-    if after == 0 { None } else { Some(sep) }
+    if after == 0 {
+        return None;
+    }
+    if after != 3 {
+        return Some(sep);
+    }
+    // Exactly three digits follow the lone separator — the classic
+    // thousands-vs-decimals ambiguity ("1.250"). Decisive signals first:
+    // space groups mean the separator is decimal; a >3-digit or zero-led
+    // integer part cannot be the first thousands group.
+    let integer: Vec<char> = value[..pos]
+        .chars()
+        .filter(|c| c.is_ascii_digit())
+        .collect();
+    let leading_zero = integer.first().is_some_and(|c| *c == '0');
+    if has_group_spaces || integer.len() > 3 || integer.is_empty() || leading_zero {
+        return Some(sep);
+    }
+    match style {
+        NumberStyle::PreferDecimal => Some(sep),
+        NumberStyle::PreferGrouped => None,
+    }
+}
+
+/// Strict scientific-notation form. Excel renders large numbers to text as
+/// `1.23E+08`; the manual separator logic would otherwise drop the exponent
+/// and produce a silently wrong value. Anything looser than
+/// `[+-]digits[.,digits][eE][+-]digits` falls back to the localized parser.
+fn parse_scientific(value: &str) -> Option<f64> {
+    let trimmed = value.trim();
+    let (mantissa, exponent) = trimmed.split_once(['e', 'E'])?;
+    if mantissa.is_empty() || exponent.is_empty() {
+        return None;
+    }
+    let exp_digits = exponent.strip_prefix(['+', '-']).unwrap_or(exponent);
+    if exp_digits.is_empty() || !exp_digits.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    let mantissa_body = mantissa.strip_prefix(['+', '-']).unwrap_or(mantissa);
+    if !mantissa_body.chars().any(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    let mut seen_sep = false;
+    for ch in mantissa_body.chars() {
+        if ch.is_ascii_digit() {
+            continue;
+        }
+        if matches!(ch, '.' | ',') && !seen_sep {
+            seen_sep = true;
+            continue;
+        }
+        return None;
+    }
+    trimmed.replace(',', ".").parse::<f64>().ok()
+}
+
+/// True when the value has an exponent shape — a digit immediately next to
+/// `e`/`E` (optionally across a sign) — that `parse_scientific` rejected.
+/// Such strings ("5e3 kg", "2E-3 unit") must NOT fall through to the digit
+/// harvester, which would silently drop the letters and concatenate digits.
+fn looks_like_failed_scientific(value: &str) -> bool {
+    let chars: Vec<char> = value.trim().chars().collect();
+    chars.iter().enumerate().any(|(i, ch)| {
+        if *ch != 'e' && *ch != 'E' {
+            return false;
+        }
+        // A digit just before the exponent marker.
+        let digit_before = i > 0 && chars[i - 1].is_ascii_digit();
+        // A digit (optionally after a sign) just after it.
+        let after = &chars[i + 1..];
+        let after = match after.first() {
+            Some('+') | Some('-') => &after[1..],
+            _ => after,
+        };
+        let digit_after = after.first().is_some_and(|c| c.is_ascii_digit());
+        digit_before && digit_after
+    })
 }

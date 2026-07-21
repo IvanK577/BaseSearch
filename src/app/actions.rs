@@ -46,6 +46,7 @@ pub(super) fn run_guided_question(app: &mut App, action: GuidedQuestionAction) {
         text: app.query_text.clone(),
         filters: app.filters.clone(),
         advanced: app.advanced_query.clone(),
+        record_scope: Default::default(),
     };
     if current.is_empty() && !matches!(action, GuidedQuestionAction::Profile(_)) {
         app.status = StatusLine {

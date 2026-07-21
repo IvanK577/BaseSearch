@@ -14,14 +14,17 @@
 use rusqlite::types::Value;
 
 use crate::storage::normalize::{
-    clean_label_value, month_key, normalize_country_key, parse_number,
+    NumberStyle, clean_label_value, month_key, normalize_country_key, parse_number_styled,
 };
 
 /// How a derived column is computed from its source schema column.
 #[derive(Clone, Copy)]
 pub(crate) enum Derivation {
     /// Localized number to `REAL`, or `NULL` when the text is not numeric.
-    Number,
+    /// The style resolves the "1.250" thousands-vs-decimals ambiguity per
+    /// column: weights keep three-decimal readings, totals and quantities
+    /// read a lone three-digit tail as a thousands group.
+    Number(NumberStyle),
     /// Cleaned grouping label; placeholder values ("0", "n/a", ...) become "".
     Label,
     /// Normalized ISO country code with synonyms merged; placeholders become "".
@@ -45,7 +48,16 @@ const fn num(name: &'static str, source: &'static str) -> DerivedColumn {
         name,
         sql_type: "REAL",
         source,
-        derivation: Derivation::Number,
+        derivation: Derivation::Number(NumberStyle::PreferDecimal),
+    }
+}
+
+const fn num_grouped(name: &'static str, source: &'static str) -> DerivedColumn {
+    DerivedColumn {
+        name,
+        sql_type: "REAL",
+        source,
+        derivation: Derivation::Number(NumberStyle::PreferGrouped),
     }
 }
 
@@ -70,10 +82,10 @@ const fn country(name: &'static str, source: &'static str) -> DerivedColumn {
 /// Columns materialized at import time. Order is stable; insert binds them in
 /// this order after the raw schema columns.
 pub(crate) const DERIVED: &[DerivedColumn] = &[
-    num("value_num", "currency_control_value"),
+    num_grouped("value_num", "currency_control_value"),
     num("net_kg_num", "net_kg"),
     num("gross_kg_num", "gross_kg"),
-    num("quantity_num", "quantity"),
+    num_grouped("quantity_num", "quantity"),
     num("rfv_num", "rfv_usd_kg"),
     num("rmv_net_num", "rmv_net_usd_kg"),
     num("rmv_extra_num", "rmv_usd_extra_unit"),
@@ -97,7 +109,7 @@ pub(crate) const DERIVED: &[DerivedColumn] = &[
 /// Computes the stored value of a derived column from its source text.
 pub(crate) fn compute(derivation: Derivation, source_value: &str) -> Value {
     match derivation {
-        Derivation::Number => match parse_number(source_value) {
+        Derivation::Number(style) => match parse_number_styled(source_value, style) {
             Some(number) if number.is_finite() => Value::Real(number),
             _ => Value::Null,
         },
@@ -109,7 +121,16 @@ pub(crate) fn compute(derivation: Derivation, source_value: &str) -> Value {
 
 /// Materialized numeric column for a source schema column, if one exists.
 pub(crate) fn num_column_for(source: &str) -> Option<&'static str> {
-    derived_name_for(source, Derivation::Number)
+    derived_name_for(source, Derivation::Number(NumberStyle::PreferDecimal))
+}
+
+/// The number style a source schema column is materialized with, so that
+/// query-time parsing (search filters) matches the stored value exactly.
+pub(crate) fn number_style_for(source: &str) -> Option<NumberStyle> {
+    DERIVED.iter().find_map(|column| match column.derivation {
+        Derivation::Number(style) if column.source == source => Some(style),
+        _ => None,
+    })
 }
 
 /// Materialized cleaned-label column for a source schema column, if one exists.
@@ -167,14 +188,19 @@ pub(crate) fn backfill_assignments() -> String {
 
 fn backfill_expr(column: &DerivedColumn) -> String {
     match column.derivation {
-        Derivation::Number => format!("num_value({})", column.source),
+        Derivation::Number(NumberStyle::PreferDecimal) => {
+            format!("num_value({})", column.source)
+        }
+        Derivation::Number(NumberStyle::PreferGrouped) => {
+            format!("num_value_grouped({})", column.source)
+        }
         Derivation::Label => format!("label_value({})", column.source),
         Derivation::Country => format!("country_key({})", column.source),
-        Derivation::Month => format!(
-            "CASE WHEN TRIM({source}) GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]*' \
-             THEN SUBSTR(TRIM({source}), 1, 7) ELSE '' END",
-            source = column.source
-        ),
+        // Use the same month_key UDF the import path uses, so a backfilled
+        // legacy row and a freshly imported row derive the identical month
+        // for every date shape (an ISO-shaped but invalid value like
+        // "1234-56-78" yields "" in both, not a bogus "1234-56").
+        Derivation::Month => format!("month_key({})", column.source),
     }
 }
 
@@ -186,6 +212,7 @@ fn month_of(date: &str) -> String {
 mod tests {
     use super::{DERIVED, Derivation, compute, month_of};
     use crate::schema::col_index;
+    use crate::storage::normalize::NumberStyle;
     use rusqlite::types::Value;
 
     #[test]
@@ -254,10 +281,30 @@ mod tests {
     #[test]
     fn compute_matches_normalization_rules() {
         assert_eq!(
-            compute(Derivation::Number, "1 200,50"),
+            compute(Derivation::Number(NumberStyle::PreferDecimal), "1 200,50"),
             Value::Real(1200.50)
         );
-        assert_eq!(compute(Derivation::Number, "not a number"), Value::Null);
+        assert_eq!(
+            compute(
+                Derivation::Number(NumberStyle::PreferDecimal),
+                "not a number"
+            ),
+            Value::Null
+        );
+        // Grouped style (totals/quantities): a lone three-digit tail is a
+        // thousands group; decimal style (weights) keeps three decimals.
+        assert_eq!(
+            compute(Derivation::Number(NumberStyle::PreferGrouped), "1,250"),
+            Value::Real(1250.0)
+        );
+        assert_eq!(
+            compute(Derivation::Number(NumberStyle::PreferDecimal), "1.250"),
+            Value::Real(1.25)
+        );
+        assert_eq!(
+            compute(Derivation::Number(NumberStyle::PreferGrouped), "1.23E+08"),
+            Value::Real(123_000_000.0)
+        );
         assert_eq!(
             compute(Derivation::Label, "  0 "),
             Value::Text(String::new())

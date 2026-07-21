@@ -4,71 +4,228 @@ on:
   push:
     branches: [master, main]
   pull_request:
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  RELEASE_FEATURES: release-package
+  RUST_VERSION: 1.96.0
+  NODE_VERSION: 22.22.0
 
 jobs:
-  build:
-    name: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: windows-latest
-            artifact: BaseSearch-windows
-            binaries: |
-              target/release/BaseSearch.exe
-              target/release/base-search-cli.exe
-          - os: ubuntu-latest
-            artifact: BaseSearch-linux
-            binaries: |
-              target/release/BaseSearch
-              target/release/base-search-cli
-          - os: macos-latest
-            artifact: BaseSearch-macos
-            binaries: |
-              target/release/BaseSearch
-              target/release/base-search-cli
-    runs-on: ${{ matrix.os }}
+  quality:
+    name: Locked release quality gate
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
       - name: Install Linux build dependencies
-        if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y libxkbcommon-dev libwayland-dev \
+          sudo apt-get install -y \
+            cmake ninja-build pkg-config \
+            libwayland-dev libxkbcommon-dev libxkbcommon-x11-dev \
             libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev
 
-      - name: Install Rust (stable)
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: web-ui/package-lock.json
+
+      - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
+          toolchain: ${{ env.RUST_VERSION }}
           components: rustfmt, clippy
 
-      - name: Cache cargo
+      - name: Cache Cargo downloads
         uses: actions/cache@v4
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
+          key: ubuntu-cargo-${{ env.RUST_VERSION }}-${{ hashFiles('Cargo.lock') }}
 
-      - name: Check formatting
-        run: cargo fmt --check
+      - name: Prove clean-clone frontend order
+        run: |
+          rm -rf web-ui/dist
+          test ! -e web-ui/dist
 
-      - name: Run tests
-        run: cargo test --release
+      - name: Install locked frontend dependencies
+        working-directory: web-ui
+        run: npm ci
 
-      - name: Run clippy
-        run: cargo clippy --all-targets -- -D warnings
+      - name: Check frontend types
+        working-directory: web-ui
+        run: npm run typecheck
 
-      - name: Build release binaries
-        run: cargo build --release
+      - name: Validate translations
+        run: node web-ui/validate-i18n.mjs
 
-      - name: Upload binaries
+      - name: Run frontend unit tests
+        working-directory: web-ui
+        run: npm run test:unit
+
+      - name: Build embedded React assets
+        working-directory: web-ui
+        run: npm run build
+
+      - name: Check Rust formatting
+        run: cargo fmt --all -- --check
+
+      - name: Check release feature set
+        run: >-
+          cargo check --locked --all-targets --no-default-features
+          --features "${RELEASE_FEATURES}"
+
+      - name: Test release feature set
+        run: >-
+          cargo test --locked --all-targets --no-default-features
+          --features "${RELEASE_FEATURES}"
+
+      - name: Lint release feature set
+        run: >-
+          cargo clippy --locked --all-targets --no-default-features
+          --features "${RELEASE_FEATURES}" -- -D warnings
+
+      - name: Create browser smoke fixture
+        run: |
+          mkdir -p target/smoke
+          cargo run --locked --quiet --no-default-features --features "${RELEASE_FEATURES}" \
+            --example make_sample -- target/smoke/sample.xlsx 320
+          cargo run --locked --quiet --no-default-features --features "${RELEASE_FEATURES}" \
+            --bin base-search-cli -- import target/smoke/sample.db target/smoke/sample.xlsx
+
+      - name: Install Playwright browser
+        working-directory: web-ui
+        run: npx playwright install --with-deps chromium
+
+      - name: Run browser workflow tests
+        working-directory: web-ui
+        env:
+          SMOKE_DB: ${{ github.workspace }}/target/smoke/sample.db
+        run: npm test
+
+  packages:
+    name: Package and smoke (${{ matrix.platform }})
+    needs: quality
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: windows
+            os: windows-latest
+          - platform: macos
+            os: macos-latest
+          - platform: linux
+            os: ubuntu-latest
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Linux build dependencies
+        if: matrix.platform == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            cmake ninja-build pkg-config \
+            libwayland-dev libxkbcommon-dev libxkbcommon-x11-dev \
+            libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: web-ui/package-lock.json
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+
+      - name: Cache Cargo downloads
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-cargo-${{ env.RUST_VERSION }}-${{ hashFiles('Cargo.lock') }}
+
+      - name: Build Windows folder and ZIP
+        if: matrix.platform == 'windows'
+        shell: pwsh
+        run: ./scripts/package-release.ps1 -OutputRoot release_packages
+
+      - name: Smoke extracted Windows package
+        if: matrix.platform == 'windows'
+        shell: pwsh
+        run: |
+          $archive = Get-ChildItem release_packages -File -Filter 'BaseSearch-*-windows-*.zip' | Select-Object -First 1
+          if (-not $archive) { throw 'Windows archive was not created.' }
+          $extract = Join-Path $PWD 'target/archive-smoke/windows'
+          New-Item -ItemType Directory -Force $extract | Out-Null
+          Expand-Archive -LiteralPath $archive.FullName -DestinationPath $extract -Force
+          $package = Get-ChildItem $extract -Directory | Select-Object -First 1
+          ./scripts/smoke-package.ps1 -PackageDir $package.FullName
+
+      - name: Build macOS app folder and ZIP
+        if: matrix.platform == 'macos'
+        run: bash scripts/package-macos.sh release_packages
+
+      - name: Smoke extracted macOS package
+        if: matrix.platform == 'macos'
+        run: |
+          archive=$(find release_packages -maxdepth 1 -type f -name 'BaseSearch-*-macos-*.zip' | head -n 1)
+          test -n "$archive"
+          mkdir -p target/archive-smoke/macos
+          unzip -q "$archive" -d target/archive-smoke/macos
+          package=$(find target/archive-smoke/macos -mindepth 1 -maxdepth 1 -type d | head -n 1)
+          bash scripts/smoke-package.sh macos "$package"
+
+      - name: Build Linux folder and tar.gz
+        if: matrix.platform == 'linux'
+        run: bash scripts/package-linux.sh release_packages
+
+      - name: Smoke extracted Linux package
+        if: matrix.platform == 'linux'
+        run: |
+          archive=$(find release_packages -maxdepth 1 -type f -name 'BaseSearch-*-linux-*.tar.gz' | head -n 1)
+          test -n "$archive"
+          mkdir -p target/archive-smoke/linux
+          tar -xzf "$archive" -C target/archive-smoke/linux
+          package=$(find target/archive-smoke/linux -mindepth 1 -maxdepth 1 -type d | head -n 1)
+          bash scripts/smoke-package.sh linux "$package"
+
+      - name: Upload complete Windows package
+        if: matrix.platform == 'windows'
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.artifact }}
-          path: ${{ matrix.binaries }}
+          name: BaseSearch-windows-package
+          path: |
+            release_packages/BaseSearch-*-windows-*.zip
+            release_packages/BaseSearch-*-windows-*.zip.sha256
+          if-no-files-found: error
+
+      - name: Upload complete macOS package
+        if: matrix.platform == 'macos'
+        uses: actions/upload-artifact@v4
+        with:
+          name: BaseSearch-macos-package
+          path: |
+            release_packages/BaseSearch-*-macos-*.zip
+            release_packages/BaseSearch-*-macos-*.zip.sha256
+          if-no-files-found: error
+
+      - name: Upload complete Linux package
+        if: matrix.platform == 'linux'
+        uses: actions/upload-artifact@v4
+        with:
+          name: BaseSearch-linux-package
+          path: |
+            release_packages/BaseSearch-*-linux-*.tar.gz
+            release_packages/BaseSearch-*-linux-*.tar.gz.sha256
+          if-no-files-found: error

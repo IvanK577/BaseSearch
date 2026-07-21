@@ -4,12 +4,14 @@ pub mod db_types;
 pub mod domain;
 #[cfg(feature = "duckdb-olap")]
 pub mod duckdb_olap;
+pub mod engines;
 pub mod export;
 pub mod i18n;
 pub mod import;
 pub mod olap;
 pub mod schema;
 pub mod search;
+#[cfg(feature = "browser")]
+pub mod server;
 pub(crate) mod storage;
-pub mod web;
 pub mod workers;

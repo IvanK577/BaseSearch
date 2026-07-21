@@ -88,6 +88,7 @@ pub(super) fn toolbar_panel(root: &mut egui::Ui, input: ToolbarInput<'_>) -> Too
         text: guided_text.clone(),
         filters: guided_filters.clone(),
         advanced: advanced_query.clone(),
+        record_scope: Default::default(),
     };
     let guided_items = guided_questions_for(&guided_text, &guided_filters);
     let mut action = ToolbarAction::default();

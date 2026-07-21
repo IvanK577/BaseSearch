@@ -7,29 +7,93 @@ use std::sync::atomic::AtomicBool;
 use rusqlite::Connection;
 use rusqlite::types::Value;
 
-use crate::domain::table::TableShape;
-use crate::search::{FieldInfo, field_catalog_for_context, result_field_catalog_for_context};
+use crate::domain::table::{
+    ImportSource, SemanticField, SourceSchema, SourceSchemaField, TableShape,
+};
+use crate::search::{
+    FieldInfo, field_catalog_for_context, field_catalog_for_source_fields,
+    result_field_catalog_for_context, result_field_catalog_for_source_fields,
+};
 use crate::storage::extra::{parse_extra, remember_extra_header};
 use crate::storage::normalize::normalize_text_key;
 use crate::storage::{
     analytics_repo, connection as storage_connection, fts_index, import_log, maintenance, meta,
-    query_plan, record_writer, result_repo, table_shape,
+    query_plan, record_writer, result_repo, source_mapping_profiles, source_schemas, table_shape,
 };
 
 pub use crate::db_types::*;
-pub use crate::storage::maintenance::{DatabaseStorageInfo, WalCheckpointInfo};
-pub use crate::storage::normalize::{extract_year, parse_number};
+pub use crate::storage::maintenance::{
+    DatabaseStorageInfo, DuplicateCompactionOptions, DuplicateCompactionProgress,
+    DuplicateCompactionReport, WalCheckpointInfo,
+};
+pub use crate::storage::normalize::{
+    NumberStyle, extract_year, parse_number, parse_number_grouped, parse_number_styled,
+};
 pub use crate::storage::records::canonical_record_hash;
 pub use crate::storage::search_text::{build_fts_query, contains_ci, fts_prefix_terms};
+pub use crate::storage::source_mapping_profiles::{
+    SourceMappingColumn, SourceMappingProfile, SourceMappingProfileCollection,
+    SourceMappingProfileCorruption, SourceMappingProfileError, SourceMappingProfileUpsert,
+    source_mapping_signature,
+};
+
+/// Sentinel error returned by [`Db::with_statement_deadline`] when the
+/// deadline interrupted the running statement.
+pub const STATEMENT_DEADLINE_EXCEEDED: &str = "statement_deadline_exceeded";
 
 pub struct Db {
     conn: Connection,
 }
 
 impl Db {
+    /// Runs `f` under a wall-clock deadline: SQLite's progress handler
+    /// interrupts any statement still executing when the deadline passes.
+    /// Returns [`STATEMENT_DEADLINE_EXCEEDED`] in that case, so callers can
+    /// answer with an actionable message instead of blocking a worker thread
+    /// for an unbounded broad-scope query.
+    pub fn with_statement_deadline<T>(
+        &self,
+        timeout: std::time::Duration,
+        f: impl FnOnce(&Db) -> Result<T, String>,
+    ) -> Result<T, String> {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let fired = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&fired);
+        let deadline = std::time::Instant::now() + timeout;
+        let installed = self
+            .conn
+            .progress_handler(
+                10_000,
+                Some(move || {
+                    if std::time::Instant::now() >= deadline {
+                        flag.store(true, Ordering::Relaxed);
+                        true
+                    } else {
+                        false
+                    }
+                }),
+            )
+            .is_ok();
+        let result = f(self);
+        if installed {
+            let _ = self.conn.progress_handler(0, None::<fn() -> bool>);
+        }
+        if result.is_err() && fired.load(Ordering::Relaxed) {
+            return Err(STATEMENT_DEADLINE_EXCEEDED.to_string());
+        }
+        result
+    }
+
     pub fn open(path: &Path) -> Result<Db, String> {
         Ok(Db {
             conn: storage_connection::open(path)?,
+        })
+    }
+
+    pub fn open_runtime(path: &Path) -> Result<Db, String> {
+        Ok(Db {
+            conn: storage_connection::open_runtime(path)?,
         })
     }
 
@@ -101,6 +165,43 @@ impl Db {
         record_writer::insert_batch(&self.conn, source_file, records)
     }
 
+    pub(crate) fn register_import_source_schema(
+        &self,
+        raw_headers: &[String],
+        shape: &TableShape,
+        fixed_values: &std::collections::BTreeMap<SemanticField, String>,
+        source_file: &str,
+        table_name: &str,
+        import_fingerprint: &str,
+    ) -> rusqlite::Result<(SourceSchema, ImportSource)> {
+        let source_schema =
+            source_schemas::register_schema(&self.conn, raw_headers, shape, fixed_values)?;
+        let source = source_schemas::register_import_source(
+            &self.conn,
+            source_schema.id,
+            source_file,
+            table_name,
+            import_fingerprint,
+        )?;
+        Ok((source_schema, source))
+    }
+
+    pub(crate) fn insert_batch_for_source(
+        &mut self,
+        source_file: &str,
+        schema_id: i64,
+        source_id: i64,
+        records: &[ImportRecord],
+    ) -> rusqlite::Result<(u64, u64)> {
+        record_writer::insert_batch_scoped(
+            &self.conn,
+            source_file,
+            Some(schema_id),
+            Some(source_id),
+            records,
+        )
+    }
+
     // ---------- FTS ----------
 
     /// Indexes all rows with an id above the watermark.
@@ -113,6 +214,14 @@ impl Db {
         fts_index::index(&mut self.conn, cancel, &mut progress)
     }
 
+    pub fn repair_fts(
+        &mut self,
+        cancel: &AtomicBool,
+        mut progress: impl FnMut(u64, u64),
+    ) -> Result<FtsRepairReport, FtsRepairError> {
+        fts_index::repair(&mut self.conn, cancel, &mut progress)
+    }
+
     /// Number of rows not yet present in the search index.
     pub fn unindexed_rows(&self) -> u64 {
         fts_index::unindexed_rows(&self.conn)
@@ -121,6 +230,18 @@ impl Db {
     /// Searchable field catalog for the current database, including imported
     /// source columns preserved in each row's canonical fields or JSON payload.
     pub fn field_catalog(&self) -> rusqlite::Result<Vec<FieldInfo>> {
+        let source_fields = source_schemas::list_fields(&self.conn, None)?;
+        if !source_fields.is_empty() {
+            let legacy = if source_schemas::has_legacy_rows(&self.conn)? {
+                field_catalog_for_context(
+                    table_shape::get(&self.conn).as_ref(),
+                    self.extra_headers()?,
+                )
+            } else {
+                Vec::new()
+            };
+            return Ok(field_catalog_for_source_fields(source_fields, legacy));
+        }
         let extra_headers = self.extra_headers()?;
         Ok(field_catalog_for_context(
             self.table_shape().as_ref(),
@@ -129,6 +250,21 @@ impl Db {
     }
 
     pub fn result_fields(&self) -> rusqlite::Result<Vec<FieldInfo>> {
+        let source_fields = source_schemas::list_fields(&self.conn, None)?;
+        if !source_fields.is_empty() {
+            let legacy = if source_schemas::has_legacy_rows(&self.conn)? {
+                result_field_catalog_for_context(
+                    table_shape::get(&self.conn).as_ref(),
+                    self.extra_headers()?,
+                )
+            } else {
+                Vec::new()
+            };
+            return Ok(result_field_catalog_for_source_fields(
+                source_fields,
+                legacy,
+            ));
+        }
         let extra_headers = self.extra_headers()?;
         Ok(result_field_catalog_for_context(
             self.table_shape().as_ref(),
@@ -137,21 +273,77 @@ impl Db {
     }
 
     pub fn field_catalog_cached(&self) -> Vec<FieldInfo> {
+        if let Ok(source_fields) = source_schemas::list_fields(&self.conn, None)
+            && !source_fields.is_empty()
+        {
+            let legacy = source_schemas::has_legacy_rows(&self.conn)
+                .ok()
+                .filter(|has_legacy| *has_legacy)
+                .map(|_| {
+                    field_catalog_for_context(
+                        table_shape::get(&self.conn).as_ref(),
+                        self.cached_extra_headers(),
+                    )
+                })
+                .unwrap_or_default();
+            return field_catalog_for_source_fields(source_fields, legacy);
+        }
         let extra_headers = self.cached_extra_headers();
         field_catalog_for_context(self.table_shape().as_ref(), extra_headers)
     }
 
     pub fn result_fields_cached(&self) -> Vec<FieldInfo> {
+        if let Ok(source_fields) = source_schemas::list_fields(&self.conn, None)
+            && !source_fields.is_empty()
+        {
+            let legacy = source_schemas::has_legacy_rows(&self.conn)
+                .ok()
+                .filter(|has_legacy| *has_legacy)
+                .map(|_| {
+                    result_field_catalog_for_context(
+                        table_shape::get(&self.conn).as_ref(),
+                        self.cached_extra_headers(),
+                    )
+                })
+                .unwrap_or_default();
+            return result_field_catalog_for_source_fields(source_fields, legacy);
+        }
         let extra_headers = self.cached_extra_headers();
         result_field_catalog_for_context(self.table_shape().as_ref(), extra_headers)
     }
 
     pub fn table_shape(&self) -> Option<TableShape> {
-        table_shape::get(&self.conn)
+        source_schemas::compatibility_shape(&self.conn)
+            .ok()
+            .flatten()
+            .or_else(|| table_shape::get(&self.conn))
     }
 
     pub fn remember_table_shape(&self, shape: &TableShape) -> TableShape {
         table_shape::merge(&self.conn, shape)
+    }
+
+    pub fn list_source_schemas(&self) -> rusqlite::Result<Vec<SourceSchema>> {
+        source_schemas::list(&self.conn)
+    }
+
+    pub fn get_source_schema(&self, public_id: &str) -> rusqlite::Result<Option<SourceSchema>> {
+        source_schemas::get(&self.conn, public_id)
+    }
+
+    pub fn list_source_fields(
+        &self,
+        schema_public_id: Option<&str>,
+    ) -> rusqlite::Result<Vec<SourceSchemaField>> {
+        source_schemas::list_fields(&self.conn, schema_public_id)
+    }
+
+    pub fn list_import_sources(&self) -> rusqlite::Result<Vec<ImportSource>> {
+        source_schemas::list_import_sources(&self.conn)
+    }
+
+    pub fn get_import_source(&self, public_id: &str) -> rusqlite::Result<Option<ImportSource>> {
+        source_schemas::get_import_source(&self.conn, public_id)
     }
 
     /// Assigns or clears the analytical meaning of a shape column by id, so the
@@ -162,6 +354,19 @@ impl Db {
         column_id: &str,
         semantic: Option<crate::domain::table::SemanticField>,
     ) -> bool {
+        // Registered source schemas own the shape now: write the meaning
+        // through to every physical field behind the compatibility column.
+        if let Ok(Some((_, backing))) = source_schemas::compatibility_shape_with_fields(&self.conn)
+        {
+            return match backing.get(column_id) {
+                Some(field_ids) => {
+                    source_schemas::set_fields_semantic(&self.conn, field_ids, semantic)
+                        .unwrap_or(false)
+                }
+                None => false,
+            };
+        }
+        // Legacy metadata-blob shape for databases imported before schemas.
         let Some(mut shape) = table_shape::get(&self.conn) else {
             return false;
         };
@@ -175,6 +380,42 @@ impl Db {
         column.semantic = semantic;
         table_shape::set(&self.conn, &shape);
         true
+    }
+
+    // ---------- reusable source mappings ----------
+
+    pub fn list_source_mapping_profiles(
+        &self,
+    ) -> Result<SourceMappingProfileCollection, SourceMappingProfileError> {
+        source_mapping_profiles::list(&self.conn)
+    }
+
+    pub fn get_source_mapping_profile(
+        &self,
+        id: i64,
+    ) -> Result<Option<SourceMappingProfile>, SourceMappingProfileError> {
+        source_mapping_profiles::get(&self.conn, id)
+    }
+
+    pub fn suggest_source_mapping_profiles(
+        &self,
+        signature: &str,
+    ) -> Result<SourceMappingProfileCollection, SourceMappingProfileError> {
+        source_mapping_profiles::suggest(&self.conn, signature)
+    }
+
+    pub fn upsert_source_mapping_profile(
+        &self,
+        profile: SourceMappingProfileUpsert,
+    ) -> Result<SourceMappingProfile, SourceMappingProfileError> {
+        source_mapping_profiles::upsert(&self.conn, profile)
+    }
+
+    pub fn delete_source_mapping_profile(
+        &self,
+        id: i64,
+    ) -> Result<bool, SourceMappingProfileError> {
+        source_mapping_profiles::delete(&self.conn, id)
     }
 
     pub fn extra_headers(&self) -> rusqlite::Result<Vec<String>> {
@@ -236,21 +477,25 @@ impl Db {
 
     // ---------- search ----------
 
-    fn filter_plan(
-        &self,
-        q: &Query,
-        unique_only: bool,
-    ) -> rusqlite::Result<query_plan::FilterPlan> {
-        query_plan::build_filter_plan(q, unique_only, self.meta_get_i64("fts_watermark"))
+    fn filter_plan(&self, q: &Query) -> rusqlite::Result<query_plan::FilterPlan> {
+        let shape = table_shape::effective(&self.conn);
+        let source_fields = source_schemas::field_lookup(&self.conn)?;
+        query_plan::build_filter_plan(
+            q,
+            q.record_scope == RecordScope::Canonical,
+            self.meta_get_i64("fts_watermark"),
+            shape.as_ref(),
+            &source_fields,
+        )
     }
 
     pub fn count(&self, q: &Query) -> rusqlite::Result<u64> {
-        result_repo::count(&self.conn, self.filter_plan(q, false)?)
+        result_repo::count(&self.conn, self.filter_plan(q)?)
     }
 
     /// Legacy fixed-schema result page.
     pub fn search_page(&self, q: &Query, limit: u64, offset: u64) -> rusqlite::Result<SearchPage> {
-        result_repo::legacy_search_page(&self.conn, q, self.filter_plan(q, false)?, limit, offset)
+        result_repo::legacy_search_page(&self.conn, q, self.filter_plan(q)?, limit, offset)
     }
 
     pub fn search_page_dynamic(
@@ -259,14 +504,63 @@ impl Db {
         limit: u64,
         offset: u64,
     ) -> rusqlite::Result<DynamicSearchPage> {
-        let fields = self.result_fields_cached();
+        self.search_page_dynamic_sorted(q, limit, offset, None)
+    }
+
+    /// Result fields for a query: schema-exact when the query addresses
+    /// registered source fields directly, else the folded compatibility
+    /// catalog every plain search uses.
+    pub fn result_fields_for_query(&self, q: &Query) -> rusqlite::Result<Vec<FieldInfo>> {
+        let lookup = source_schemas::field_lookup(&self.conn)?;
+        self.result_fields_for_query_with(q, &lookup)
+    }
+
+    fn result_fields_for_query_with(
+        &self,
+        q: &Query,
+        lookup: &std::collections::HashMap<String, SourceSchemaField>,
+    ) -> rusqlite::Result<Vec<FieldInfo>> {
+        if let Some(advanced) = &q.advanced {
+            let mut schema_ids: Vec<i64> = crate::search::source_field_ids(advanced)
+                .iter()
+                .filter_map(|field_id| lookup.get(field_id))
+                .map(|field| field.schema_id)
+                .collect();
+            schema_ids.sort_unstable();
+            schema_ids.dedup();
+            if !schema_ids.is_empty() {
+                let mut fields = Vec::new();
+                for schema_id in schema_ids {
+                    fields.extend(source_schemas::list_fields_by_schema_id(
+                        &self.conn, schema_id,
+                    )?);
+                }
+                return Ok(crate::search::schema_exact_field_infos(&fields));
+            }
+        }
+        Ok(self.result_fields_cached())
+    }
+
+    /// Result page with an optional user-chosen column ordering. `sort = None`
+    /// keeps the default recency order.
+    pub fn search_page_dynamic_sorted(
+        &self,
+        q: &Query,
+        limit: u64,
+        offset: u64,
+        sort: Option<ResultSort>,
+    ) -> rusqlite::Result<DynamicSearchPage> {
+        let source_fields = source_schemas::field_lookup(&self.conn)?;
+        let fields = self.result_fields_for_query_with(q, &source_fields)?;
         result_repo::dynamic_search_page(
             &self.conn,
             q,
             fields,
-            self.filter_plan(q, false)?,
+            self.filter_plan(q)?,
             limit,
             offset,
+            sort.as_ref(),
+            &source_fields,
         )
     }
 
@@ -277,7 +571,7 @@ impl Db {
         last_id: i64,
         limit: u64,
     ) -> rusqlite::Result<(i64, Vec<Vec<String>>)> {
-        result_repo::legacy_export_batch(&self.conn, self.filter_plan(q, false)?, last_id, limit)
+        result_repo::legacy_export_batch(&self.conn, self.filter_plan(q)?, last_id, limit)
     }
 
     pub fn export_batch_dynamic(
@@ -298,22 +592,48 @@ impl Db {
         limit: u64,
         fields: &[FieldInfo],
     ) -> rusqlite::Result<(i64, Vec<Vec<String>>)> {
+        let source_fields = source_schemas::field_lookup(&self.conn)?;
         result_repo::export_batch_fields(
             &self.conn,
             fields,
-            self.filter_plan(q, false)?,
+            self.filter_plan(q)?,
             last_id,
             limit,
+            &source_fields,
+        )
+    }
+
+    pub fn visit_export_rows_fields(
+        &self,
+        q: &Query,
+        fields: &[FieldInfo],
+        sort_catalog: &[FieldInfo],
+        sort: Option<&ResultSort>,
+        visit: impl FnMut(Vec<String>) -> bool,
+    ) -> rusqlite::Result<u64> {
+        let source_fields = source_schemas::field_lookup(&self.conn)?;
+        result_repo::visit_export_rows_fields(
+            &self.conn,
+            q,
+            fields,
+            sort_catalog,
+            self.filter_plan(q)?,
+            sort,
+            visit,
+            &source_fields,
         )
     }
 
     /// Full record card by id.
     pub fn record_card(&self, id: i64) -> rusqlite::Result<RecordCard> {
-        if self.table_shape().is_none() {
+        let Some(schema_id) = source_schemas::schema_id_for_record(&self.conn, id)? else {
             return result_repo::legacy_record_card(&self.conn, id);
-        }
-        let fields = self.result_fields_cached();
-        result_repo::record_card(&self.conn, fields, id)
+        };
+        let source_schema = source_schemas::get_by_id(&self.conn, schema_id)?
+            .ok_or(rusqlite::Error::QueryReturnedNoRows)?;
+        let fields = result_field_catalog_for_source_fields(source_schema.columns, Vec::new());
+        let source_fields = source_schemas::field_lookup(&self.conn)?;
+        result_repo::record_card(&self.conn, fields, id, &source_fields)
     }
 
     // ---------- analytics ----------
@@ -347,7 +667,7 @@ impl Db {
         hs_level: u8,
     ) -> rusqlite::Result<Analytics> {
         let overview = self.analytics_overview(q)?;
-        let months = self.analytics_months(q)?;
+        let months = self.analytics_months(q, overview.compatible_usd.is_some())?;
         let mut analytics = Analytics {
             overview,
             months,
@@ -477,7 +797,7 @@ impl Db {
     ) -> rusqlite::Result<AnalyticsSection> {
         analytics_repo::section(
             &self.conn,
-            self.filter_plan(q, true)?,
+            self.filter_plan(q)?,
             kind,
             hs_level,
             limit,
@@ -486,13 +806,17 @@ impl Db {
     }
 
     fn analytics_overview(&self, q: &Query) -> rusqlite::Result<AnalyticsOverview> {
-        analytics_repo::overview(&self.conn, self.filter_plan(q, true)?)
+        analytics_repo::overview(&self.conn, self.filter_plan(q)?)
     }
 
     /// Import dynamics grouped by month ("YYYY-MM" from the ISO date).
     /// Returns the most recent 48 months in chronological order.
-    fn analytics_months(&self, q: &Query) -> rusqlite::Result<Vec<AnalyticsMonthRow>> {
-        analytics_repo::months(&self.conn, self.filter_plan(q, true)?)
+    fn analytics_months(
+        &self,
+        q: &Query,
+        query_is_usd: bool,
+    ) -> rusqlite::Result<Vec<AnalyticsMonthRow>> {
+        analytics_repo::months(&self.conn, self.filter_plan(q)?, query_is_usd)
     }
 
     /// Full dossier for one company (by EDRPOU): name variants, headline
@@ -516,7 +840,7 @@ impl Db {
     ) -> rusqlite::Result<Undervaluation> {
         analytics_repo::undervaluation(
             &self.conn,
-            self.filter_plan(q, true)?,
+            self.filter_plan(q)?,
             threshold,
             min_samples,
             limit,
@@ -538,7 +862,7 @@ impl Db {
     ) -> rusqlite::Result<PivotResult> {
         analytics_repo::pivot(
             &self.conn,
-            self.filter_plan(q, true)?,
+            self.filter_plan(q)?,
             row_dim,
             col_dim,
             metric,
@@ -557,6 +881,10 @@ impl Db {
         record_writer::total_rows(&self.conn)
     }
 
+    pub fn max_record_id(&self) -> u64 {
+        record_writer::max_record_id(&self.conn)
+    }
+
     pub fn add_import_log(&self, entry: ImportLogWrite<'_>) {
         import_log::add(&self.conn, entry);
     }
@@ -571,6 +899,15 @@ impl Db {
 
     pub fn vacuum_database(&self) -> rusqlite::Result<()> {
         maintenance::vacuum_database(&self.conn)
+    }
+
+    pub fn compact_duplicate_payloads(
+        &mut self,
+        cancel: &AtomicBool,
+        options: DuplicateCompactionOptions,
+        progress: impl FnMut(DuplicateCompactionProgress),
+    ) -> rusqlite::Result<DuplicateCompactionReport> {
+        maintenance::compact_duplicate_payloads(&mut self.conn, cancel, options, progress)
     }
 
     /// Full cleanup: removes all records and import logs, then returns disk

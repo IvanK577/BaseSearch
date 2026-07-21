@@ -66,7 +66,8 @@ fn col_spec(name: &str) -> (f32, CellKind) {
 pub(super) fn field_col_spec(field: &FieldInfo) -> (f32, CellKind) {
     match &field.source {
         FieldRef::Column(name) => col_spec(name),
-        FieldRef::Extra(_) => match field.kind {
+        // Source-schema fields render by their kind, like extra columns.
+        FieldRef::Extra(_) | FieldRef::SourceField(_) => match field.kind {
             FieldKind::Number => (116.0, CellKind::Number),
             FieldKind::Code => (120.0, CellKind::Code),
             FieldKind::Date | FieldKind::Country => (110.0, CellKind::Weak),
@@ -79,20 +80,20 @@ pub(super) fn field_col_spec(field: &FieldInfo) -> (f32, CellKind) {
 pub(super) fn field_glossary(field: &FieldInfo) -> Option<&'static str> {
     match &field.source {
         FieldRef::Column(name) => column_glossary(name),
-        FieldRef::Extra(_) => None,
+        FieldRef::Extra(_) | FieldRef::SourceField(_) => None,
     }
 }
 
 fn field_column_name(field: &FieldInfo) -> Option<&str> {
     match &field.source {
         FieldRef::Column(name) => Some(name.as_str()),
-        FieldRef::Extra(_) => None,
+        FieldRef::Extra(_) | FieldRef::SourceField(_) => None,
     }
 }
 
 pub(super) fn column_group(field: &FieldInfo) -> &'static str {
     match &field.source {
-        FieldRef::Extra(_) => "Source columns",
+        FieldRef::Extra(_) | FieldRef::SourceField(_) => "Source columns",
         FieldRef::Column(name) => {
             match name.as_str() {
                 "declaration_number" | "declaration_date" | "declaration_type"

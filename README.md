@@ -1,4 +1,4 @@
-# Base Search 1.6.5
+# Base Search 2.0.0
 
 [![CI](https://github.com/IvanK577/BaseSearch/actions/workflows/ci.yml/badge.svg)](https://github.com/IvanK577/BaseSearch/actions/workflows/ci.yml)
 
@@ -9,7 +9,7 @@ It is built for people who have many large spreadsheet files and need to work
 with them as one searchable database instead of opening heavy workbooks one by
 one in Excel. Base Search is document-neutral: ordinary tabular Excel files are
 imported with their real source columns as first-class fields, and optional
-semantic profiles can add better analytics when familiar business fields are
+semantic profiles add better analytics when familiar business fields are
 recognized.
 
 Base Search runs locally. It does not upload spreadsheets, search results, or
@@ -31,37 +31,18 @@ the database to a cloud service.
 - Opens a full details card for any row.
 - Provides analytics for the current query and filters.
 - Exports results to CSV or XLSX.
-- Includes an optional local browser interface on `127.0.0.1`.
 - Works offline on Windows, macOS, and Linux.
 
 ## Typical Use Cases
 
 - Search across many Excel exports as one dataset.
 - Find all rows related to a product, brand, SKU/code, company, country, or year.
-- Compare which companies, SKUs/codes, brands, or countries dominate a
-  selected result set.
+- Compare which companies, SKUs/codes, brands, or countries dominate a selected
+  result set.
 - Inspect suspicious prices or unusual value-per-weight patterns.
 - Prepare filtered CSV/XLSX extracts for further work in Excel, BI tools, or
   reports.
 - Use generic Excel tables as searchable local data without writing SQL.
-
-## Why Not Just Excel?
-
-Excel is strong for viewing and editing spreadsheets. It becomes inconvenient
-when the workflow is mostly:
-
-1. Open a very large file.
-2. Wait for filters or search.
-3. Repeat the same search in several other files.
-4. Copy matching rows into a new workbook.
-
-Base Search changes that workflow:
-
-1. Import the files once.
-2. Let the app build a local database and search index.
-3. Search, filter, analyze, and export from the indexed database.
-
-This is especially useful when the same dataset is searched many times.
 
 ## Quick Start
 
@@ -73,21 +54,14 @@ Run the prebuilt application from the distribution folder:
 dist\BaseSearch\BaseSearch.exe
 ```
 
-To open the local browser interface:
+A small launcher window opens, starts the local server, and opens the
+workspace in your default browser. Two modes are offered:
 
-```text
-dist\BaseSearch\BaseSearch.exe --web
-```
-
-or double-click:
-
-```text
-dist\BaseSearch\Open Browser Mode.cmd
-```
-
-The browser opens a local address such as `http://127.0.0.1:7832`. This is not a
-hosted web service. The page talks to the Base Search process running on the
-same computer.
+- **Personal** (default) — binds `127.0.0.1` only; no sign-in, nothing is
+  reachable from other machines.
+- **Trusted LAN** — binds a private LAN/VPN address the launcher discovered, so
+  colleagues on the same network can open the shown URL. Sign-in becomes
+  mandatory and the server refuses to start until at least one account exists.
 
 ### macOS
 
@@ -117,6 +91,62 @@ cd BaseSearch
 On Fedora use `sudo dnf install -y git`. On Arch use
 `sudo pacman -S --needed git`.
 
+## Browser Workspace (Local)
+
+Base Search also ships a local browser workspace: the same import, search,
+analytics, and export engine behind a modern web UI, served by a small server
+that binds `127.0.0.1` only. Nothing is sent to a cloud.
+
+Start it from the desktop binary or the CLI:
+
+```text
+BaseSearch --browser
+base-search-cli browser path\to\base_search.db --port 7833
+```
+
+Options: `--host` (defaults to loopback; anything else explicitly opts in to
+LAN exposure), `--port` (default `7833`), and `--no-open` to skip launching the
+browser. The workspace covers search with filters and advanced rules, a
+many-column results grid with a column picker, record cards, analytics
+(overview, monthly dynamics, companies, goods, countries, prices, pivot, a
+printable report, and side-by-side compare), a price-risk screen, per-company
+dossiers, imports with a pre-import preview plus progress and history, CSV/XLSX
+export, column mapping, and maintenance — all backed by the real API. Long
+operations run as background jobs.
+
+The frontend lives in `web-ui/` (Vite + React + TypeScript). Build it with
+`npm install && npm run build` in `web-ui/`; the compiled assets are embedded
+into the release binary.
+
+### Sharing on a local network (optional)
+
+The easiest path is the launcher's **Trusted LAN** mode. From the CLI, binding
+any non-loopback host turns sign-in on. Create the first administrator locally
+first, then start the server:
+
+```text
+base-search-cli user-add path\to\base_search.db admin --role admin
+base-search-cli browser path\to\base_search.db --host 192.168.1.10
+```
+
+A networked server refuses to start with zero accounts. Accounts are
+argon2-hashed and stored beside the database; sessions use HttpOnly cookies
+with CSRF protection, and sign-in is rate-limited. Roles: **owner/admin**
+(everything, including accounts and maintenance), **editor** (import and column
+mapping), **viewer** (search, analytics, export — read-only). The last enabled
+administrator can never be removed by accident.
+
+The connection is **not encrypted** — keep it on a trusted LAN or behind a TLS
+reverse proxy, and never expose it to the internet. Loopback use stays
+password-free.
+
+### Optional DuckDB OLAP
+
+Build with `--features browser,duckdb-olap` to enable the columnar analytics
+engine. Build a projection (from the Analytics screen or `base-search-cli
+olap-build <db>`) and analytics run on DuckDB when the projection is fresh and
+matches the SQLite totals, falling back to SQLite otherwise.
+
 ## Data Location
 
 Base Search stores its database outside the executable.
@@ -138,86 +168,27 @@ outside the executable makes updates and backups simpler.
 5. Use **Advanced** for structured search logic.
 6. Review the result table.
 7. Open row details when needed.
-8. Open **Analytics** for summaries and breakdowns.
-9. Export matching rows to CSV or XLSX.
+8. Use **Analytics** to understand companies, goods, countries, prices, pivots,
+   reports, and comparisons for the current result set.
+9. Export matching rows to CSV or XLSX when needed.
 
-## Universal Table Import
+## Universal Tables
 
-Base Search 1.6.5 is not limited to one fixed spreadsheet layout.
-
-The default import model is a generic table:
-
-- the detected header row becomes the column list;
-- every source column is preserved;
-- values are indexed for full-text search;
-- source fields are visible in the result table;
-- source fields are available in Advanced Search;
-- CSV/XLSX export includes the dynamic columns.
-
-When Base Search recognizes common business fields such as date, company,
-SKU/code, country, value, quantity, weight, or price indicators, it adds semantic
-meaning for better analytics. The original spreadsheet headers still remain the
-user-facing columns. Generic columns remain searchable, filterable, visible,
-and exportable without requiring any document-specific schema.
-
-After each import, Base Search shows a quality report. It explains which layout
-was detected, which row was used as the header, how many columns were recognized
-as semantic fields, how many source columns were preserved, how full the
-imported table is, and whether anything deserves a manual check.
-
-## Search
-
-Base Search supports two search styles.
-
-### Simple Search
-
-Use the main search box for fast broad search:
-
-```text
-brand name
-SKU-42
-invoice number
-company name
-```
-
-Rules:
-
-- multiple words must all be present;
-- `word*` searches by prefix;
-- numeric terms with 4 or more digits can be treated as code prefixes;
-- text matching is case-insensitive;
-- field filters are better when the meaning matters.
-
-Broad search is useful for discovery. Field filters are narrower and more
-precise when the column meaning matters.
-
-### Advanced Search
-
-Use Advanced Search for structured questions:
-
-- company contains A or B;
-- origin country is not CN;
-- year is between 2024 and 2026;
-- value is greater than a threshold;
-- an imported source column is empty or not empty;
-- several groups of rules should match with all/any logic.
-
-Advanced Search is designed for users who need flexible filtering without
-writing SQL.
+Base Search can import regular Excel tables even when they do not follow a
+customs schema. Unknown columns are preserved as dynamic fields, included in
+full-text search, shown in the result table, available in Advanced Search,
+listed on the row card, and exported to CSV/XLSX.
 
 ## Analytics
 
-Analytics follows the current search and filters. If the Results table is
-showing a filtered subset, Analytics is calculated for the same subset.
+Analytics are calculated from the same query and filters as the result table.
 
-Available views include:
-
-| View | Purpose |
+| Area | Purpose |
 |---|---|
-| Overview | Headline totals, document IDs, companies, value, weight, quantity, countries, and monthly dynamics when recognized fields exist. |
-| Companies | Top company identifiers and recognized company columns. |
-| Goods | Product/SKU codes, brands, and product groups when recognized fields exist. |
-| Countries | Recognized country columns. |
+| Overview | Rows, declarations, companies, value, weight, average value per kg, codes, brands, and countries. |
+| Companies | Recipients, senders, identifiers, totals, shares, and full lists. |
+| Goods | Product codes, trademarks, product groups, values, weights, and participating companies. |
+| Countries | Origin, dispatch, and trade countries counted separately. |
 | Prices | Average and weighted price metrics, medians, quartiles, and possible undervaluation checks. |
 | Pivot | Cross-tab analysis by company, code, country, month, year, or other supported dimensions. |
 | Report | A compact working report that can be copied or saved as print-ready HTML. |
@@ -225,24 +196,6 @@ Available views include:
 
 For very broad data, Base Search avoids running heavy analytics on an empty
 global query by accident. Add a query or filter first.
-
-## Browser Mode
-
-Browser mode exposes the same local database through a localhost interface:
-
-```text
-BaseSearch.exe --web
-```
-
-It is useful when a browser-based table and analytics view is more convenient
-than the native desktop UI.
-
-Security notes:
-
-- the server binds to localhost by default;
-- API routes use a per-session token;
-- files and database content stay on the same machine;
-- this is not a multi-user hosted server.
 
 ## Export
 
@@ -270,19 +223,16 @@ base-search-cli benchmark <db> [query...] [--year Y] [--code C] [--origin C] [--
 base-search-cli olap-build <db> [projection.duckdb]
 base-search-cli olap-benchmark <projection.duckdb> [query...] [--year Y] [--origin C]
 base-search-cli export <db> <out.csv|out.xlsx> [query...]
-base-search-cli web [db] [--host 127.0.0.1] [--port 7832] [--no-open]
 ```
 
 The desktop app is the primary interface. The CLI is mainly for verification,
 batch work, troubleshooting, and database maintenance.
 
-`benchmark` runs the same practical scenarios that matter for future OLAP and
-database-backend decisions: search count, first result page, analytics overview,
+`benchmark` runs practical scenarios for future OLAP and database-backend
+decisions: search count, first result page, analytics overview,
 company/product/country/price aggregations, pivot, and possible undervaluation
-checks. It measures the current SQLite baseline before comparing alternatives
-such as DuckDB, PostgreSQL, ClickHouse, OpenSearch, or Elasticsearch.
-Use `--json` for machine-readable output and `--allow-empty` only when a
-full-database benchmark is intentional.
+checks. Use `--json` for machine-readable output and `--allow-empty` only when
+a full-database benchmark is intentional.
 
 Optional DuckDB OLAP support can be enabled for technical comparisons and heavy
 aggregate experiments:
@@ -315,22 +265,6 @@ the database to return unused pages to the filesystem. Vacuuming a large
 database can take a long time and should be done after closing other Base
 Search windows.
 
-## Performance Notes
-
-Performance depends on:
-
-- CPU speed;
-- SSD/HDD speed;
-- Excel file format;
-- number of rows and columns;
-- query breadth;
-- available RAM;
-- whether analytics or export is running.
-
-Narrow searches after indexing are usually interactive. Import speed is often
-limited by Excel parsing and disk writes. Very broad analytics and large exports
-depend heavily on database size and hardware.
-
 ## Build From Source
 
 Requirements:
@@ -346,6 +280,7 @@ Build and test:
 ```bash
 cargo test
 cargo build --release
+cargo build --release --features duckdb-olap --bin BaseSearch --bin base-search-cli
 ```
 
 Release binaries are created in `target/release/`:
@@ -373,13 +308,11 @@ Base Search is built with:
 - SQLite aggregate queries for analytics;
 - a benchmark command for repeatable search and OLAP baseline measurements;
 - optional DuckDB projections for analytical backend experiments;
-- a small localhost web server for browser mode;
 - xxhash for duplicate detection;
 - CSV and XLSX writers for export.
 
-The current architecture is a local single-machine application. A hosted or
-multi-user server edition would require a separate deployment model and is not
-part of the current release.
+The application is local-first: selected files are imported into a local
+database, searched locally, analyzed locally, and exported locally.
 
 ## Privacy
 
@@ -394,7 +327,6 @@ reports, and database on their own machine.
 - Generic tables are searchable and exportable, but semantic analytics require
   recognizable fields such as dates, values, weights, companies, codes, or
   countries.
-- Browser mode is local-only, not a shared web application.
 - Very large databases still need enough disk space and a reasonably fast SSD.
 
 ## Changelog

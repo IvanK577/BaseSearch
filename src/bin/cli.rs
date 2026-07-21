@@ -16,7 +16,6 @@ use base_search::export;
 use base_search::import::{self, ImportPhase};
 use base_search::olap::{OlapBenchmarkOptions, OlapBenchmarkReport, run_sqlite_benchmark};
 use base_search::search::FieldInfo;
-use base_search::web;
 
 const USAGE: &str = "base-search-cli - technical database checks for Base Search
 
@@ -42,11 +41,15 @@ Usage:
                        [--section-limit N] [--hs-level 2|4|6|10]
                        [--pivot-rows N] [--pivot-cols N]
                        [--allow-empty] [--json]
+  base-search-cli browser <db> [--host 127.0.0.1] [--port 7833] [--no-open]
+                          [--confirm-wildcard-bind]
+  base-search-cli user-add <db> <username> [--role admin|viewer]   (password from stdin)
+  base-search-cli user-list <db>
+  base-search-cli user-remove <db> <username>
   base-search-cli olap-build <db> [projection.duckdb]
   base-search-cli olap-benchmark <projection.duckdb> [query...] [--year Y]
                        [--origin C] [--repeat N] [--warmups N] [--json]
-  base-search-cli export <db> <out.csv|out.xlsx> [query...]
-  base-search-cli web [db] [--host 127.0.0.1] [--port 7832] [--no-open]";
+  base-search-cli export <db> <out.csv|out.xlsx> [query...]";
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -63,7 +66,10 @@ fn main() -> ExitCode {
             cmd_olap_benchmark(Path::new(&args[1]), &args[2..])
         }
         Some("export") if args.len() >= 3 => cmd_export(Path::new(&args[1]), &args[2], &args[3..]),
-        Some("web") => cmd_web(&args[1..]),
+        Some("browser") if args.len() >= 2 => cmd_browser(Path::new(&args[1]), &args[2..]),
+        Some("user-add") if args.len() >= 3 => cmd_user_add(Path::new(&args[1]), &args[2..]),
+        Some("user-list") if args.len() == 2 => cmd_user_list(Path::new(&args[1])),
+        Some("user-remove") if args.len() == 3 => cmd_user_remove(Path::new(&args[1]), &args[2]),
         Some("sql") if args.len() == 3 => cmd_sql(Path::new(&args[1]), &args[2]),
         _ => {
             eprintln!("{USAGE}");
@@ -77,43 +83,6 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
-}
-
-fn cmd_web(args: &[String]) -> Result<(), String> {
-    let mut config = web::WebConfig::new(base_search::app::default_db_path());
-    let mut i = 0;
-    while i < args.len() {
-        match args[i].as_str() {
-            "--host" => {
-                i += 1;
-                config.host = args
-                    .get(i)
-                    .ok_or_else(|| "--host requires a value".to_string())?
-                    .clone();
-            }
-            "--port" => {
-                i += 1;
-                config.port = args
-                    .get(i)
-                    .ok_or_else(|| "--port requires a value".to_string())?
-                    .parse()
-                    .map_err(|_| "--port must be a number from 0 to 65535".to_string())?;
-            }
-            "--no-open" => config.open_browser = false,
-            "--token" => {
-                i += 1;
-                config.token = Some(
-                    args.get(i)
-                        .ok_or_else(|| "--token requires a value".to_string())?
-                        .clone(),
-                );
-            }
-            value if !value.starts_with("--") => config.db_path = PathBuf::from(value),
-            other => return Err(format!("Unknown web option: {other}")),
-        }
-        i += 1;
-    }
-    web::run(config)
 }
 
 fn cmd_stats(db_path: &Path) -> Result<(), String> {
@@ -673,7 +642,7 @@ fn cmd_olap_build(db_path: &Path, projection_arg: Option<&String>) -> Result<(),
     let projection_path = projection_arg
         .map(PathBuf::from)
         .unwrap_or_else(|| duckdb_olap::default_projection_path(db_path));
-    let build = duckdb_olap::build_projection(db_path, &projection_path)?;
+    let build = duckdb_olap::build_projection_atomic(db_path, &projection_path)?;
     println!(
         "Built DuckDB projection: {}",
         build.projection_path.display()
@@ -958,6 +927,115 @@ fn export_error_message(err: export::ExportError) -> String {
         export::ExportError::Cancelled => "Export cancelled".to_string(),
         export::ExportError::Other(message) => message,
     }
+}
+
+/// Starts the local browser workspace on 127.0.0.1 (or an explicit host).
+#[cfg(feature = "browser")]
+fn cmd_browser(db_path: &Path, args: &[String]) -> Result<(), String> {
+    use base_search::server::{self, ServerConfig};
+
+    let mut config = ServerConfig::local(db_path.to_path_buf());
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--host" => {
+                i += 1;
+                let value = args.get(i).ok_or("--host requires a value")?;
+                config.host = value
+                    .parse::<std::net::IpAddr>()
+                    .map_err(|_| format!("invalid host address: {value}"))?;
+            }
+            "--port" => {
+                i += 1;
+                let value = args.get(i).ok_or("--port requires a value")?;
+                config.port = value
+                    .parse::<u16>()
+                    .map_err(|_| "--port must be a number between 1 and 65535".to_string())?;
+                if config.port == 0 {
+                    return Err("--port must be a number between 1 and 65535".to_string());
+                }
+            }
+            "--no-open" => config.open_browser = false,
+            "--confirm-wildcard-bind" => config.confirm_wildcard_bind(),
+            other => return Err(format!("Unknown browser option: {other}")),
+        }
+        i += 1;
+    }
+    config.validate_bind_policy()?;
+    server::run(config)
+}
+
+#[cfg(not(feature = "browser"))]
+fn cmd_browser(_db_path: &Path, _args: &[String]) -> Result<(), String> {
+    Err(
+        "This build was compiled without the browser feature. Rebuild with --features browser."
+            .to_string(),
+    )
+}
+
+/// Creates or replaces a local account. The password is read from stdin so it
+/// stays out of the shell history and process list.
+#[cfg(feature = "browser")]
+fn cmd_user_add(db_path: &Path, args: &[String]) -> Result<(), String> {
+    let username = &args[0];
+    let mut role = "admin".to_string();
+    let mut i = 1;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--role" => {
+                i += 1;
+                role = args.get(i).ok_or("--role requires a value")?.clone();
+            }
+            other => return Err(format!("Unknown option: {other}")),
+        }
+        i += 1;
+    }
+    eprintln!("Enter a password for '{username}' (read from stdin):");
+    let mut password = String::new();
+    std::io::stdin()
+        .read_line(&mut password)
+        .map_err(|err| err.to_string())?;
+    let password = password.trim_end_matches(['\n', '\r']);
+    base_search::server::add_account(db_path, username, password, &role)?;
+    println!("Account '{username}' ({role}) created.");
+    Ok(())
+}
+
+#[cfg(feature = "browser")]
+fn cmd_user_list(db_path: &Path) -> Result<(), String> {
+    let accounts = base_search::server::list_accounts(db_path)?;
+    if accounts.is_empty() {
+        println!("No accounts.");
+    }
+    for (username, role, created_at) in accounts {
+        println!("{username}\t{role}\t{created_at}");
+    }
+    Ok(())
+}
+
+#[cfg(feature = "browser")]
+fn cmd_user_remove(db_path: &Path, username: &str) -> Result<(), String> {
+    if base_search::server::remove_account(db_path, username)? {
+        println!("Removed account '{username}'.");
+    } else {
+        println!("No account named '{username}'.");
+    }
+    Ok(())
+}
+
+#[cfg(not(feature = "browser"))]
+fn cmd_user_add(_db_path: &Path, _args: &[String]) -> Result<(), String> {
+    Err("Account management requires the browser feature.".to_string())
+}
+
+#[cfg(not(feature = "browser"))]
+fn cmd_user_list(_db_path: &Path) -> Result<(), String> {
+    Err("Account management requires the browser feature.".to_string())
+}
+
+#[cfg(not(feature = "browser"))]
+fn cmd_user_remove(_db_path: &Path, _username: &str) -> Result<(), String> {
+    Err("Account management requires the browser feature.".to_string())
 }
 
 #[cfg(test)]
