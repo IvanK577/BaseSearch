@@ -79,6 +79,15 @@ explicit fallback.
 
 ### Fixed
 
+- Fixed the price-risk screen silently re-running its expensive analysis on
+  every background poll (about every 1.5 seconds), which made the page flicker
+  and kept the database busy. The analysis now runs exactly once per query and
+  settings combination, and translation lookups no longer destabilize effect
+  dependencies application-wide.
+- Added price-risk work tools: sortable columns, confidence and currency
+  filters, a free-text filter, a "companies with the most signals" summary
+  with dossier links, CSV export of the visible rows, and a result-size
+  selector — localized in all eleven languages.
 - Fixed the launcher keeping a dead workspace URL visible after a failed or
   stopped start; the URL is now a clickable link only once the server passes
   its health check, and shows as plain "starting" text before that.
