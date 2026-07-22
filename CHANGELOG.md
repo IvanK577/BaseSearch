@@ -79,6 +79,12 @@ explicit fallback.
 
 ### Fixed
 
+- Fixed the launcher keeping a dead workspace URL visible after a failed or
+  stopped start; the URL is now a clickable link only once the server passes
+  its health check, and shows as plain "starting" text before that.
+- Fixed starting a second launcher silently picking a neighboring port while
+  the first workspace keeps running; the launcher now refuses with a clear
+  message naming the already-running workspace URL.
 - Fixed the README quick start pointing only at unpublished GitHub Releases;
   it now documents the ready-to-run `dist\BaseSearch` folder shipped in the
   repository and warns against running two launchers at once.

@@ -498,6 +498,8 @@ impl LauncherModel {
         self.generation = self.generation.wrapping_add(1).max(1);
         self.status = LaunchStatus::Stopped;
         self.stage = "Local server stopped".to_string();
+        self.local_url = None;
+        self.lan_url = None;
         self.generation
     }
 
@@ -541,6 +543,10 @@ impl LauncherModel {
             LaunchEvent::Failed(message) => {
                 self.stage = message.clone();
                 self.status = LaunchStatus::Error(message);
+                // A workspace that failed to start has no working URL; keeping
+                // the last prepared one would show a dead link.
+                self.local_url = None;
+                self.lan_url = None;
                 None
             }
         }
@@ -1135,9 +1141,16 @@ impl LauncherApp {
             .wrap(),
         );
         ui.add_space(8.0);
+        let ready = self.controller.model.status == LaunchStatus::Ready;
         ui.label(egui::RichText::new("Local URL").strong());
         if let Some(url) = &self.controller.model.local_url {
-            ui.hyperlink_to(url, url);
+            // The URL becomes a working link only once the server answered a
+            // health check; before that it is informational text.
+            if ready {
+                ui.hyperlink_to(url, url);
+            } else {
+                ui.label(egui::RichText::new(format!("{url} (starting…)")).monospace());
+            }
         } else {
             ui.label("Available after the workspace starts");
         }
@@ -1145,7 +1158,11 @@ impl LauncherApp {
             ui.add_space(8.0);
             ui.label(egui::RichText::new("LAN URL").strong());
             if let Some(url) = &self.controller.model.lan_url {
-                ui.hyperlink_to(url, url);
+                if ready {
+                    ui.hyperlink_to(url, url);
+                } else {
+                    ui.label(egui::RichText::new(format!("{url} (starting…)")).monospace());
+                }
             } else if self.controller.model.status == LaunchStatus::Ready {
                 ui.label(
                             "A private LAN address could not be detected. Check this computer's network address.",
@@ -1312,6 +1329,22 @@ fn start_server_worker(request: ServerWorkerRequest) {
     } else {
         vec![Ipv4Addr::LOCALHOST]
     };
+    // If a healthy Base Search already answers on the preferred port, refuse
+    // to silently start a second server (usually against the same database)
+    // on a neighboring port — that is how users end up with several launcher
+    // windows showing URLs that do not respond.
+    if preferred_port != 0
+        && health_is_ready(SocketAddr::from((Ipv4Addr::LOCALHOST, preferred_port)))
+    {
+        send_event(
+            &events,
+            generation,
+            LaunchEvent::Failed(format!(
+                "A Base Search workspace is already running at http://127.0.0.1:{preferred_port}/. Use that window or browser tab, or stop the other copy before starting a new workspace. To run a second independent workspace on purpose, choose a different preferred port first."
+            )),
+        );
+        return;
+    }
     let port = match select_available_port(&listener_hosts, preferred_port, PORT_SEARCH_WIDTH) {
         Ok(port) => port,
         Err(error) => {
@@ -1936,6 +1969,48 @@ mod tests {
         );
         assert_eq!(model.status(), LaunchStatus::Ready);
         assert_eq!(model.apply(generation, LaunchEvent::Ready), None);
+    }
+
+    #[test]
+    fn failed_and_stopped_launches_never_keep_a_dead_workspace_url() {
+        let mut model = LauncherModel::new(PathBuf::from("data/base_search.db"), false);
+        let generation = model.begin_start();
+        model.apply(
+            generation,
+            LaunchEvent::Prepared {
+                urls: WorkspaceUrls {
+                    local: "http://127.0.0.1:7834".to_string(),
+                    lan: Some("http://192.168.1.50:7834".to_string()),
+                },
+            },
+        );
+        assert_eq!(model.local_url(), Some("http://127.0.0.1:7834"));
+
+        model.apply(
+            generation,
+            LaunchEvent::Failed("port stolen mid-start".to_string()),
+        );
+        assert_eq!(
+            model.local_url(),
+            None,
+            "a failed launch has no working URL"
+        );
+        assert_eq!(model.lan_url(), None);
+
+        let generation = model.begin_start();
+        model.apply(
+            generation,
+            LaunchEvent::Prepared {
+                urls: WorkspaceUrls {
+                    local: "http://127.0.0.1:7835".to_string(),
+                    lan: None,
+                },
+            },
+        );
+        model.apply(generation, LaunchEvent::Ready);
+        model.stop();
+        assert_eq!(model.local_url(), None, "a stopped workspace has no URL");
+        assert_eq!(model.lan_url(), None);
     }
 
     #[test]

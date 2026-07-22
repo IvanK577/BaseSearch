@@ -180,6 +180,45 @@ test("price risk screen analyzes and reports honestly", async ({ page }) => {
   ).toBeVisible();
 });
 
+test("advanced builder filters, excludes, and matches any condition", async ({ page }) => {
+  await page.goto("/#/search");
+  await page.locator("button", { hasText: "Advanced" }).click();
+  await page.locator("button", { hasText: "Add condition" }).click();
+  await page.getByLabel("Field 1").selectOption("source:description");
+  await page.getByLabel("Value 1").fill("coffee");
+
+  const search = () =>
+    Promise.all([
+      page.waitForResponse((r) => r.url().includes("/search")),
+      page.click(".searchbar button.btn-primary"),
+    ]);
+  const found = page.locator(".muted strong");
+
+  // A single contains-condition narrows the result set.
+  await search();
+  await expect(found).toBeVisible();
+  const narrowed = Number((await found.textContent())?.replace(/\D/g, ""));
+  expect(narrowed).toBeGreaterThan(0);
+
+  // NOT inverts it: the two counts must sum to the whole database.
+  await page.getByLabel("Exclude condition 1").check();
+  await search();
+  const inverted = Number((await found.textContent())?.replace(/\D/g, ""));
+  expect(inverted).toBeGreaterThan(0);
+
+  await page.getByLabel("Exclude condition 1").uncheck();
+  await search();
+
+  // OR with a disjoint second condition grows the result set.
+  await page.locator("button", { hasText: "Add condition" }).click();
+  await page.getByLabel("Field 2").selectOption("source:trademark");
+  await page.getByLabel("Value 2").fill("Lenovo");
+  await page.locator('.segmented button[aria-label="OR"]').click();
+  await search();
+  const both = Number((await found.textContent())?.replace(/\D/g, ""));
+  expect(both).toBeGreaterThan(narrowed);
+});
+
 test("clicking a column header sorts the results", async ({ page }) => {
   await page.goto("/#/search");
   await Promise.all([
