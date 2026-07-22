@@ -2,6 +2,37 @@
 
 All notable changes to Base Search are documented in this file.
 
+## 2.0.1 - 2026-07-22
+
+### Fixed
+
+- Fixed the price-risk screen silently re-running its expensive analysis on
+  every background poll (about every 1.5 seconds), which made the page flicker
+  and kept the database busy. The analysis now runs exactly once per query and
+  settings combination, and translation lookups no longer destabilize effect
+  dependencies application-wide.
+- Fixed the launcher keeping a dead workspace URL visible after a failed or
+  stopped start; the URL is now a clickable link only once the server passes
+  its health check, and shows as plain "starting" text before that.
+- Fixed starting a second launcher silently picking a neighboring port while
+  the first workspace keeps running; the launcher now refuses with a clear
+  message naming the already-running workspace URL.
+- Fixed the README quick start pointing only at unpublished GitHub Releases;
+  it now documents the ready-to-run `dist\BaseSearch` folder shipped in the
+  repository and warns against running two launchers at once.
+- Fixed the CI translation gate failing on the new Portuguese strings; the
+  affected label now uses sentence case, which the mojibake check accepts.
+
+### Added
+
+- Added price-risk work tools: sortable columns, confidence and currency
+  filters, a free-text filter, a "companies with the most signals" summary
+  with dossier links, CSV export of the visible rows, and a result-size
+  selector — localized in all eleven languages.
+- Added an end-to-end test that drives the advanced query builder against a
+  live server: a contains-condition narrows results, NOT inverts it, and OR
+  with a second condition widens it.
+
 ## 2.0.0 - 2026-07-22
 
 Base Search 2 is a major browser-first release. Existing V1 SQLite workspaces
@@ -79,26 +110,6 @@ explicit fallback.
 
 ### Fixed
 
-- Fixed the price-risk screen silently re-running its expensive analysis on
-  every background poll (about every 1.5 seconds), which made the page flicker
-  and kept the database busy. The analysis now runs exactly once per query and
-  settings combination, and translation lookups no longer destabilize effect
-  dependencies application-wide.
-- Added price-risk work tools: sortable columns, confidence and currency
-  filters, a free-text filter, a "companies with the most signals" summary
-  with dossier links, CSV export of the visible rows, and a result-size
-  selector — localized in all eleven languages.
-- Fixed the launcher keeping a dead workspace URL visible after a failed or
-  stopped start; the URL is now a clickable link only once the server passes
-  its health check, and shows as plain "starting" text before that.
-- Fixed starting a second launcher silently picking a neighboring port while
-  the first workspace keeps running; the launcher now refuses with a clear
-  message naming the already-running workspace URL.
-- Fixed the README quick start pointing only at unpublished GitHub Releases;
-  it now documents the ready-to-run `dist\BaseSearch` folder shipped in the
-  repository and warns against running two launchers at once.
-- Fixed the CI translation gate failing on the new Portuguese strings; the
-  affected label now uses sentence case, which the mojibake check accepts.
 - Fixed the company dossier "row share" column overstating shares: it now uses
   the company's full row count as the denominator instead of only the visible
   top rows.

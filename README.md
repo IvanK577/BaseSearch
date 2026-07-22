@@ -1,4 +1,4 @@
-# Base Search 2.0.0
+# Base Search 2.0.1
 
 [![CI](https://github.com/IvanK577/BaseSearch/actions/workflows/ci.yml/badge.svg)](https://github.com/IvanK577/BaseSearch/actions/workflows/ci.yml)
 
