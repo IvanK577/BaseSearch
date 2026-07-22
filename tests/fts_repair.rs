@@ -151,7 +151,19 @@ fn cancelled_repair_keeps_live_index_and_all_success_metadata_unchanged() {
         Some("old-timestamp")
     );
     assert_eq!(db.count(&query("Stable searchable record")).unwrap(), 1);
+    // The partial rebuild is kept so the next attempt resumes instead of
+    // starting the multi-minute job over from zero.
+    assert!(rebuild_artifact_count(&db) > 0);
+    assert!(db.meta_get("fts_rebuild_cursor").is_some());
+
+    // The next repair resumes from the kept cursor and completes the swap.
+    let resume_cancel = AtomicBool::new(false);
+    let report = db.repair_fts(&resume_cancel, |_, _| {}).unwrap();
+    assert!(report.rebuilt);
+    assert_eq!(report.indexed_rows, 20051);
     assert_eq!(rebuild_artifact_count(&db), 0);
+    assert!(db.meta_get("fts_rebuild_cursor").is_none());
+    assert_eq!(db.count(&query("Stable searchable record")).unwrap(), 1);
 }
 
 #[test]
@@ -212,10 +224,12 @@ fn successful_repair_marks_a_stale_schema_current_only_after_the_swap() {
 }
 
 #[test]
-fn an_immediately_cancelled_repair_removes_a_stale_rebuild_artifact() {
+fn a_repair_discards_a_stale_rebuild_artifact_it_cannot_resume() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("stale-artifact.db");
     let mut db = Db::open(&path).unwrap();
+    // An abandoned staging table without matching resume bookkeeping (e.g.
+    // from a crashed older version) must not be trusted or kept.
     db.diagnostic_execute_batch(
         "CREATE VIRTUAL TABLE records_fts_rebuild USING fts5(
              search_text,
@@ -230,12 +244,14 @@ fn an_immediately_cancelled_repair_removes_a_stale_rebuild_artifact() {
     .unwrap();
     assert!(rebuild_artifact_count(&db) > 0);
 
-    let cancel = AtomicBool::new(true);
+    let cancel = AtomicBool::new(false);
     let report = db.repair_fts(&cancel, |_, _| {}).unwrap();
 
-    assert!(report.cancelled);
-    assert!(!report.rebuilt);
+    assert!(report.rebuilt);
+    assert_eq!(report.indexed_rows, 0);
     assert_eq!(rebuild_artifact_count(&db), 0);
+    // The abandoned contents must not have been swapped into the live index.
+    assert_eq!(db.count(&query("abandoned")).unwrap(), 0);
 }
 
 fn rebuild_artifact_count(db: &Db) -> u64 {

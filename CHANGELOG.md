@@ -6,6 +6,17 @@ All notable changes to Base Search are documented in this file.
 
 ### Fixed
 
+- Fixed servers and the stats command stalling for many minutes on large
+  databases while a search-index rebuild was pending: the "rows not yet
+  indexed" check ran a correlated self-join over every row on every startup
+  and every status request. It now uses two index-backed counts with the same
+  exact result and answers in seconds even on tens of millions of rows.
+- Fixed the one-time search-index rebuild losing all progress when the
+  application was closed: chunk progress now commits together with a resume
+  cursor, an interrupted rebuild continues where it stopped, and an import in
+  between safely restarts it from scratch. Startup phases slower than one
+  second are now reported in the log.
+
 - Fixed the price-risk screen silently re-running its expensive analysis on
   every background poll (about every 1.5 seconds), which made the page flicker
   and kept the database busy. The analysis now runs exactly once per query and

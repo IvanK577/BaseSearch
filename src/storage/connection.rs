@@ -36,7 +36,14 @@ pub(crate) fn open(path: &Path) -> Result<Connection, String> {
         .unwrap_or(false);
     let conn = Connection::open(path).map_err(|err| err.to_string())?;
     initialize(&conn, path, database_existed)?;
+    let heal_started = std::time::Instant::now();
     heal_oversized_wal(&conn, path);
+    if heal_started.elapsed().as_secs() >= 1 {
+        eprintln!(
+            "[base-search] startup: reclaiming write-ahead log space took {:.1}s",
+            heal_started.elapsed().as_secs_f64()
+        );
+    }
     Ok(conn)
 }
 
@@ -49,9 +56,24 @@ pub(crate) fn open_runtime(path: &Path) -> Result<Connection, String> {
 }
 
 fn initialize(conn: &Connection, path: &Path, database_existed: bool) -> Result<(), String> {
+    // Startup phases on a large database can take real time; report any phase
+    // that exceeds one second so slow starts are diagnosable from the log.
+    let phase_started = std::cell::Cell::new(std::time::Instant::now());
+    let report = |name: &str| {
+        let elapsed = phase_started.get().elapsed();
+        if elapsed.as_secs() >= 1 {
+            eprintln!(
+                "[base-search] startup: {name} took {:.1}s",
+                elapsed.as_secs_f64()
+            );
+        }
+        phase_started.set(std::time::Instant::now());
+    };
     configure_pragmas(conn).map_err(|err| err.to_string())?;
+    report("configuring the database connection");
     register_scalar_functions(conn).map_err(|err| err.to_string())?;
     register_aggregate_functions(conn).map_err(|err| err.to_string())?;
+    report("registering search functions");
 
     let recorded_backup = if database_existed {
         recorded_pre_upgrade_backup(conn)?
@@ -60,6 +82,7 @@ fn initialize(conn: &Connection, path: &Path, database_existed: bool) -> Result<
     };
     let upgrade_required = database_existed
         && migrations::destructive_upgrade_required(conn).map_err(|err| err.to_string())?;
+    report("checking the schema version");
     let backup = if upgrade_required || recorded_backup.is_some() {
         Some(match recorded_backup {
             Some(backup) => reuse_pre_upgrade_backup(path, backup)?,
@@ -75,6 +98,7 @@ fn initialize(conn: &Connection, path: &Path, database_existed: bool) -> Result<
     if backup.is_some() {
         eprintln!("[base-search] One-time database upgrade: applying schema changes.");
     }
+    phase_started.set(std::time::Instant::now());
     if let Err(error) = migrations::ensure_schema(conn) {
         return Err(match backup {
             Some(backup) => format!(
@@ -84,6 +108,7 @@ fn initialize(conn: &Connection, path: &Path, database_existed: bool) -> Result<
             None => error.to_string(),
         });
     }
+    report("ensuring tables and indexes");
     if let Some(backup) = backup {
         eprintln!("[base-search] One-time database upgrade: verifying the upgraded database.");
         sqlite_integrity_check(conn).map_err(|error| {
