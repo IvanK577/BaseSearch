@@ -204,6 +204,52 @@ export interface DatabaseStats {
 
 // Analytics ------------------------------------------------------------------
 
+export interface AnalyticsCurrencyTotal {
+  currency: string;
+  known: boolean;
+  valued_rows: number;
+  total_value: number;
+}
+
+export interface AnalyticsWeightTotal {
+  source_unit: string;
+  known: boolean;
+  normalized_unit: string | null;
+  factor_to_kg: number | null;
+  weighted_rows: number;
+  total_source_weight: number;
+  total_kg: number | null;
+}
+
+export interface AnalyticsValuePerWeight {
+  currency: string;
+  normalized_weight_unit: string;
+  source_weight_units: string[];
+  paired_rows: number;
+  total_value: number;
+  total_weight: number;
+  value_per_weight: number | null;
+}
+
+export interface AnalyticsMeasureExclusions {
+  value_without_known_currency: number;
+  net_weight_without_known_unit: number;
+  gross_weight_without_known_unit: number;
+  ratio_without_known_currency: number;
+  ratio_without_known_weight_unit: number;
+  ratio_with_zero_or_missing_weight: number;
+}
+
+export interface AnalyticsMeasures {
+  currency_totals: AnalyticsCurrencyTotal[];
+  net_weight_totals: AnalyticsWeightTotal[];
+  gross_weight_totals: AnalyticsWeightTotal[];
+  value_per_net_weight: AnalyticsValuePerWeight[];
+  compatible_value_total: AnalyticsCurrencyTotal | null;
+  compatible_value_per_net_weight: AnalyticsValuePerWeight | null;
+  exclusions: AnalyticsMeasureExclusions;
+}
+
 export interface AnalyticsOverview {
   row_count: number;
   declaration_count: number;
@@ -215,11 +261,12 @@ export interface AnalyticsOverview {
   distinct_origin_countries: number;
   distinct_dispatch_countries: number;
   distinct_trade_countries: number;
-  total_value_usd: number;
+  total_value_usd?: number;
   total_gross_kg: number;
   total_net_kg: number;
   total_quantity: number;
-  avg_value_per_net_kg: number;
+  avg_value_per_net_kg?: number;
+  measures: AnalyticsMeasures;
 }
 
 export interface AnalyticsFilterAction {
@@ -232,12 +279,13 @@ export interface AnalyticsGroupRow {
   rows: number;
   declarations: number;
   companies: number;
-  total_value_usd: number;
+  total_value_usd?: number;
   total_net_kg: number;
   total_gross_kg: number;
   total_quantity: number;
   share_percent: number;
-  avg_value_per_net_kg: number;
+  avg_value_per_net_kg?: number;
+  measures: AnalyticsMeasures;
   filter_action: AnalyticsFilterAction | null;
 }
 
@@ -281,8 +329,9 @@ export interface AnalyticsMonthRow {
   month: string;
   rows: number;
   declarations: number;
-  total_value_usd: number;
+  total_value_usd?: number;
   total_net_kg: number;
+  measures: AnalyticsMeasures;
 }
 
 export interface Analytics {

@@ -17,6 +17,17 @@ interface MenuState {
   rowId: number;
 }
 
+const RESULT_NUMBER = new Intl.NumberFormat("en-US", {
+  maximumFractionDigits: 6,
+  useGrouping: true,
+});
+
+export function formatResultCell(field: FieldDto, value: string): string {
+  if (field.kind !== "number" || value.trim() === "") return value;
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? RESULT_NUMBER.format(parsed) : value;
+}
+
 export function ResultsTable({
   fields,
   rows,
@@ -143,12 +154,13 @@ export function ResultsTable({
               >
                 {visible.map((c, ci) => {
                   const value = row.values[c.index] ?? "";
+                  const displayValue = formatResultCell(c.field, value);
                   const isCompany =
                     companyFieldId != null && c.field.id === companyFieldId && value.trim() !== "";
                   return (
                     <td
                       key={c.field.id}
-                      title={value}
+                      title={displayValue}
                       onContextMenu={(e) => {
                         e.preventDefault();
                         setMenu({ x: e.clientX, y: e.clientY, field: c.field, value, rowId: row.id });
@@ -162,13 +174,16 @@ export function ResultsTable({
                             onOpenCompany(value);
                           }}
                         >
-                          {value}
+                          {displayValue}
                         </button>
                       ) : (
-                        value
+                        displayValue
                       )}
                       {ci === 0 && row.duplicate_of ? (
-                        <span className="dup-tag" title={`Duplicate of ${row.duplicate_of}`}>
+                        <span
+                          className="dup-tag"
+                          title={t("results_duplicate_of", { id: row.duplicate_of })}
+                        >
                           {t("search_duplicate")}
                         </span>
                       ) : null}
@@ -188,7 +203,7 @@ export function ResultsTable({
           onClick={(e) => e.stopPropagation()}
         >
           <button className="context-item" onClick={() => { copy(menu.value); setMenu(null); }}>
-            Copy value
+            {t("results_copy_value")}
           </button>
           <button
             className="context-item"
@@ -198,7 +213,7 @@ export function ResultsTable({
               setMenu(null);
             }}
           >
-            Copy row
+            {t("results_copy_row")}
           </button>
           {onSearchValue && menu.value.trim() ? (
             <button
@@ -208,7 +223,7 @@ export function ResultsTable({
                 setMenu(null);
               }}
             >
-              Search this value
+              {t("results_search_value")}
             </button>
           ) : null}
           {onOpenCompany && menu.field.id === companyFieldId && menu.value.trim() ? (
@@ -219,11 +234,11 @@ export function ResultsTable({
                 setMenu(null);
               }}
             >
-              Open company
+              {t("results_open_company")}
             </button>
           ) : null}
           <button className="context-item" onClick={() => { onOpen(menu.rowId); setMenu(null); }}>
-            Open record
+            {t("results_open_record")}
           </button>
         </div>
       ) : null}

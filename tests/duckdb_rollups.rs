@@ -113,6 +113,33 @@ fn assert_close(actual: f64, expected: f64, label: &str) {
     );
 }
 
+fn assert_optional_close(actual: Option<f64>, expected: Option<f64>, label: &str) {
+    match (actual, expected) {
+        (None, None) => {}
+        (Some(actual), Some(expected)) => assert_close(actual, expected, label),
+        _ => panic!("{label}: optional values differ: {actual:?} vs {expected:?}"),
+    }
+}
+
+fn assert_usd_compatibility_match(
+    actual: Option<&base_search::db::AnalyticsUsdCompatibility>,
+    expected: Option<&base_search::db::AnalyticsUsdCompatibility>,
+    label: &str,
+) {
+    match (actual, expected) {
+        (None, None) => {}
+        (Some(actual), Some(expected)) => {
+            assert_close(actual.total_value_usd, expected.total_value_usd, label);
+            assert_optional_close(
+                actual.avg_value_per_net_kg,
+                expected.avg_value_per_net_kg,
+                label,
+            );
+        }
+        _ => panic!("{label}: USD compatibility differs"),
+    }
+}
+
 fn assert_analytics_match(actual: &Analytics, expected: &Analytics) {
     let (actual_overview, expected_overview) = (&actual.overview, &expected.overview);
     assert_eq!(actual_overview.row_count, expected_overview.row_count);
@@ -136,21 +163,30 @@ fn assert_analytics_match(actual: &Analytics, expected: &Analytics) {
         actual_overview.distinct_product_codes,
         expected_overview.distinct_product_codes
     );
-    assert_close(
-        actual_overview.total_value_usd,
-        expected_overview.total_value_usd,
-        "total value",
+    assert_usd_compatibility_match(
+        actual_overview.compatible_usd.as_ref(),
+        expected_overview.compatible_usd.as_ref(),
+        "overview",
     );
-    assert_close(
-        actual_overview.total_net_kg,
-        expected_overview.total_net_kg,
-        "net kg",
+    assert_eq!(
+        actual_overview.measures.currency_totals.len(),
+        expected_overview.measures.currency_totals.len()
     );
-    assert_close(
-        actual_overview.total_gross_kg,
-        expected_overview.total_gross_kg,
-        "gross kg",
-    );
+    for expected_total in &expected_overview.measures.currency_totals {
+        let actual_total = actual_overview
+            .measures
+            .currency_totals
+            .iter()
+            .find(|total| total.currency == expected_total.currency)
+            .unwrap_or_else(|| panic!("missing currency {}", expected_total.currency));
+        assert_eq!(actual_total.known, expected_total.known);
+        assert_eq!(actual_total.valued_rows, expected_total.valued_rows);
+        assert_close(
+            actual_total.total_value,
+            expected_total.total_value,
+            "currency total",
+        );
+    }
     assert_close(
         actual_overview.total_quantity,
         expected_overview.total_quantity,
@@ -161,12 +197,11 @@ fn assert_analytics_match(actual: &Analytics, expected: &Analytics) {
         assert_eq!(actual.month, expected.month);
         assert_eq!(actual.rows, expected.rows);
         assert_eq!(actual.declarations, expected.declarations);
-        assert_close(
-            actual.total_value_usd,
-            expected.total_value_usd,
-            "month value",
+        assert_usd_compatibility_match(
+            actual.compatible_usd.as_ref(),
+            expected.compatible_usd.as_ref(),
+            "month",
         );
-        assert_close(actual.total_net_kg, expected.total_net_kg, "month net kg");
     }
     for (actual_sections, expected_sections) in [
         (&actual.company_sections, &expected.company_sections),
@@ -174,27 +209,43 @@ fn assert_analytics_match(actual: &Analytics, expected: &Analytics) {
         (&actual.country_sections, &expected.country_sections),
     ] {
         assert_eq!(actual_sections.len(), expected_sections.len());
-        for (actual, expected) in actual_sections.iter().zip(expected_sections) {
+        for expected in expected_sections {
+            let actual = actual_sections
+                .iter()
+                .find(|section| section.kind == expected.kind)
+                .unwrap_or_else(|| panic!("missing section {:?}", expected.kind));
             assert_eq!(actual.kind, expected.kind);
             assert_eq!(actual.rows.len(), expected.rows.len());
-            for (actual, expected) in actual.rows.iter().zip(&expected.rows) {
+            for expected in &expected.rows {
+                let actual = actual
+                    .rows
+                    .iter()
+                    .find(|row| row.label == expected.label)
+                    .unwrap_or_else(|| panic!("missing group {}", expected.label));
                 assert_eq!(actual.label, expected.label);
                 assert_eq!(actual.rows, expected.rows);
                 assert_eq!(actual.declarations, expected.declarations);
                 assert_eq!(actual.companies, expected.companies);
-                assert_close(
-                    actual.total_value_usd,
-                    expected.total_value_usd,
-                    "group value",
+                assert_usd_compatibility_match(
+                    actual.compatible_usd.as_ref(),
+                    expected.compatible_usd.as_ref(),
+                    "group",
                 );
-                assert_close(actual.total_net_kg, expected.total_net_kg, "group net kg");
-                assert_close(actual.share_percent, expected.share_percent, "group share");
+                if actual.compatible_usd.is_some() {
+                    assert_close(actual.share_percent, expected.share_percent, "group share");
+                }
             }
         }
     }
     assert_eq!(actual.price_sections.len(), expected.price_sections.len());
     for (actual, expected) in actual.price_sections.iter().zip(&expected.price_sections) {
         assert_eq!(actual.kind, expected.kind);
+        if actual.kind == base_search::db::PriceMetricKind::ValuePerNetKg
+            && actual.cohorts.len() != 1
+        {
+            assert_eq!(actual.count, 0);
+            continue;
+        }
         assert_eq!(actual.count, expected.count);
         assert_close(actual.average, expected.average, "price average");
         assert_close(actual.minimum, expected.minimum, "price minimum");
@@ -422,7 +473,8 @@ fn unknown_currency_makes_monetary_rollups_explicitly_unavailable() {
     let unknown_rows: i64 = projection
         .query_row(
             "SELECT valued_rows FROM rollup_currency_totals
-             WHERE record_scope = 'canonical' AND year_key = 0 AND currency_key = ''",
+             WHERE record_scope = 'canonical' AND year_key = 0
+               AND starts_with(currency_key, '__unknown__')",
             [],
             |row| row.get(0),
         )

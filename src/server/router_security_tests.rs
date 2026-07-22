@@ -425,3 +425,83 @@ async fn login_failures_do_not_reveal_whether_the_username_exists() {
     let missing_body = to_bytes(missing.into_body(), usize::MAX).await.unwrap();
     assert_eq!(existing_body, missing_body);
 }
+
+#[tokio::test]
+async fn user_mutation_reports_created_or_updated_role_without_implicit_owner_promotion() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = lan_state(&temp);
+    let credentials = state.auth.create_session("owner").unwrap();
+    let app = api::router(state.clone());
+    let peer: SocketAddr = "192.0.2.40:45000".parse().unwrap();
+
+    for (requested_role, expected_role, expected_action) in [
+        (Some("viewer"), "viewer", "created"),
+        (Some("admin"), "admin", "updated"),
+        (None, "admin", "updated"),
+    ] {
+        let mut payload = serde_json::json!({
+            "username": "analyst",
+            "password": "analyst-password",
+        });
+        if let Some(requested_role) = requested_role {
+            payload["role"] = requested_role.into();
+        }
+        let body = payload.to_string();
+        let mut request =
+            request_with_peer(Method::POST, "/api/v2/admin/users", Body::from(body), peer);
+        request
+            .headers_mut()
+            .insert(header::CONTENT_TYPE, "application/json".parse().unwrap());
+        request.headers_mut().insert(
+            header::COOKIE,
+            format!(
+                "bs_session={}; bs_csrf={}",
+                credentials.token, credentials.csrf_token
+            )
+            .parse()
+            .unwrap(),
+        );
+        request
+            .headers_mut()
+            .insert(CSRF_HEADER_NAME, credentials.csrf_token.parse().unwrap());
+
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: serde_json::Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(body["role"], expected_role);
+        assert_eq!(body["action"], expected_action);
+        assert_eq!(
+            state.auth.user_role("analyst").unwrap().unwrap().as_str(),
+            expected_role
+        );
+    }
+
+    let body = serde_json::json!({
+        "username": "ambiguous-role",
+        "password": "analyst-password",
+        "role": "auditor",
+    })
+    .to_string();
+    let mut request =
+        request_with_peer(Method::POST, "/api/v2/admin/users", Body::from(body), peer);
+    request
+        .headers_mut()
+        .insert(header::CONTENT_TYPE, "application/json".parse().unwrap());
+    request.headers_mut().insert(
+        header::COOKIE,
+        format!(
+            "bs_session={}; bs_csrf={}",
+            credentials.token, credentials.csrf_token
+        )
+        .parse()
+        .unwrap(),
+    );
+    request
+        .headers_mut()
+        .insert(CSRF_HEADER_NAME, credentials.csrf_token.parse().unwrap());
+    let response = app.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(state.auth.user_role("ambiguous-role").unwrap(), None);
+}

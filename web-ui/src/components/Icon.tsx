@@ -1,8 +1,12 @@
 import {
   Activity,
+  ArrowLeft,
+  ArrowRight,
   BarChart3,
+  Bookmark,
   Building2,
   Check,
+  ChevronDown,
   ChevronRight,
   Columns3,
   Database,
@@ -11,14 +15,21 @@ import {
   FileUp,
   Filter,
   Flame,
+  Languages,
   LayoutDashboard,
+  LogOut,
   Menu,
+  Moon,
   Plus,
+  RefreshCw,
   Search,
   Settings,
+  Sun,
   Trash2,
   TriangleAlert,
   Upload,
+  UserRound,
+  UsersRound,
   X,
   type LucideIcon,
 } from "lucide-react";
@@ -39,12 +50,23 @@ type IconName =
   | "check"
   | "menu"
   | "filter"
+  | "bookmark"
   | "trash"
   | "download"
   | "plus"
   | "alert"
   | "building"
-  | "external";
+  | "external"
+  | "arrow-left"
+  | "arrow-right"
+  | "chevron-down"
+  | "sun"
+  | "moon"
+  | "user"
+  | "users"
+  | "logout"
+  | "refresh"
+  | "language";
 
 const ICONS: Record<IconName, LucideIcon> = {
   home: LayoutDashboard,
@@ -62,12 +84,23 @@ const ICONS: Record<IconName, LucideIcon> = {
   check: Check,
   menu: Menu,
   filter: Filter,
+  bookmark: Bookmark,
   trash: Trash2,
   download: Download,
   plus: Plus,
   alert: TriangleAlert,
   building: Building2,
   external: ExternalLink,
+  "arrow-left": ArrowLeft,
+  "arrow-right": ArrowRight,
+  "chevron-down": ChevronDown,
+  sun: Sun,
+  moon: Moon,
+  user: UserRound,
+  users: UsersRound,
+  logout: LogOut,
+  refresh: RefreshCw,
+  language: Languages,
 };
 
 export function Icon({

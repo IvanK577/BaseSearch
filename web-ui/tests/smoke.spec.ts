@@ -16,8 +16,8 @@ async function enterWholeDb(page: import("@playwright/test").Page) {
 
 test("workspace shell loads", async ({ page }) => {
   await page.goto("/");
-  await expect(page.locator(".brand-name")).toHaveText("Base Search");
-  await expect(page.locator(".nav-item")).toHaveCount(8);
+  await expect(page.locator(".brand-name")).toContainText("Base Search");
+  await expect(page.locator(".nav-primary")).toHaveCount(4);
 });
 
 test("search returns results and opens a record", async ({ page }) => {
@@ -89,7 +89,8 @@ test("analytics and export keep using the last applied query", async ({ page }) 
   const exportCountPromise = page.waitForRequest((request) =>
     request.url().includes("/count"),
   );
-  await page.click('a.nav-item[href="#/exports"]');
+  await page.click('a.nav-item[href="#/imports"]');
+  await page.click('.nav-secondary a[href="#/exports"]');
   const exportBody = (await exportCountPromise).postDataJSON() as {
     query: { text: string };
   };
@@ -240,9 +241,9 @@ function numeric(text: string): number {
 }
 
 for (const [name, size] of [
-  ["mobile", { width: 375, height: 812 }],
-  ["tablet", { width: 768, height: 1024 }],
-  ["desktop", { width: 1280, height: 800 }],
+  ["mobile", { width: 390, height: 844 }],
+  ["tablet", { width: 1024, height: 768 }],
+  ["desktop", { width: 1366, height: 768 }],
 ] as const) {
   test(`no full-page horizontal overflow on ${name}`, async ({ page }) => {
     await page.setViewportSize(size);

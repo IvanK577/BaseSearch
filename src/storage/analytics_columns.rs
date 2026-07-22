@@ -35,10 +35,11 @@ pub(crate) struct AnalyticsMeasureSql {
 pub(crate) struct AnalyticsColumns {
     shape: Option<TableShape>,
     row_alias: String,
-    /// Schema-level fixed values chosen at import ("this whole file is USD").
-    /// Present only when every registered schema agrees on the same value.
-    fixed_currency: Option<String>,
-    fixed_weight_unit: Option<String>,
+    /// Row-level SQL fallbacks for schema metadata chosen at import ("this
+    /// whole file is USD"). These stay as expressions so mixed schemas retain
+    /// their own currency and unit instead of being flattened globally.
+    fixed_currency_expr: Option<String>,
+    fixed_weight_unit_expr: Option<String>,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -54,18 +55,18 @@ impl AnalyticsColumns {
         Self {
             shape,
             row_alias: row_alias.to_string(),
-            fixed_currency: None,
-            fixed_weight_unit: None,
+            fixed_currency_expr: None,
+            fixed_weight_unit_expr: None,
         }
     }
 
-    pub(crate) fn with_fixed_values(
+    pub(crate) fn with_schema_fixed_values(
         mut self,
-        fixed_currency: Option<String>,
-        fixed_weight_unit: Option<String>,
+        fixed_currency_expr: Option<String>,
+        fixed_weight_unit_expr: Option<String>,
     ) -> Self {
-        self.fixed_currency = fixed_currency;
-        self.fixed_weight_unit = fixed_weight_unit;
+        self.fixed_currency_expr = fixed_currency_expr;
+        self.fixed_weight_unit_expr = fixed_weight_unit_expr;
         self
     }
 
@@ -73,18 +74,32 @@ impl AnalyticsColumns {
     /// column, the schema-level fixed value chosen at import, or the currency
     /// embedded in the value column's own name ("Value USD").
     pub(crate) fn currency_expr(&self) -> Option<String> {
-        self.text(SemanticField::Currency)
-            .or_else(|| self.fixed_currency.clone().map(sql_literal))
-            .or_else(|| self.embedded_currency().map(sql_literal))
+        coalesce_text(
+            [
+                self.text(SemanticField::Currency),
+                self.fixed_currency_expr.clone(),
+                self.embedded_currency().map(sql_literal),
+            ]
+            .into_iter()
+            .flatten()
+            .collect(),
+        )
     }
 
     /// Weight-unit expression: a mapped unit column, the schema-level fixed
     /// value chosen at import, or the unit embedded in the weight column's
     /// own name ("Net kg").
     pub(crate) fn weight_unit_expr(&self) -> Option<String> {
-        self.text(SemanticField::WeightUnit)
-            .or_else(|| self.fixed_weight_unit.clone().map(sql_literal))
-            .or_else(|| self.embedded_weight_unit().map(sql_literal))
+        coalesce_text(
+            [
+                self.text(SemanticField::WeightUnit),
+                self.fixed_weight_unit_expr.clone(),
+                self.embedded_weight_unit().map(sql_literal),
+            ]
+            .into_iter()
+            .flatten()
+            .collect(),
+        )
     }
 
     pub(crate) fn raw_column(&self, name: &str) -> String {
@@ -311,14 +326,6 @@ impl AnalyticsColumns {
             .flat_map(|field| self.semantic_headers(field))
             .collect::<Vec<_>>();
         common_hint(headers.iter().map(|header| weight_hint(header)))
-    }
-}
-
-impl Source {
-    fn name(&self) -> &str {
-        match self {
-            Source::Schema(name) | Source::Extra(name) => name,
-        }
     }
 }
 

@@ -10,10 +10,11 @@ import { useStore } from "../state/store";
 
 export function SettingsPage() {
   const { t, lang, setLang } = useI18n();
-  const { status, theme, toggleTheme, toast, refreshJobs, isAdmin } = useStore();
+  const { status, theme, toggleTheme, toast, refreshJobs, isAdmin, auth } = useStore();
   const [stats, setStats] = useState<DatabaseStats | null>(null);
   const [engines, setEngines] = useState<EngineStatus | null>(null);
   const [busy, setBusy] = useState(false);
+  const isLanWorkspace = Boolean(auth?.required || status?.lan_exposed);
 
   const loadStats = () => {
     api.stats().then(setStats).catch(() => {});
@@ -46,33 +47,67 @@ export function SettingsPage() {
   };
 
   return (
-    <div className="stack content-narrow">
-      <div className="grid-2">
-        <div className="panel panel-pad stack" style={{ gap: 14 }}>
-          <div className="section-title" style={{ margin: 0 }}>
-            {t("settings_language")}
+    <div className="stack content-narrow settings-page">
+      <div className="settings-overview-grid">
+        <section className="panel panel-pad workspace-settings">
+          <div className={`settings-mode-icon ${isLanWorkspace ? "lan" : "personal"}`}>
+            <Icon name={isLanWorkspace ? "users" : "user"} size={20} />
           </div>
-          <select
-            className="select"
-            value={lang}
-            onChange={(e) => setLang(e.target.value as typeof lang)}
-          >
-            {LANGUAGES.map((l) => (
-              <option key={l.code} value={l.code}>
-                {l.label}
-              </option>
-            ))}
-          </select>
-
-          <div className="section-title" style={{ margin: "6px 0 0" }}>
-            {t("settings_theme")}
+          <div>
+            <div className="section-title">
+              {isLanWorkspace ? t("shell_lan_active") : t("shell_personal_workspace")}
+            </div>
+            <strong>
+              {isLanWorkspace
+                ? t("settings_team_account_required")
+                : t("settings_personal_no_account")}
+            </strong>
+            <p className="faint">
+              {isLanWorkspace
+                ? t("settings_lan_warning")
+                : t("settings_personal_local_only")}
+            </p>
           </div>
-          <button className="btn" onClick={toggleTheme}>
-            {theme === "dark" ? t("theme_light") : t("theme_dark")}
-          </button>
-        </div>
+        </section>
 
-        <div className="panel panel-pad stack" style={{ gap: 10 }}>
+        <section className="panel panel-pad settings-section">
+          <div className="settings-row">
+            <div className="settings-row-label">
+              <Icon name="language" size={16} />
+              <span>{t("settings_language")}</span>
+            </div>
+            <select
+              className="select input-compact"
+              value={lang}
+              onChange={(event) => setLang(event.target.value as typeof lang)}
+              aria-label={t("settings_language")}
+            >
+              {LANGUAGES.map((language) => (
+                <option key={language.code} value={language.code}>
+                  {language.label}
+                </option>
+              ))}
+            </select>
+          </div>
+          <label className="settings-row" htmlFor="theme-switch">
+            <div className="settings-row-label">
+              <Icon name={theme === "dark" ? "moon" : "sun"} size={16} />
+              <span>{t("settings_theme")}</span>
+            </div>
+            <span className="switch-control">
+              <input
+                id="theme-switch"
+                type="checkbox"
+                checked={theme === "light"}
+                onChange={toggleTheme}
+                aria-label={theme === "dark" ? t("theme_light") : t("theme_dark")}
+              />
+              <span aria-hidden="true" />
+            </span>
+          </label>
+        </section>
+
+        <section className="panel panel-pad stack database-settings" style={{ gap: 0 }}>
           <div className="section-title" style={{ margin: 0 }}>
             {t("settings_database")}
           </div>
@@ -100,13 +135,13 @@ export function SettingsPage() {
             <div className="kv-label">{t("settings_last_import")}</div>
             <div className="kv-value faint">{stats?.last_import ?? "—"}</div>
           </div>
-        </div>
+        </section>
       </div>
 
-      {isAdmin ? <UsersPanel /> : null}
+      {isAdmin && isLanWorkspace ? <UsersPanel /> : null}
 
       {isAdmin ? (
-      <div className="panel panel-pad stack" style={{ gap: 14 }}>
+      <section className="panel panel-pad stack maintenance-settings" style={{ gap: 12 }}>
         <div className="section-title" style={{ margin: 0 }}>
           {t("settings_maintenance")}
         </div>
@@ -153,12 +188,7 @@ export function SettingsPage() {
             <Icon name="trash" size={16} /> {t("settings_clear")}
           </button>
         </div>
-        {status?.lan_exposed ? (
-          <div className="banner banner-warn">
-            {t("settings_lan_warning")}
-          </div>
-        ) : null}
-      </div>
+      </section>
       ) : null}
     </div>
   );
@@ -172,6 +202,14 @@ function UsersPanel() {
   const [password, setPassword] = useState("");
   const [role, setRole] = useState<UserRole>("viewer");
   const [busy, setBusy] = useState(false);
+  const requestedUsername = username.trim();
+  const existingAccount = accounts.find(
+    (account) =>
+      requestedUsername.length > 0 &&
+      account.username.localeCompare(requestedUsername, undefined, {
+        sensitivity: "accent",
+      }) === 0,
+  );
 
   const load = () => {
     api.accounts().then(setAccounts).catch(() => {});
@@ -179,9 +217,13 @@ function UsersPanel() {
   useEffect(load, []);
 
   const add = async () => {
+    if (existingAccount) {
+      toast(t("settings_account_exists", { name: existingAccount.username }), "error");
+      return;
+    }
     setBusy(true);
     try {
-      await api.createAccount(username.trim(), password, role);
+      await api.createAccount(requestedUsername, password, role);
       toast(t("settings_account_created"), "success");
       setUsername("");
       setPassword("");
@@ -250,10 +292,13 @@ function UsersPanel() {
         <div className="faint">{t("settings_no_accounts")}</div>
       )}
 
-      <div className="row wrap" style={{ gap: 10, alignItems: "flex-end" }}>
+      <div className="row wrap account-create-form" style={{ gap: 10, alignItems: "flex-end" }}>
         <div>
-          <label className="field-label">{t("settings_username")}</label>
+          <label className="field-label" htmlFor="account-username">
+            {t("settings_username")}
+          </label>
           <input
+            id="account-username"
             className="input"
             style={{ width: 160 }}
             value={username}
@@ -261,8 +306,11 @@ function UsersPanel() {
           />
         </div>
         <div>
-          <label className="field-label">{t("settings_password")}</label>
+          <label className="field-label" htmlFor="account-password">
+            {t("settings_password")}
+          </label>
           <input
+            id="account-password"
             className="input"
             style={{ width: 160 }}
             type="password"
@@ -271,8 +319,11 @@ function UsersPanel() {
           />
         </div>
         <div>
-          <label className="field-label">{t("settings_role")}</label>
+          <label className="field-label" htmlFor="account-role">
+            {t("settings_role")}
+          </label>
           <select
+            id="account-role"
             className="select"
             style={{ width: 120 }}
             value={role}
@@ -288,11 +339,16 @@ function UsersPanel() {
         </div>
         <button
           className="btn btn-primary"
-          disabled={busy || !username.trim() || password.length < 8}
+          disabled={busy || !requestedUsername || password.length < 8 || Boolean(existingAccount)}
           onClick={add}
         >
           <Icon name="plus" size={15} /> {t("settings_add_account")}
         </button>
+        {existingAccount ? (
+          <div className="account-name-error" role="alert">
+            {t("settings_account_exists", { name: existingAccount.username })}
+          </div>
+        ) : null}
       </div>
     </div>
   );

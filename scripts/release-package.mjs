@@ -29,6 +29,23 @@ const PRIVATE_EXTENSIONS = new Set([
   ".xlsx",
 ]);
 
+const SOURCE_EXTENSIONS = new Set([
+  ".c",
+  ".cc",
+  ".cpp",
+  ".h",
+  ".hpp",
+  ".jsx",
+  ".m",
+  ".map",
+  ".mm",
+  ".rs",
+  ".swift",
+  ".toml",
+  ".ts",
+  ".tsx",
+]);
+
 function fail(message) {
   throw new Error(message);
 }
@@ -52,6 +69,34 @@ function required(args, name) {
   return value;
 }
 
+function booleanArg(args, name, fallback = false) {
+  const value = args[name];
+  if (value === undefined) return fallback;
+  if (value === "true") return true;
+  if (value === "false") return false;
+  fail(`--${name} must be true or false`);
+}
+
+function signingDeclaration(args, platform) {
+  const signing = args.signing ?? "unsigned";
+  if (!new Set(["signed", "unsigned"]).has(signing)) {
+    fail("--signing must be signed or unsigned");
+  }
+  const notarized = booleanArg(args, "notarized");
+  if (platform !== "macos" && notarized) {
+    fail("--notarized true is valid only for macOS packages");
+  }
+  if (signing !== "signed" && notarized) {
+    fail("A notarized macOS package must also be signed");
+  }
+  return {
+    windows_authenticode: platform === "windows" ? signing : "not-applicable",
+    macos_codesign: platform === "macos" ? signing : "not-applicable",
+    macos_notarization:
+      platform === "macos" ? (notarized ? "stapled" : "not-notarized") : "not-applicable",
+  };
+}
+
 function relativeUnix(root, item) {
   return path.relative(root, item).split(path.sep).join("/");
 }
@@ -71,7 +116,7 @@ function walk(root) {
   return entries;
 }
 
-function expectedFiles(platform) {
+function expectedFiles(platform, signing) {
   if (platform === "windows") {
     return [
       "BaseSearch.exe",
@@ -83,7 +128,7 @@ function expectedFiles(platform) {
     ];
   }
   if (platform === "macos") {
-    return [
+    const files = [
       "BaseSearch.app/Contents/Info.plist",
       "BaseSearch.app/Contents/MacOS/BaseSearch",
       "LICENSE",
@@ -91,6 +136,15 @@ function expectedFiles(platform) {
       "base-search-cli",
       "release-manifest.json",
     ];
+    if (signing.macos_codesign === "signed") {
+      files.push("BaseSearch.app/Contents/_CodeSignature/CodeResources");
+    }
+    if (signing.macos_notarization === "stapled") {
+      // `xcrun stapler staple` stores the notarization ticket as an extra
+      // top-level CodeResources file inside Contents.
+      files.push("BaseSearch.app/Contents/CodeResources");
+    }
+    return files;
   }
   if (platform === "linux") {
     return [
@@ -105,7 +159,7 @@ function expectedFiles(platform) {
   fail(`Unsupported platform: ${platform}`);
 }
 
-function assertSafePackage(root, platform, manifestRequired) {
+function assertSafePackage(root, platform, manifestRequired, signing) {
   if (!existsSync(root) || !statSync(root).isDirectory()) {
     fail(`Package root is missing: ${root}`);
   }
@@ -120,7 +174,7 @@ function assertSafePackage(root, platform, manifestRequired) {
     .filter((entry) => entry.info.isFile())
     .map((entry) => entry.relative)
     .sort();
-  const expected = expectedFiles(platform).filter(
+  const expected = expectedFiles(platform, signing).filter(
     (name) => manifestRequired || name !== "release-manifest.json",
   );
   if (files.join("\n") !== [...expected].sort().join("\n")) {
@@ -138,6 +192,7 @@ function assertSafePackage(root, platform, manifestRequired) {
     const extension = path.extname(lower);
     if (
       PRIVATE_EXTENSIONS.has(extension) ||
+      SOURCE_EXTENSIONS.has(extension) ||
       lower.endsWith("-wal") ||
       lower.endsWith("-shm") ||
       lower.endsWith(".db-wal") ||
@@ -147,7 +202,9 @@ function assertSafePackage(root, platform, manifestRequired) {
     }
   }
 
-  if (platform !== "windows") {
+  // NTFS does not expose portable POSIX execute bits through Node. Target
+  // runners still enforce them when building and verifying Unix packages.
+  if (platform !== "windows" && process.platform !== "win32") {
     const executables =
       platform === "macos"
         ? ["BaseSearch.app/Contents/MacOS/BaseSearch", "base-search-cli"]
@@ -173,6 +230,7 @@ function normalizeTimes(root, epoch) {
 
 function renderReadme(args) {
   const platform = required(args, "platform");
+  const signing = signingDeclaration(args, platform);
   const replacements = {
     "{{ARCH}}": required(args, "arch"),
     "{{GIT_SHA}}": required(args, "git-sha"),
@@ -186,14 +244,21 @@ function renderReadme(args) {
     replacements["{{CLI_INSTRUCTIONS}}"] =
       "Run base-search-cli.exe from PowerShell or Command Prompt.";
     replacements["{{PLATFORM_NOTE}}"] =
-      "This Windows package is portable and does not require installation.";
+      signing.windows_authenticode === "signed"
+        ? "This portable Windows package is Authenticode signed and does not require installation."
+        : "This portable local Windows build is unsigned and does not require installation.";
   } else if (platform === "macos") {
-    replacements["{{START_INSTRUCTIONS}}"] =
-      "Open BaseSearch.app. If macOS blocks an unsigned local build, use the context menu and choose Open.";
+    replacements["{{START_INSTRUCTIONS}}"] = signing.macos_codesign === "signed"
+      ? "Open BaseSearch.app."
+      : "Open BaseSearch.app. If macOS blocks an unsigned local build, use the context menu and choose Open.";
     replacements["{{CLI_INSTRUCTIONS}}"] =
       "Run ./base-search-cli from Terminal.";
     replacements["{{PLATFORM_NOTE}}"] =
-      "This local .app build is unsigned. Public distribution requires Developer ID signing, hardened runtime, notarization, and stapling after packaging.";
+      signing.macos_notarization === "stapled"
+        ? "This .app is Developer ID signed, notarized, and stapled."
+        : signing.macos_codesign === "signed"
+          ? "This local .app is Developer ID signed but has not been notarized or stapled."
+          : "This local .app build is unsigned. Public distribution requires Developer ID signing, hardened runtime, notarization, and stapling.";
   } else if (platform === "linux") {
     replacements["{{START_INSTRUCTIONS}}"] =
       "Run ./Open Base Search.sh or ./BaseSearch.";
@@ -216,9 +281,10 @@ function renderReadme(args) {
 function writeManifest(args) {
   const root = path.resolve(required(args, "root"));
   const platform = required(args, "platform");
+  const signing = signingDeclaration(args, platform);
   const epoch = Number(required(args, "epoch"));
   if (!Number.isSafeInteger(epoch) || epoch < 0) fail("Source date epoch must be a positive integer");
-  assertSafePackage(root, platform, false);
+  assertSafePackage(root, platform, false, signing);
   const hashes = {};
   for (const entry of walk(root).filter((item) => item.info.isFile())) {
     hashes[entry.relative] = sha256(entry.full);
@@ -234,6 +300,13 @@ function writeManifest(args) {
     features: ["browser", "duckdb-olap"],
     launcher_default: "browser",
     legacy_desktop_fallback: true,
+    data_policy: {
+      default: "per-user-unversioned",
+      existing_portable_database: "reuse-in-place",
+      sibling_portable_database: "reuse-after-explicit-confirmation",
+      automatic_database_move: false,
+    },
+    signing,
     files_sha256: hashes,
   };
   writeFileSync(
@@ -242,14 +315,19 @@ function writeManifest(args) {
     "utf8",
   );
   normalizeTimes(root, epoch);
-  assertSafePackage(root, platform, true);
+  assertSafePackage(root, platform, true, signing);
 }
 
 function verifyManifest(args) {
   const root = path.resolve(required(args, "root"));
   const platform = required(args, "platform");
-  assertSafePackage(root, platform, true);
+  if (!existsSync(root) || !statSync(root).isDirectory()) {
+    fail(`Package root is missing: ${root}`);
+  }
   const manifestPath = path.join(root, "release-manifest.json");
+  if (!existsSync(manifestPath) || !statSync(manifestPath).isFile()) {
+    fail("Package release-manifest.json is missing");
+  }
   const manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
   if (manifest.platform !== platform) fail("Manifest platform does not match package");
   if (!Array.isArray(manifest.features) || !manifest.features.includes("browser") || !manifest.features.includes("duckdb-olap")) {
@@ -257,6 +335,35 @@ function verifyManifest(args) {
   }
   if (manifest.launcher_default !== "browser" || manifest.legacy_desktop_fallback !== true) {
     fail("Manifest launcher contract is invalid");
+  }
+  if (
+    manifest.data_policy?.default !== "per-user-unversioned" ||
+    manifest.data_policy?.existing_portable_database !== "reuse-in-place" ||
+    manifest.data_policy?.sibling_portable_database !== "reuse-after-explicit-confirmation" ||
+    manifest.data_policy?.automatic_database_move !== false
+  ) {
+    fail("Manifest database location and migration policy is invalid");
+  }
+  const signing = manifest.signing;
+  if (
+    !signing ||
+    !["signed", "unsigned", "not-applicable"].includes(signing.windows_authenticode) ||
+    !["signed", "unsigned", "not-applicable"].includes(signing.macos_codesign) ||
+    !["stapled", "not-notarized", "not-applicable"].includes(signing.macos_notarization)
+  ) {
+    fail("Manifest signing declaration is invalid");
+  }
+  assertSafePackage(root, platform, true, signing);
+  if (booleanArg(args, "require-signed")) {
+    if (platform === "windows" && signing.windows_authenticode !== "signed") {
+      fail("Windows Authenticode signing is required for stable publishing");
+    }
+    if (platform === "macos" && signing.macos_codesign !== "signed") {
+      fail("macOS codesigning is required for stable publishing");
+    }
+    if (platform === "macos" && signing.macos_notarization !== "stapled") {
+      fail("The macOS app must be notarized and stapled for stable publishing");
+    }
   }
   const actual = {};
   for (const entry of walk(root).filter(

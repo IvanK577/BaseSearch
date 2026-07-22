@@ -20,7 +20,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
-use calamine::{Data, Reader, Sheets, open_workbook_auto};
+use calamine::{Data, Dimensions, Reader, Sheets, open_workbook_auto};
 use chrono::Timelike;
 use xxhash_rust::xxh3::Xxh3;
 
@@ -35,6 +35,9 @@ use self::detection::{DETECTION_BUFFER_ROWS, DetectedTable, detect_table};
 const BATCH_SIZE: usize = 8192;
 /// Number of first sheet rows scanned while searching for the header row.
 const HEADER_SCAN_ROWS: usize = 50;
+const MAX_WORKBOOK_SHEETS: usize = 256;
+const MAX_SOURCE_COLUMNS: usize = 16_384;
+const MAX_SOURCE_CELLS_PER_SHEET: u64 = 100_000_000;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ImportPhase {
@@ -477,6 +480,71 @@ fn preview_sheet(
     })
 }
 
+fn validate_workbook_sheet_count(sheet_count: usize) -> Result<(), String> {
+    if sheet_count > MAX_WORKBOOK_SHEETS {
+        return Err(format!(
+            "The workbook contains {sheet_count} sheets; at most {MAX_WORKBOOK_SHEETS} sheets are supported."
+        ));
+    }
+    Ok(())
+}
+
+fn validate_sheet_width(cols: usize) -> Result<(), String> {
+    if cols > MAX_SOURCE_COLUMNS {
+        return Err(format!(
+            "The sheet contains {cols} columns; at most {MAX_SOURCE_COLUMNS} columns are supported."
+        ));
+    }
+    Ok(())
+}
+
+fn dimensions_size(dimensions: Dimensions) -> Result<(usize, usize), String> {
+    let rows = dimensions
+        .end
+        .0
+        .checked_sub(dimensions.start.0)
+        .and_then(|rows| rows.checked_add(1))
+        .ok_or_else(|| "The sheet has invalid row dimensions.".to_string())?
+        as usize;
+    let cols = dimensions
+        .end
+        .1
+        .checked_sub(dimensions.start.1)
+        .and_then(|cols| cols.checked_add(1))
+        .ok_or_else(|| "The sheet has invalid column dimensions.".to_string())?
+        as usize;
+    validate_sheet_width(cols)?;
+    Ok((rows, cols))
+}
+
+fn preview_streamed_sheet(
+    name: String,
+    dimensions: Dimensions,
+    mut next_cell: impl FnMut() -> Result<Option<(u32, u32, Data)>, String>,
+) -> Result<Option<SheetPeek>, String> {
+    let (rows, cols) = dimensions_size(dimensions)?;
+    let scanned_rows = rows.min(DETECTION_BUFFER_ROWS);
+    let mut scanned = vec![Vec::new(); scanned_rows];
+    while let Some((row, col, value)) = next_cell()? {
+        let Some(row) = row.checked_sub(dimensions.start.0) else {
+            continue;
+        };
+        let row = row as usize;
+        if row >= scanned_rows {
+            break;
+        }
+        let Some(col) = col.checked_sub(dimensions.start.1) else {
+            continue;
+        };
+        let col = col as usize;
+        if scanned[row].len() <= col {
+            scanned[row].resize(col + 1, Data::Empty);
+        }
+        scanned[row][col] = value;
+    }
+    Ok(preview_sheet(name, rows, cols, &scanned))
+}
+
 /// Reads at most `max_sheets` sheets and previews each one's header row plus the
 /// first data row. Read-only: it never touches the database.
 pub fn peek_file(path: &Path, max_sheets: usize) -> Result<WorkbookPeek, String> {
@@ -485,17 +553,58 @@ pub fn peek_file(path: &Path, max_sheets: usize) -> Result<WorkbookPeek, String>
     }
     let mut workbook = open_workbook_auto(path).map_err(|e| e.to_string())?;
     let names: Vec<String> = workbook.sheet_names().to_vec();
+    validate_workbook_sheet_count(names.len())?;
     let mut sheets = Vec::new();
     for (index, name) in names.iter().enumerate().take(max_sheets) {
-        let Some(Ok(range)) = workbook.worksheet_range_at(index) else {
-            continue;
+        let sheet = match &mut workbook {
+            Sheets::Xlsx(xlsx) => {
+                let mut reader = xlsx
+                    .worksheet_cells_reader(name)
+                    .map_err(|error| error.to_string())?;
+                let dimensions = reader.dimensions();
+                preview_streamed_sheet(name.clone(), dimensions, || {
+                    reader
+                        .next_cell()
+                        .map_err(|error| error.to_string())
+                        .map(|cell| {
+                            cell.map(|cell| {
+                                let (row, col) = cell.get_position();
+                                (row, col, cell.get_value().clone().into())
+                            })
+                        })
+                })?
+            }
+            Sheets::Xlsb(xlsb) => {
+                let mut reader = xlsb
+                    .worksheet_cells_reader(name)
+                    .map_err(|error| error.to_string())?;
+                let dimensions = reader.dimensions();
+                preview_streamed_sheet(name.clone(), dimensions, || {
+                    reader
+                        .next_cell()
+                        .map_err(|error| error.to_string())
+                        .map(|cell| {
+                            cell.map(|cell| {
+                                let (row, col) = cell.get_position();
+                                (row, col, cell.get_value().clone().into())
+                            })
+                        })
+                })?
+            }
+            other => {
+                let Some(Ok(range)) = other.worksheet_range_at(index) else {
+                    continue;
+                };
+                validate_sheet_width(range.width())?;
+                let scanned = range
+                    .rows()
+                    .take(DETECTION_BUFFER_ROWS)
+                    .map(|row| row.to_vec())
+                    .collect::<Vec<_>>();
+                preview_sheet(name.clone(), range.height(), range.width(), &scanned)
+            }
         };
-        let scanned = range
-            .rows()
-            .take(DETECTION_BUFFER_ROWS)
-            .map(|row| row.to_vec())
-            .collect::<Vec<_>>();
-        if let Some(sheet) = preview_sheet(name.clone(), range.height(), range.width(), &scanned) {
+        if let Some(sheet) = sheet {
             sheets.push(sheet);
         }
     }
@@ -559,24 +668,29 @@ pub fn import_file_with_options(
     match db.begin_import_file() {
         Ok(()) => match import_file_inner(
             db,
-            path,
-            &file_name,
-            options,
-            &file_hash,
+            FileImportSpec {
+                path,
+                file_name: &file_name,
+                options,
+                import_fingerprint: &file_hash,
+            },
             cancel,
             progress,
             &mut summary,
         ) {
-            Ok(()) if !summary.cancelled => match db.commit_import_file() {
-                Ok(()) => {
-                    committed = true;
+            Ok(()) if !summary.cancelled && !cancel.load(Ordering::Relaxed) => {
+                match db.commit_import_file() {
+                    Ok(()) => {
+                        committed = true;
+                    }
+                    Err(e) => {
+                        summary.error = Some(e.to_string());
+                        db.rollback_import_file();
+                    }
                 }
-                Err(e) => {
-                    summary.error = Some(e.to_string());
-                    db.rollback_import_file();
-                }
-            },
+            }
             Ok(()) => {
+                summary.cancelled = true;
                 db.rollback_import_file();
                 summary.imported = 0;
                 summary.duplicates = 0;
@@ -734,9 +848,34 @@ fn detect_delimiter(path: &Path) -> Result<u8, String> {
             best = candidate;
         }
     }
-    best.map(|(_, _, delimiter)| delimiter).ok_or_else(|| {
-        "Could not detect a comma, semicolon, tab, or pipe-delimited table.".to_string()
-    })
+    if let Some((_, _, delimiter)) = best {
+        return Ok(delimiter);
+    }
+    match path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("csv") => Ok(b','),
+        Some("tsv") => Ok(b'\t'),
+        _ => Err("Could not detect a comma, semicolon, tab, or pipe-delimited table.".to_string()),
+    }
+}
+
+fn delimited_width(path: &Path, delimiter: u8) -> Result<usize, String> {
+    let mut reader = csv::ReaderBuilder::new()
+        .delimiter(delimiter)
+        .has_headers(false)
+        .flexible(true)
+        .from_path(path)
+        .map_err(|error| error.to_string())?;
+    let mut width = 0;
+    for record in reader.records() {
+        width = width.max(record.map_err(|error| error.to_string())?.len());
+        validate_sheet_width(width)?;
+    }
+    Ok(width)
 }
 
 fn delimited_record_widths(sample: &[u8], delimiter: u8, limit: usize) -> Vec<usize> {
@@ -827,6 +966,7 @@ fn import_delimited_file_inner(
         fixed_values,
     } = spec;
     let delimiter = detect_delimiter(path)?;
+    let source_width = delimited_width(path, delimiter)?;
     let mut reader = csv::ReaderBuilder::new()
         .delimiter(delimiter)
         .has_headers(false)
@@ -842,6 +982,8 @@ fn import_delimited_file_inner(
         progress,
         summary,
         total_rows_hint: 0,
+        source_width,
+        source_cells_seen: 0,
         mapping: None,
         extra_cols: Vec::new(),
         year_extra_index: None,
@@ -867,16 +1009,26 @@ fn import_delimited_file_inner(
     sink.finish()
 }
 
+struct FileImportSpec<'a> {
+    path: &'a Path,
+    file_name: &'a str,
+    options: &'a ImportOptions,
+    import_fingerprint: &'a str,
+}
+
 fn import_file_inner(
     db: &mut Db,
-    path: &Path,
-    file_name: &str,
-    options: &ImportOptions,
-    import_fingerprint: &str,
+    spec: FileImportSpec<'_>,
     cancel: &AtomicBool,
     progress: &mut dyn FnMut(ImportPhase, u64, u64),
     summary: &mut FileSummary,
 ) -> Result<(), String> {
+    let FileImportSpec {
+        path,
+        file_name,
+        options,
+        import_fingerprint,
+    } = spec;
     if is_delimited_path(path) {
         if options
             .selected_sheets
@@ -925,6 +1077,7 @@ fn import_file_inner(
     if sheet_names.is_empty() {
         return Err("The workbook contains no sheets.".to_string());
     }
+    validate_workbook_sheet_count(sheet_names.len())?;
 
     let selected_sheet_names = if let Some(selected) = &options.selected_sheets {
         if selected.is_empty() {
@@ -1077,6 +1230,8 @@ fn import_single_sheet_inner(
         progress,
         summary,
         total_rows_hint: 0,
+        source_width: 0,
+        source_cells_seen: 0,
         mapping: None,
         extra_cols: Vec::new(),
         year_extra_index: None,
@@ -1097,7 +1252,8 @@ fn import_single_sheet_inner(
                 .map_err(|e| e.to_string())?;
             let dims = reader.dimensions();
             sink.total_rows_hint = (dims.end.0.saturating_sub(dims.start.0)) as u64;
-            let mut assembler = RowAssembler::default();
+            sink.source_width = dimensions_size(dims)?.1;
+            let mut assembler = RowAssembler::with_column_offset(dims.start.1);
             while let Some(cell) = reader.next_cell().map_err(|e| e.to_string())? {
                 let (row, col) = cell.get_position();
                 let data: Data = cell.get_value().clone().into();
@@ -1118,7 +1274,8 @@ fn import_single_sheet_inner(
                 .map_err(|e| e.to_string())?;
             let dims = reader.dimensions();
             sink.total_rows_hint = (dims.end.0.saturating_sub(dims.start.0)) as u64;
-            let mut assembler = RowAssembler::default();
+            sink.source_width = dimensions_size(dims)?.1;
+            let mut assembler = RowAssembler::with_column_offset(dims.start.1);
             while let Some(cell) = reader.next_cell().map_err(|e| e.to_string())? {
                 let (row, col) = cell.get_position();
                 let data: Data = cell.get_value().clone().into();
@@ -1137,6 +1294,8 @@ fn import_single_sheet_inner(
         other => {
             let range = other.worksheet_range(&sheet).map_err(|e| e.to_string())?;
             sink.total_rows_hint = (range.height().saturating_sub(1)) as u64;
+            sink.source_width = range.width();
+            validate_sheet_width(sink.source_width)?;
             for row in range.rows() {
                 if !sink.row(row.to_vec())? {
                     break;
@@ -1152,10 +1311,18 @@ fn import_single_sheet_inner(
 #[derive(Default)]
 struct RowAssembler {
     current_row: Option<u32>,
+    column_offset: u32,
     cells: Vec<Data>,
 }
 
 impl RowAssembler {
+    fn with_column_offset(column_offset: u32) -> Self {
+        Self {
+            column_offset,
+            ..Self::default()
+        }
+    }
+
     fn push(&mut self, row: u32, col: u32, value: Data) -> Option<Vec<Data>> {
         let mut finished = None;
         match self.current_row {
@@ -1164,7 +1331,7 @@ impl RowAssembler {
             None => {}
         }
         self.current_row = Some(row);
-        let col = col as usize;
+        let col = col.saturating_sub(self.column_offset) as usize;
         if self.cells.len() < col {
             self.cells.resize(col, Data::Empty);
         }
@@ -1192,6 +1359,8 @@ struct RowSink<'a> {
     progress: &'a mut dyn FnMut(ImportPhase, u64, u64),
     summary: &'a mut FileSummary,
     total_rows_hint: u64,
+    source_width: usize,
+    source_cells_seen: u64,
     mapping: Option<Vec<ColSrc>>,
     /// Source columns not consumed by the mapping: (column index, header name).
     /// Captured verbatim per row so no source data is lost on import.
@@ -1210,6 +1379,14 @@ struct RowSink<'a> {
 impl RowSink<'_> {
     /// Ok(false) means import was cancelled and no more rows are needed.
     fn row(&mut self, row: Vec<Data>) -> Result<bool, String> {
+        validate_sheet_width(row.len())?;
+        let row_cells = row.len() as u64;
+        if row_cells > MAX_SOURCE_CELLS_PER_SHEET.saturating_sub(self.source_cells_seen) {
+            return Err(format!(
+                "The sheet exceeds the {MAX_SOURCE_CELLS_PER_SHEET} source-cell import limit."
+            ));
+        }
+        self.source_cells_seen += row_cells;
         self.rows_seen += 1;
         if self.mapping.is_none() {
             self.scanned.push(row);
@@ -1225,12 +1402,22 @@ impl RowSink<'_> {
         let scanned = std::mem::take(&mut self.scanned);
         let Some(DetectedTable {
             header_index,
-            headers,
+            mut headers,
             plan,
         }) = detect_table(&scanned)
         else {
             return Err(self.missing_error());
         };
+        let detected_width = headers.len();
+        let source_width = self.source_width.max(detected_width);
+        if source_width > detected_width {
+            headers.resize(source_width, String::new());
+            headers = TableShape::from_headers(headers)
+                .columns
+                .into_iter()
+                .map(|column| column.header)
+                .collect();
+        }
         let mapping = apply_semantic_overrides(&headers, plan.columns, &self.semantic_overrides)?;
         let mapping = apply_fixed_values(mapping, &self.fixed_values)?;
         let semantics = semantics_with_overrides(&plan.semantics, &self.semantic_overrides);
@@ -1285,6 +1472,15 @@ impl RowSink<'_> {
             extra_columns: self.extra_cols.len() as u64,
             ..Default::default()
         };
+        if source_width > detected_width {
+            push_quality_warning(
+                &mut self.summary.quality,
+                &format!(
+                    "Rows wider than the detected header added {} generated source column(s).",
+                    source_width - detected_width
+                ),
+            );
+        }
         for row in scanned.into_iter().skip(header_index + 1) {
             if !self.data_row(row)? {
                 return Ok(false);
@@ -1294,6 +1490,9 @@ impl RowSink<'_> {
     }
 
     fn data_row(&mut self, row: Vec<Data>) -> Result<bool, String> {
+        if self.stop_if_cancelled() {
+            return Ok(false);
+        }
         let mapping = self.mapping.as_ref().expect("mapping initialized");
         let mut values: Vec<String> = Vec::with_capacity(COLUMNS.len());
         for (i, src) in mapping.iter().enumerate() {
@@ -1331,8 +1530,7 @@ impl RowSink<'_> {
         });
         if self.batch.len() >= BATCH_SIZE {
             self.flush_batch()?;
-            if self.cancel.load(Ordering::Relaxed) {
-                self.summary.cancelled = true;
+            if self.stop_if_cancelled() {
                 return Ok(false);
             }
         }
@@ -1395,6 +1593,9 @@ impl RowSink<'_> {
         if self.batch.is_empty() {
             return Ok(());
         }
+        if self.stop_if_cancelled() {
+            return Ok(());
+        }
         let (inserted, duplicates) = self
             .db
             .insert_batch_for_source(
@@ -1414,6 +1615,9 @@ impl RowSink<'_> {
     }
 
     fn finish(&mut self) -> Result<(), String> {
+        if self.stop_if_cancelled() {
+            return Ok(());
+        }
         if self.mapping.is_none() {
             let sheet_is_empty = self
                 .scanned
@@ -1424,8 +1628,20 @@ impl RowSink<'_> {
             }
             self.start_detected_import()?;
         }
+        if self.stop_if_cancelled() {
+            return Ok(());
+        }
         self.flush_batch()?;
         Ok(())
+    }
+
+    fn stop_if_cancelled(&mut self) -> bool {
+        if !self.cancel.load(Ordering::Relaxed) {
+            return false;
+        }
+        self.summary.cancelled = true;
+        self.batch.clear();
+        true
     }
 
     fn missing_error(&self) -> String {
@@ -1595,7 +1811,15 @@ pub fn row_hash_cells(row: &[Data]) -> [u8; 16] {
 
 #[cfg(test)]
 mod tests {
-    use super::{ColSrc, unmapped_columns};
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use crate::db::{Db, Query};
+    use crate::domain::table::SemanticField;
+
+    use super::{
+        ColSrc, DETECTION_BUFFER_ROWS, Data, FileSummary, ImportOptions, RowSink, import_file,
+        import_file_with_options, peek_file, unmapped_columns,
+    };
 
     #[test]
     fn unmapped_columns_preserve_blank_and_duplicate_headers() {
@@ -1622,5 +1846,207 @@ mod tests {
                 (2, "SKU (2)".to_string())
             ]
         );
+    }
+
+    #[test]
+    fn cancellation_before_a_partial_final_batch_rolls_back_every_row() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut db = Db::open(&temp.path().join("workspace.db")).unwrap();
+        db.begin_import_file().unwrap();
+        let cancel = AtomicBool::new(false);
+        let mut summary = FileSummary {
+            file_name: "partial.csv".to_string(),
+            ..Default::default()
+        };
+        let mut progress = |_, _, _| {};
+
+        {
+            let mut sink = RowSink {
+                db: &mut db,
+                file_name: "partial.csv",
+                table_name: "partial.csv",
+                import_fingerprint: "partial-batch-test",
+                cancel: &cancel,
+                progress: &mut progress,
+                summary: &mut summary,
+                total_rows_hint: (DETECTION_BUFFER_ROWS - 1) as u64,
+                source_width: 2,
+                source_cells_seen: 0,
+                mapping: None,
+                extra_cols: Vec::new(),
+                year_extra_index: None,
+                date_extra_indices: Default::default(),
+                scanned: Vec::new(),
+                batch: Vec::new(),
+                rows_seen: 0,
+                semantic_overrides: Default::default(),
+                fixed_values: Default::default(),
+                schema_id: None,
+                source_id: None,
+            };
+            assert!(
+                sink.row(vec![
+                    Data::String("Name".to_string()),
+                    Data::String("Value".to_string()),
+                ])
+                .unwrap()
+            );
+            for index in 0..DETECTION_BUFFER_ROWS - 1 {
+                assert!(
+                    sink.row(vec![
+                        Data::String(format!("row-{index}")),
+                        Data::String(index.to_string()),
+                    ])
+                    .unwrap()
+                );
+            }
+            assert_eq!(sink.batch.len(), DETECTION_BUFFER_ROWS - 1);
+
+            cancel.store(true, Ordering::SeqCst);
+            sink.finish().unwrap();
+            assert!(sink.batch.is_empty());
+        }
+
+        assert!(summary.cancelled);
+        assert_eq!(summary.total_rows, (DETECTION_BUFFER_ROWS - 1) as u64);
+        assert_eq!(summary.imported, 0);
+        db.rollback_import_file();
+        assert_eq!(db.total_rows(), 0);
+    }
+
+    #[test]
+    fn one_column_csv_imports_as_a_valid_table() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("one-column.csv");
+        std::fs::write(&path, "Item\nAlpha\nBeta\n").unwrap();
+        let mut db = Db::open(&temp.path().join("workspace.db")).unwrap();
+        let cancel = AtomicBool::new(false);
+
+        let summary = import_file(&mut db, &path, &cancel, &mut |_, _, _| {});
+
+        assert_eq!(summary.error, None);
+        assert_eq!(summary.imported, 2);
+        assert_eq!(db.total_rows(), 2);
+    }
+
+    #[test]
+    fn columns_first_seen_after_detection_are_preserved() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("late-column.csv");
+        let mut contents = String::from("Name,Value\n");
+        for index in 0..57 {
+            contents.push_str(&format!("row-{index},{index}\n"));
+        }
+        contents.push_str("late-row,999,preserved-late-value\n");
+        std::fs::write(&path, contents).unwrap();
+        let mut db = Db::open(&temp.path().join("workspace.db")).unwrap();
+        let cancel = AtomicBool::new(false);
+
+        let summary = import_file(&mut db, &path, &cancel, &mut |_, _, _| {});
+
+        assert_eq!(summary.error, None);
+        let schemas = db.list_source_schemas().unwrap();
+        assert_eq!(schemas.len(), 1);
+        assert_eq!(schemas[0].columns.len(), 3);
+        assert_eq!(schemas[0].columns[2].header, "Column 3");
+        let (fields, _, rows, _) = db.search_page_dynamic(&Query::default(), 100, 0).unwrap();
+        let late_index = fields
+            .iter()
+            .position(|field| field.label == "Column 3")
+            .expect("generated late column");
+        assert!(
+            rows.iter()
+                .any(|row| row[late_index] == "preserved-late-value")
+        );
+        assert!(
+            summary
+                .quality
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("wider"))
+        );
+    }
+
+    #[test]
+    fn preview_of_a_large_sparse_xlsx_reads_only_the_bounded_header_window() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("large-sparse.xlsx");
+        let mut workbook = rust_xlsxwriter::Workbook::new();
+        let sheet = workbook.add_worksheet();
+        sheet.write_string(0, 0, "Name").unwrap();
+        sheet.write_string(599_999, 0, "far-tail").unwrap();
+        workbook.save(&path).unwrap();
+
+        let preview = peek_file(&path, 1).unwrap();
+
+        assert_eq!(preview.sheets.len(), 1);
+        assert_eq!(preview.sheets[0].rows, 600_000);
+        assert_eq!(preview.sheets[0].columns.len(), 1);
+        assert_eq!(preview.sheets[0].columns[0].header, "Name");
+    }
+
+    #[test]
+    fn analytics_preserves_fixed_currency_and_weight_unit_per_schema() {
+        let temp = tempfile::tempdir().unwrap();
+        let usd_path = temp.path().join("usd.csv");
+        let eur_path = temp.path().join("eur.csv");
+        std::fs::write(&usd_path, "Value,Weight\n100,2\n").unwrap();
+        std::fs::write(&eur_path, "Value,Weight\n200,1000\n").unwrap();
+        let mut db = Db::open(&temp.path().join("workspace.db")).unwrap();
+        let cancel = AtomicBool::new(false);
+
+        for (path, currency, unit) in [(&usd_path, "USD", "kg"), (&eur_path, "EUR", "g")] {
+            let options = ImportOptions::default()
+                .with_sheet_semantics(
+                    path.file_name().unwrap().to_string_lossy(),
+                    [
+                        (0, Some(SemanticField::Value)),
+                        (1, Some(SemanticField::NetWeight)),
+                    ],
+                )
+                .with_sheet_fixed_values(
+                    path.file_name().unwrap().to_string_lossy(),
+                    [
+                        (SemanticField::Currency, currency),
+                        (SemanticField::WeightUnit, unit),
+                    ],
+                );
+            let summary =
+                import_file_with_options(&mut db, path, &options, &cancel, &mut |_, _, _| {});
+            assert_eq!(summary.error, None);
+            assert_eq!(summary.imported, 1);
+        }
+
+        let measures = db
+            .analytics(&Query::default(), 10)
+            .unwrap()
+            .overview
+            .measures;
+        let usd = measures
+            .currency_totals
+            .iter()
+            .find(|total| total.currency == "USD")
+            .unwrap();
+        let eur = measures
+            .currency_totals
+            .iter()
+            .find(|total| total.currency == "EUR")
+            .unwrap();
+        assert_eq!(usd.total_value, 100.0);
+        assert_eq!(eur.total_value, 200.0);
+        assert_eq!(measures.total_net_kg(), 3.0);
+
+        let usd_ratio = measures
+            .value_per_net_weight
+            .iter()
+            .find(|ratio| ratio.currency == "USD")
+            .unwrap();
+        let eur_ratio = measures
+            .value_per_net_weight
+            .iter()
+            .find(|ratio| ratio.currency == "EUR")
+            .unwrap();
+        assert_eq!(usd_ratio.value_per_weight, Some(50.0));
+        assert_eq!(eur_ratio.value_per_weight, Some(200.0));
     }
 }

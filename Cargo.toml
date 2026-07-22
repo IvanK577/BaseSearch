@@ -29,6 +29,7 @@ browser = [
     "dep:argon2",
     "dep:getrandom",
     "dep:if-addrs",
+    "dep:rpassword",
 ]
 
 [[bin]]
@@ -67,6 +68,7 @@ mime_guess = { version = "2", optional = true }
 argon2 = { version = "0.5", optional = true }
 getrandom = { version = "0.2", optional = true }
 if-addrs = { version = "0.15.0", optional = true }
+rpassword = { version = "7.5.4", optional = true }
 
 [dev-dependencies]
 tempfile = "3"

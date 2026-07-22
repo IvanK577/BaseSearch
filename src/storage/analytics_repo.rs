@@ -1,4 +1,4 @@
-﻿use std::collections::HashMap;
+use std::collections::HashMap;
 
 use rusqlite::{Connection, params_from_iter};
 
@@ -21,10 +21,15 @@ use crate::storage::table_shape;
 /// Analytics column resolver for the effective shape, including the
 /// schema-level fixed currency/weight-unit values chosen at import.
 fn columns_for(conn: &Connection, row_alias: &str) -> AnalyticsColumns {
-    let (fixed_currency, fixed_weight_unit) =
-        source_schemas::merged_fixed_values(conn).unwrap_or((None, None));
     AnalyticsColumns::for_alias(table_shape::effective(conn), row_alias)
-        .with_fixed_values(fixed_currency, fixed_weight_unit)
+        .with_schema_fixed_values(
+            Some(format!(
+                "(SELECT schema_meta.fixed_currency FROM source_schemas schema_meta WHERE schema_meta.id = {row_alias}.schema_id)"
+            )),
+            Some(format!(
+                "(SELECT schema_meta.fixed_weight_unit FROM source_schemas schema_meta WHERE schema_meta.id = {row_alias}.schema_id)"
+            )),
+        )
 }
 
 /// Merges an extra condition into a plan's rendered WHERE clause.
@@ -866,6 +871,46 @@ const RISK_MIN_SAMPLES: u64 = 20;
 const RISK_MAX_SAMPLES: u64 = 1_000;
 const RISK_IQR_MULTIPLIER: f64 = 1.5;
 
+struct RiskSummary {
+    query_rows: u64,
+    missing_product_code: u64,
+    missing_period: u64,
+    missing_currency: u64,
+    missing_weight_unit: u64,
+    invalid_value: u64,
+    invalid_weight: u64,
+    eligible_rows: u64,
+    evaluated_rows: u64,
+    checked_codes: u64,
+    checked_cohorts: u64,
+    flagged_rows: u64,
+    flagged_codes: u64,
+    flagged_value: f64,
+    estimated_gap: f64,
+    currency_totals_json: String,
+}
+
+fn read_risk_summary(row: &rusqlite::Row<'_>) -> rusqlite::Result<RiskSummary> {
+    Ok(RiskSummary {
+        query_rows: row.get::<_, i64>(0)? as u64,
+        missing_product_code: row.get::<_, i64>(1)? as u64,
+        missing_period: row.get::<_, i64>(2)? as u64,
+        missing_currency: row.get::<_, i64>(3)? as u64,
+        missing_weight_unit: row.get::<_, i64>(4)? as u64,
+        invalid_value: row.get::<_, i64>(5)? as u64,
+        invalid_weight: row.get::<_, i64>(6)? as u64,
+        eligible_rows: row.get::<_, i64>(7)? as u64,
+        evaluated_rows: row.get::<_, i64>(8)? as u64,
+        checked_codes: row.get::<_, i64>(9)? as u64,
+        checked_cohorts: row.get::<_, i64>(10)? as u64,
+        flagged_rows: row.get::<_, i64>(11)? as u64,
+        flagged_codes: row.get::<_, i64>(12)? as u64,
+        flagged_value: row.get::<_, Option<f64>>(13)?.unwrap_or(0.0),
+        estimated_gap: row.get::<_, Option<f64>>(14)?.unwrap_or(0.0),
+        currency_totals_json: row.get(15)?,
+    })
+}
+
 fn risk_contract(threshold: f64, min_samples: u64) -> PriceRiskContract {
     PriceRiskContract {
         price_basis: "mapped value / mapped net weight".to_string(),
@@ -919,16 +964,28 @@ fn risk_confidence(sample_count: u64, median: f64, iqr: f64, cohort_level: &str)
     }
 }
 
-fn row_limitations(
+struct RowLimitationContext<'a> {
     sample_count: u64,
     median: f64,
     iqr: f64,
-    cohort_level: &str,
+    cohort_level: &'a str,
     row_has_brand: bool,
     row_has_country: bool,
     brand_supported: bool,
     country_supported: bool,
-) -> Vec<RiskLimitation> {
+}
+
+fn row_limitations(context: RowLimitationContext<'_>) -> Vec<RiskLimitation> {
+    let RowLimitationContext {
+        sample_count,
+        median,
+        iqr,
+        cohort_level,
+        row_has_brand,
+        row_has_country,
+        brand_supported,
+        country_supported,
+    } = context;
     let mut out = vec![limitation(
         "heuristic_not_proof",
         "This is a statistical screening signal, not proof of undervaluation.",
@@ -1246,52 +1303,14 @@ pub(crate) fn undervaluation(
     let summary = conn.query_row(
         &summary_sql,
         params_from_iter(params.clone()),
-        |row| -> rusqlite::Result<(
-            u64,
-            u64,
-            u64,
-            u64,
-            u64,
-            u64,
-            u64,
-            u64,
-            u64,
-            u64,
-            u64,
-            u64,
-            u64,
-            f64,
-            f64,
-            String,
-        )> {
-            Ok((
-                row.get::<_, i64>(0)? as u64,
-                row.get::<_, i64>(1)? as u64,
-                row.get::<_, i64>(2)? as u64,
-                row.get::<_, i64>(3)? as u64,
-                row.get::<_, i64>(4)? as u64,
-                row.get::<_, i64>(5)? as u64,
-                row.get::<_, i64>(6)? as u64,
-                row.get::<_, i64>(7)? as u64,
-                row.get::<_, i64>(8)? as u64,
-                row.get::<_, i64>(9)? as u64,
-                row.get::<_, i64>(10)? as u64,
-                row.get::<_, i64>(11)? as u64,
-                row.get::<_, i64>(12)? as u64,
-                row.get::<_, Option<f64>>(13)?.unwrap_or(0.0),
-                row.get::<_, Option<f64>>(14)?.unwrap_or(0.0),
-                row.get(15)?,
-            ))
-        },
+        read_risk_summary,
     )?;
-    let currency_totals =
-        serde_json::from_str::<Vec<RiskCurrencyTotal>>(&summary.15).map_err(|error| {
-            rusqlite::Error::FromSqlConversionFailure(
-                15,
-                rusqlite::types::Type::Text,
-                Box::new(error),
-            )
-        })?;
+    let currency_totals = serde_json::from_str::<Vec<RiskCurrencyTotal>>(
+        &summary.currency_totals_json,
+    )
+    .map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(15, rusqlite::types::Type::Text, Box::new(error))
+    })?;
 
     let sql = format!(
         "{cte}
@@ -1333,16 +1352,16 @@ pub(crate) fn undervaluation(
         let price: f64 = row.get(10)?;
         let deviation_percent = ((1.0 - ratio) * 100.0).max(0.0);
         let confidence = risk_confidence(sample_count, median, iqr, &cohort_level);
-        let limitations = row_limitations(
+        let limitations = row_limitations(RowLimitationContext {
             sample_count,
             median,
             iqr,
-            &cohort_level,
-            !row_brand_key.is_empty(),
-            !row_country_key.is_empty(),
+            cohort_level: &cohort_level,
+            row_has_brand: !row_brand_key.is_empty(),
+            row_has_country: !row_country_key.is_empty(),
             brand_supported,
             country_supported,
-        );
+        });
         let mut dimensions = contract.required_dimensions.clone();
         if matches!(cohort_level.as_str(), "brand" | "brand_country") {
             dimensions.push("brand".to_string());
@@ -1417,25 +1436,25 @@ pub(crate) fn undervaluation(
     Ok(Undervaluation {
         available: true,
         rows: out,
-        checked_rows: summary.8,
-        checked_codes: summary.9,
-        flagged_rows: summary.11,
-        flagged_codes: summary.12,
-        flagged_value: summary.13,
-        estimated_gap: summary.14,
-        eligible_rows: summary.7,
-        evaluated_rows: summary.8,
-        checked_cohorts: summary.10,
+        checked_rows: summary.evaluated_rows,
+        checked_codes: summary.checked_codes,
+        flagged_rows: summary.flagged_rows,
+        flagged_codes: summary.flagged_codes,
+        flagged_value: summary.flagged_value,
+        estimated_gap: summary.estimated_gap,
+        eligible_rows: summary.eligible_rows,
+        evaluated_rows: summary.evaluated_rows,
+        checked_cohorts: summary.checked_cohorts,
         contract,
         exclusions: RiskExclusions {
-            query_rows: summary.0,
-            missing_product_code: summary.1,
-            missing_period: summary.2,
-            missing_currency: summary.3,
-            missing_weight_unit: summary.4,
-            invalid_value: summary.5,
-            invalid_weight: summary.6,
-            insufficient_cohort: summary.7.saturating_sub(summary.8),
+            query_rows: summary.query_rows,
+            missing_product_code: summary.missing_product_code,
+            missing_period: summary.missing_period,
+            missing_currency: summary.missing_currency,
+            missing_weight_unit: summary.missing_weight_unit,
+            invalid_value: summary.invalid_value,
+            invalid_weight: summary.invalid_weight,
+            insufficient_cohort: summary.eligible_rows.saturating_sub(summary.evaluated_rows),
         },
         limitations: global_limitations,
         currency_totals,

@@ -24,6 +24,7 @@ export interface Toast {
 }
 
 type Theme = "dark" | "light";
+export type AuthReadiness = "unknown" | "ready" | "error";
 
 interface StoreValue {
   status: StatusResponse | null;
@@ -40,6 +41,8 @@ interface StoreValue {
   companyEdrpou: string | null;
   openCompany: (edrpou: string) => void;
   auth: AuthState | null;
+  authReadiness: AuthReadiness;
+  authError: string | null;
   refreshAuth: () => void;
   /// True when this server requires sign-in and the user is not signed in.
   needsLogin: boolean;
@@ -76,16 +79,30 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   const [theme, setTheme] = useState<Theme>(initialTheme);
   const [companyEdrpou, setCompanyEdrpou] = useState<string | null>(null);
   const [auth, setAuth] = useState<AuthState | null>(null);
+  const [authReadiness, setAuthReadiness] = useState<AuthReadiness>("unknown");
+  const [authError, setAuthError] = useState<string | null>(null);
   const toastId = useRef(1);
   const prevActive = useRef(0);
+  const authRequest = useRef(0);
 
   const refreshAuth = useCallback(() => {
+    const requestId = ++authRequest.current;
+    setAuth(null);
+    setAuthError(null);
+    setAuthReadiness("unknown");
     api
       .me()
-      .then(setAuth)
-      // If the endpoint is unreachable (e.g. an older server), assume no auth so
-      // the workspace still loads rather than hanging on the spinner.
-      .catch(() => setAuth({ required: false, authenticated: false }));
+      .then((nextAuth) => {
+        if (requestId !== authRequest.current) return;
+        setAuth(nextAuth);
+        setAuthReadiness("ready");
+      })
+      .catch((error: unknown) => {
+        if (requestId !== authRequest.current) return;
+        setAuth(null);
+        setAuthError(error instanceof Error && error.message ? error.message : null);
+        setAuthReadiness("error");
+      });
   }, []);
 
   useEffect(() => {
@@ -155,7 +172,10 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     prevActive.current = activeJobs;
   }, [activeJobs, refreshStatus]);
 
-  const capabilities = capabilitiesForAuth(auth);
+  const capabilities =
+    authReadiness === "ready"
+      ? capabilitiesForAuth(auth)
+      : { isAdmin: false, canEditData: false };
   const value: StoreValue = {
     status,
     statusError,
@@ -171,8 +191,13 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     companyEdrpou,
     openCompany,
     auth,
+    authReadiness,
+    authError,
     refreshAuth,
-    needsLogin: auth ? auth.required && !auth.authenticated : false,
+    needsLogin:
+      authReadiness === "ready" && auth !== null
+        ? auth.required && !auth.authenticated
+        : false,
     ...capabilities,
   };
 

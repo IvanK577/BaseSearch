@@ -4,10 +4,10 @@
 //! assets. They prevent a browser from reaching the local server through an
 //! attacker-controlled hostname and reject cross-origin state changes.
 
-use std::net::{IpAddr, Ipv6Addr};
+use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 
 use axum::Json;
-use axum::extract::{Request, State};
+use axum::extract::{ConnectInfo, Request, State};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri, header};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
@@ -71,6 +71,25 @@ impl TransportSecurity {
         Ok(())
     }
 
+    /// A wildcard listener is an advanced compatibility mode, not a network
+    /// access-control mechanism. Reject peers outside local/private address
+    /// space before Host or authentication can be treated as that boundary.
+    pub fn validate_peer(&self, peer: Option<SocketAddr>) -> Result<(), TransportSecurityError> {
+        if !self.bind_host.is_unspecified() {
+            return Ok(());
+        }
+        let peer = peer.ok_or_else(TransportSecurityError::unapproved_peer)?;
+        let approved = match peer.ip() {
+            IpAddr::V4(address) => is_loopback_ipv4(address) || is_trusted_lan_ipv4(address),
+            IpAddr::V6(address) => address.is_loopback(),
+        };
+        if approved {
+            Ok(())
+        } else {
+            Err(TransportSecurityError::unapproved_peer())
+        }
+    }
+
     fn is_approved_authority(&self, authority: &Authority) -> bool {
         if authority.port != self.port {
             return false;
@@ -132,6 +151,14 @@ impl TransportSecurityError {
         }
     }
 
+    fn unapproved_peer() -> Self {
+        Self {
+            status: StatusCode::FORBIDDEN,
+            code: "unapproved_peer",
+            message: "This client address is not allowed for the Base Search workspace.",
+        }
+    }
+
     fn cross_site_request() -> Self {
         Self {
             status: StatusCode::FORBIDDEN,
@@ -173,7 +200,13 @@ pub async fn enforce_transport_security(
     request: Request,
     next: Next,
 ) -> Response {
-    let validation = policy.validate(request.method(), request.headers());
+    let peer = request
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|connect| connect.0);
+    let validation = policy
+        .validate_peer(peer)
+        .and_then(|()| policy.validate(request.method(), request.headers()));
     let mut response = match validation {
         Ok(()) => next.run(request).await,
         Err(error) => error.into_response(),
@@ -248,4 +281,34 @@ fn parse_authority(raw: &str) -> Option<Authority> {
     };
 
     Some(Authority { host, port })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wildcard_listener_rejects_public_peers_even_with_a_forged_local_host() {
+        let policy = TransportSecurity::new(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 7833);
+        let mut headers = HeaderMap::new();
+        headers.insert(header::HOST, "localhost:7833".parse().unwrap());
+
+        assert!(policy.validate(&Method::GET, &headers).is_ok());
+        assert!(
+            policy
+                .validate_peer(Some("203.0.113.10:44000".parse().unwrap()))
+                .is_err()
+        );
+        assert!(
+            policy
+                .validate_peer(Some("192.168.1.50:44000".parse().unwrap()))
+                .is_ok()
+        );
+        assert!(
+            policy
+                .validate_peer(Some("127.0.0.1:44000".parse().unwrap()))
+                .is_ok()
+        );
+        assert!(policy.validate_peer(None).is_err());
+    }
 }

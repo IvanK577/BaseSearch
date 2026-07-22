@@ -630,7 +630,7 @@ impl LauncherController {
         let process = self.process.clone();
         let events = self.events_tx.clone();
         std::thread::spawn(move || {
-            start_server_worker(
+            start_server_worker(ServerWorkerRequest {
                 executable,
                 db_path,
                 mode,
@@ -639,7 +639,7 @@ impl LauncherController {
                 process,
                 generation,
                 events,
-            );
+            });
         });
     }
 
@@ -1257,6 +1257,12 @@ pub fn run(config: LauncherConfig) -> Result<(), String> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("Base Search")
+            .with_icon(
+                eframe::icon_data::from_png_bytes(include_bytes!(
+                    "../web-ui/public/base-search-icon.png"
+                ))
+                .expect("embedded Base Search icon must be a valid PNG"),
+            )
             .with_inner_size([680.0, 620.0])
             .with_min_inner_size([560.0, 420.0]),
         ..Default::default()
@@ -1269,7 +1275,7 @@ pub fn run(config: LauncherConfig) -> Result<(), String> {
     .map_err(|error| format!("launcher window failed: {error}"))
 }
 
-fn start_server_worker(
+struct ServerWorkerRequest {
     executable: PathBuf,
     db_path: PathBuf,
     mode: WorkspaceMode,
@@ -1278,7 +1284,19 @@ fn start_server_worker(
     process: ProcessSlot,
     generation: u64,
     events: Sender<EventEnvelope>,
-) {
+}
+
+fn start_server_worker(request: ServerWorkerRequest) {
+    let ServerWorkerRequest {
+        executable,
+        db_path,
+        mode,
+        lan_bind_address,
+        preferred_port,
+        process,
+        generation,
+        events,
+    } = request;
     if !process.is_generation_active(generation) {
         return;
     }

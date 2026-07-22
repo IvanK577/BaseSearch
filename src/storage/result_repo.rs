@@ -12,7 +12,19 @@ use crate::storage::source_fields;
 use crate::storage::source_fields::ResolvedRef;
 use crate::storage::source_schemas::SourceFieldLookup;
 
-pub(crate) fn count(conn: &Connection, plan: FilterPlan) -> rusqlite::Result<u64> {
+pub(crate) fn capture_search_snapshot(conn: &Connection) -> rusqlite::Result<u64> {
+    let max_id: i64 = conn.query_row("SELECT COALESCE(MAX(id), 0) FROM records", [], |row| {
+        row.get(0)
+    })?;
+    Ok(max_id.max(0) as u64)
+}
+
+pub(crate) fn count(
+    conn: &Connection,
+    mut plan: FilterPlan,
+    snapshot: u64,
+) -> rusqlite::Result<u64> {
+    apply_search_snapshot(&mut plan, snapshot);
     let sql = format!(
         "SELECT COUNT(*) FROM records r{}{}",
         plan.joins, plan.where_sql
@@ -25,9 +37,11 @@ pub(crate) fn legacy_search_page(
     conn: &Connection,
     q: &Query,
     mut plan: FilterPlan,
+    snapshot: u64,
     limit: u64,
     offset: u64,
 ) -> rusqlite::Result<SearchPage> {
+    apply_search_snapshot(&mut plan, snapshot);
     let payload_alias = plan.payload_alias;
     let select: Vec<String> = RESULT_COLUMNS
         .iter()
@@ -59,16 +73,22 @@ pub(crate) fn legacy_search_page(
     Ok((ids, data, dups))
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "repository boundary keeps query, paging, sort, and schema context explicit"
+)]
 pub(crate) fn dynamic_search_page(
     conn: &Connection,
     q: &Query,
     fields: Vec<FieldInfo>,
-    plan: FilterPlan,
+    mut plan: FilterPlan,
+    snapshot: u64,
     limit: u64,
     offset: u64,
     sort: Option<&ResultSort>,
     lookup: &SourceFieldLookup,
 ) -> rusqlite::Result<DynamicSearchPage> {
+    apply_search_snapshot(&mut plan, snapshot);
     let payload_alias = plan.payload_alias;
     let field_select = source_fields::select_for_fields(&fields, payload_alias, lookup);
     let order = sort
@@ -99,6 +119,17 @@ pub(crate) fn dynamic_search_page(
         dups.push(row.get::<_, Option<String>>(fields.len() + 1)?);
     }
     Ok((fields, ids, data, dups))
+}
+
+fn apply_search_snapshot(plan: &mut FilterPlan, snapshot: u64) {
+    let conjunction = if plan.where_sql.is_empty() {
+        " WHERE"
+    } else {
+        " AND"
+    };
+    plan.where_sql.push_str(&format!("{conjunction} r.id <= ?"));
+    plan.params
+        .push(i64::try_from(snapshot).unwrap_or(i64::MAX).into());
 }
 
 pub(crate) fn legacy_export_batch(
@@ -171,6 +202,10 @@ pub(crate) fn export_batch_fields(
     Ok((max_id, data))
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "repository boundary keeps export selection, sort, visitor, and schema context explicit"
+)]
 pub(crate) fn visit_export_rows_fields(
     conn: &Connection,
     q: &Query,
@@ -376,8 +411,11 @@ fn uses_fast_result_order(q: &Query) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::AtomicBool;
+
     use super::uses_fast_result_order;
     use crate::db::{Filters, Query, ResultSort};
+    use crate::import;
     use crate::search::{FieldInfo, FieldKind, FieldRef};
 
     /// Test shim: these fields never resolve through a source-schema lookup.
@@ -486,5 +524,38 @@ mod tests {
             },
             ..Default::default()
         }));
+    }
+
+    #[test]
+    fn snapshot_keeps_offset_pages_and_count_stable_across_an_insert() {
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join("snapshot.db");
+        let initial = temp.path().join("initial.csv");
+        let later = temp.path().join("later.csv");
+        std::fs::write(&initial, "Item,Value\nA,1\nB,2\nC,3\n").unwrap();
+        std::fs::write(&later, "Item,Value\nD,4\n").unwrap();
+        let cancel = AtomicBool::new(false);
+        let mut writer = crate::db::Db::open(&db_path).unwrap();
+        let imported = import::import_file(&mut writer, &initial, &cancel, &mut |_, _, _| {});
+        assert_eq!(imported.error, None);
+
+        let reader = crate::db::Db::open(&db_path).unwrap();
+        let query = Query::default();
+        let snapshot = reader.capture_search_snapshot().unwrap();
+        let (_, first_ids, _, _) = reader
+            .search_page_dynamic_sorted_at_snapshot(&query, 2, 0, None, snapshot)
+            .unwrap();
+        assert_eq!(first_ids.len(), 2);
+
+        let imported = import::import_file(&mut writer, &later, &cancel, &mut |_, _, _| {});
+        assert_eq!(imported.error, None);
+        assert_eq!(reader.count_at_snapshot(&query, snapshot).unwrap(), 3);
+
+        let (_, second_ids, _, _) = reader
+            .search_page_dynamic_sorted_at_snapshot(&query, 2, 2, None, snapshot)
+            .unwrap();
+        assert_eq!(second_ids.len(), 1);
+        assert!(first_ids.iter().all(|first| !second_ids.contains(first)));
+        assert_eq!(reader.count(&query).unwrap(), 4);
     }
 }

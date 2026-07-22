@@ -21,6 +21,10 @@ pub fn parse_number_grouped(value: &str) -> Option<f64> {
 }
 
 pub fn parse_number_styled(value: &str, style: NumberStyle) -> Option<f64> {
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
     if let Some(number) = parse_scientific(value) {
         return Some(number);
     }
@@ -32,68 +36,132 @@ pub fn parse_number_styled(value: &str, style: NumberStyle) -> Option<f64> {
         return None;
     }
 
-    // Spaces or apostrophes between digits are thousands groups; their
-    // presence marks the remaining dot/comma separator as the decimal point.
-    let mut has_group_spaces = false;
-    let mut digit_then_spaces = false;
-    let mut prev_digit = false;
-    let mut compact = String::with_capacity(value.len());
-    for ch in value.chars() {
-        if ch.is_ascii_digit() {
-            if digit_then_spaces {
-                has_group_spaces = true;
-            }
-            digit_then_spaces = false;
-            prev_digit = true;
-            compact.push(ch);
-        } else if matches!(
-            ch,
-            ' ' | '\u{00A0}' | '\u{202F}' | '\u{2009}' | '\'' | '\u{2019}'
-        ) {
-            digit_then_spaces = digit_then_spaces || prev_digit;
-            prev_digit = false;
-        } else {
-            digit_then_spaces = false;
-            prev_digit = false;
-            if matches!(ch, '.' | ',' | '-' | '+') {
-                compact.push(ch);
-            }
-        }
-    }
-    if !compact.chars().any(|ch| ch.is_ascii_digit()) {
-        return None;
-    }
+    let core = numeric_core(value)?;
+    let unsigned = core.strip_prefix(['+', '-']).unwrap_or(core);
+    let sign = core
+        .starts_with('-')
+        .then_some('-')
+        .or_else(|| core.starts_with('+').then_some('+'));
+    let has_digit_groups = unsigned.chars().any(is_digit_group_separator);
 
-    let dot_count = compact.matches('.').count();
-    let comma_count = compact.matches(',').count();
+    let dot_count = unsigned.matches('.').count();
+    let comma_count = unsigned.matches(',').count();
     let decimal_sep = match (dot_count, comma_count) {
         (0, 0) => None,
-        (0, 1) => single_separator_decimal(&compact, ',', has_group_spaces, style),
-        (1, 0) => single_separator_decimal(&compact, '.', has_group_spaces, style),
+        (0, 1) => single_separator_decimal(unsigned, ',', has_digit_groups, style),
+        (1, 0) => single_separator_decimal(unsigned, '.', has_digit_groups, style),
         (0, _) | (_, 0) => None,
         _ => {
-            let last_dot = compact.rfind('.').unwrap_or(0);
-            let last_comma = compact.rfind(',').unwrap_or(0);
+            let last_dot = unsigned.rfind('.').unwrap_or(0);
+            let last_comma = unsigned.rfind(',').unwrap_or(0);
             Some(if last_dot > last_comma { '.' } else { ',' })
         }
     };
 
-    let mut normalized = String::with_capacity(compact.len());
-    let mut sign_written = false;
-    let mut decimal_written = false;
-    for (i, ch) in compact.chars().enumerate() {
-        if ch.is_ascii_digit() {
-            normalized.push(ch);
-        } else if matches!(ch, '-' | '+') && !sign_written && normalized.is_empty() && i == 0 {
-            normalized.push(ch);
-            sign_written = true;
-        } else if Some(ch) == decimal_sep && !decimal_written {
-            normalized.push('.');
-            decimal_written = true;
+    let (integer, fraction) = if let Some(separator) = decimal_sep {
+        if unsigned.matches(separator).count() != 1 {
+            return None;
+        }
+        let position = unsigned.rfind(separator)?;
+        let fraction = &unsigned[position + separator.len_utf8()..];
+        if fraction.is_empty() || !fraction.chars().all(|ch| ch.is_ascii_digit()) {
+            return None;
+        }
+        (&unsigned[..position], Some(fraction))
+    } else {
+        (unsigned, None)
+    };
+
+    let integer_digits = normalize_grouped_integer(integer, fraction.is_some())?;
+    let mut normalized = String::with_capacity(core.len());
+    if let Some(sign) = sign {
+        normalized.push(sign);
+    }
+    normalized.push_str(&integer_digits);
+    if let Some(fraction) = fraction {
+        normalized.push('.');
+        normalized.push_str(fraction);
+    }
+
+    normalized
+        .parse::<f64>()
+        .ok()
+        .filter(|number| number.is_finite())
+}
+
+fn numeric_core(value: &str) -> Option<&str> {
+    let (first_digit, _) = value.char_indices().find(|(_, ch)| ch.is_ascii_digit())?;
+    let (last_digit, last) = value.char_indices().rfind(|(_, ch)| ch.is_ascii_digit())?;
+    let mut start = first_digit;
+
+    if let Some((index, ch)) = value[..start].char_indices().next_back() {
+        if matches!(ch, '.' | ',') {
+            start = index;
+            if let Some((sign_index, sign)) = value[..start].char_indices().next_back()
+                && matches!(sign, '+' | '-')
+            {
+                start = sign_index;
+            }
+        } else if matches!(ch, '+' | '-') {
+            start = index;
         }
     }
 
-    normalized.parse::<f64>().ok()
+    let end = last_digit + last.len_utf8();
+    if !valid_numeric_affix(&value[..start]) || !valid_numeric_affix(&value[end..]) {
+        return None;
+    }
+
+    let core = &value[start..end];
+    for (index, ch) in core.chars().enumerate() {
+        let valid = ch.is_ascii_digit()
+            || matches!(ch, '.' | ',')
+            || is_digit_group_separator(ch)
+            || (index == 0 && matches!(ch, '+' | '-'));
+        if !valid {
+            return None;
+        }
+    }
+    Some(core)
+}
+
+fn valid_numeric_affix(value: &str) -> bool {
+    !value.chars().any(|ch| {
+        ch.is_ascii_digit()
+            || matches!(ch, '.' | ',' | '+' | '-')
+            || matches!(ch, '\'' | '\u{2019}')
+    })
+}
+
+fn is_digit_group_separator(ch: char) -> bool {
+    matches!(
+        ch,
+        ' ' | '\u{00A0}' | '\u{202F}' | '\u{2009}' | '\'' | '\u{2019}'
+    )
+}
+
+fn normalize_grouped_integer(value: &str, allow_empty: bool) -> Option<String> {
+    if value.is_empty() {
+        return allow_empty.then(String::new);
+    }
+    if value.chars().all(|ch| ch.is_ascii_digit()) {
+        return Some(value.to_string());
+    }
+
+    let groups = value
+        .split(|ch: char| matches!(ch, '.' | ',') || is_digit_group_separator(ch))
+        .collect::<Vec<_>>();
+    if groups.len() < 2
+        || groups[0].is_empty()
+        || groups[0].len() > 3
+        || groups
+            .iter()
+            .any(|group| !group.chars().all(|ch| ch.is_ascii_digit()))
+        || groups[1..].iter().any(|group| group.len() != 3)
+    {
+        return None;
+    }
+    Some(groups.concat())
 }
 
 pub(crate) fn parse_year(value: &str) -> Option<i64> {
@@ -363,13 +431,16 @@ fn parse_scientific(value: &str) -> Option<f64> {
         }
         return None;
     }
-    trimmed.replace(',', ".").parse::<f64>().ok()
+    trimmed
+        .replace(',', ".")
+        .parse::<f64>()
+        .ok()
+        .filter(|number| number.is_finite())
 }
 
-/// True when the value has an exponent shape — a digit immediately next to
-/// `e`/`E` (optionally across a sign) — that `parse_scientific` rejected.
-/// Such strings ("5e3 kg", "2E-3 unit") must NOT fall through to the digit
-/// harvester, which would silently drop the letters and concatenate digits.
+/// True when an exponent marker touches a digit but `parse_scientific`
+/// rejected the complete value. Such strings ("5e3 kg", "1e", "e3") must
+/// not fall through to the localized parser as an unrelated plain number.
 fn looks_like_failed_scientific(value: &str) -> bool {
     let chars: Vec<char> = value.trim().chars().collect();
     chars.iter().enumerate().any(|(i, ch)| {
@@ -385,6 +456,6 @@ fn looks_like_failed_scientific(value: &str) -> bool {
             _ => after,
         };
         let digit_after = after.first().is_some_and(|c| c.is_ascii_digit());
-        digit_before && digit_after
+        digit_before || digit_after
     })
 }

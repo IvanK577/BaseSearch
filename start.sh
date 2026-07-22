@@ -7,9 +7,10 @@
 #   1. Detect the operating system.
 #   2. Make sure the build tools are present - install the Rust toolchain and,
 #      on Linux, the GUI libraries, only when they are missing.
-#   3. Build Base Search. The first build downloads dependencies and takes a
-#      few minutes; later runs are instant because nothing has changed.
-#   4. Launch the app.
+#   3. Install and build the browser workspace from its lockfile.
+#   4. Build Base Search. The first build downloads dependencies and takes a
+#      few minutes; later runs reuse the downloaded dependencies.
+#   5. Launch the app.
 #
 # Usage:
 #   ./start.sh        Run it once. Re-run anytime to start the app again -
@@ -36,7 +37,7 @@ else
 fi
 
 STEP=0
-TOTAL=4
+TOTAL=5
 
 step() {
     STEP=$((STEP + 1))
@@ -146,7 +147,31 @@ else
     fi
 fi
 
-# --- Step 3: build --------------------------------------------------------
+# The browser workspace is embedded into the Rust binary, so Node/npm are build
+# prerequisites rather than optional developer tooling.
+if command -v node >/dev/null 2>&1 && command -v npm >/dev/null 2>&1; then
+    ok "Node.js and npm found ($(node --version 2>/dev/null), npm $(npm --version 2>/dev/null))"
+else
+    fail "Node.js and npm are required to build the browser workspace."
+    info "Install the current Node.js LTS release from https://nodejs.org and run ./start.sh again."
+    exit 1
+fi
+
+# --- Step 3: browser workspace -------------------------------------------
+step "Building the browser workspace"
+info "Installing the exact frontend dependencies from web-ui/package-lock.json."
+if npm --prefix web-ui ci && npm --prefix web-ui run build; then
+    if [ ! -f web-ui/dist/index.html ]; then
+        fail "The frontend build finished without creating web-ui/dist/index.html."
+        exit 1
+    fi
+    ok "Browser workspace is ready for embedding"
+else
+    fail "The browser workspace build failed. The npm messages above explain why."
+    exit 1
+fi
+
+# --- Step 4: build --------------------------------------------------------
 step "Building Base Search"
 info "The first build downloads dependencies and can take a few minutes."
 info "Later runs are instant when nothing changed. Progress is shown below:"
@@ -168,7 +193,7 @@ else
     exit 1
 fi
 
-# --- Step 4: launch -------------------------------------------------------
+# --- Step 5: launch -------------------------------------------------------
 step "Launching Base Search"
 ok "Starting the app. You can keep this terminal open or minimize it."
 printf '\n'

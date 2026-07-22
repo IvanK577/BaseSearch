@@ -14,6 +14,7 @@ use crate::storage::table_shape;
 pub(crate) const FINGERPRINT_VERSION: u32 = 1;
 
 pub(crate) type SourceFieldLookup = HashMap<String, SourceSchemaField>;
+pub(crate) type CompatibilityShapeFields = (TableShape, HashMap<String, Vec<String>>);
 
 pub(crate) fn ensure_schema(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch(
@@ -270,13 +271,6 @@ pub(crate) fn schema_id_for_record(
     .map(Option::flatten)
 }
 
-pub(crate) fn has_registered_schemas(conn: &Connection) -> rusqlite::Result<bool> {
-    conn.query_row("SELECT EXISTS(SELECT 1 FROM source_schemas)", [], |row| {
-        row.get::<_, i64>(0)
-    })
-    .map(|value| value != 0)
-}
-
 pub(crate) fn has_legacy_rows(conn: &Connection) -> rusqlite::Result<bool> {
     conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM records WHERE schema_id IS NULL LIMIT 1)",
@@ -299,7 +293,7 @@ pub(crate) fn compatibility_shape(conn: &Connection) -> rusqlite::Result<Option<
 /// can write through to the registry.
 pub(crate) fn compatibility_shape_with_fields(
     conn: &Connection,
-) -> rusqlite::Result<Option<(TableShape, HashMap<String, Vec<String>>)>> {
+) -> rusqlite::Result<Option<CompatibilityShapeFields>> {
     let fields = list_all_fields(conn)?;
     if fields.is_empty() {
         return Ok(None);
@@ -319,24 +313,6 @@ pub(crate) fn compatibility_shape_with_fields(
         backing.entry(assigned).or_default().push(field.field_id);
     }
     Ok(Some((TableShape { columns }, backing)))
-}
-
-/// Schema-level fixed values every registered schema agrees on. A schema that
-/// left the value unset counts as disagreement: mixing "this file is USD" rows
-/// with unknown-currency rows must not pretend the whole set is USD.
-pub(crate) fn merged_fixed_values(
-    conn: &Connection,
-) -> rusqlite::Result<(Option<String>, Option<String>)> {
-    conn.query_row(
-        "SELECT
-            CASE WHEN COUNT(DISTINCT COALESCE(fixed_currency, '')) = 1
-                THEN MIN(fixed_currency) END,
-            CASE WHEN COUNT(DISTINCT COALESCE(fixed_weight_unit, '')) = 1
-                THEN MIN(fixed_weight_unit) END
-         FROM source_schemas",
-        [],
-        |row| Ok((row.get(0)?, row.get(1)?)),
-    )
 }
 
 /// Writes an analytical meaning through to the physical source fields behind

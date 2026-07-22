@@ -1,44 +1,57 @@
-﻿use std::path::{Path, PathBuf};
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 use std::sync::RwLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use duckdb::{AccessMode, Config, Connection as DuckConnection, params as duck_params};
+use rusqlite::types::ValueRef;
 use rusqlite::{Connection as SqliteConnection, TransactionBehavior};
 use sha2::{Digest, Sha256};
 
 use crate::db::{
-    Analytics, AnalyticsFilterAction, AnalyticsFilterField, AnalyticsGroupRow, AnalyticsMeasures,
-    AnalyticsMonthRow, AnalyticsOverview, AnalyticsPriceMetric, AnalyticsScope, AnalyticsSection,
-    AnalyticsSectionKind, AnalyticsUsdCompatibility, PriceMetricKind, Query, RecordScope,
+    Analytics, AnalyticsCurrencyTotal, AnalyticsFilterAction, AnalyticsFilterField,
+    AnalyticsGroupRow, AnalyticsMeasureExclusions, AnalyticsMeasures, AnalyticsMonthRow,
+    AnalyticsOverview, AnalyticsPriceCohort, AnalyticsPriceMetric, AnalyticsScope,
+    AnalyticsSection, AnalyticsSectionKind, AnalyticsUsdCompatibility, AnalyticsValuePerWeight,
+    AnalyticsWeightTotal, PriceMetricKind, Query, RecordScope,
 };
-use crate::domain::table::SemanticField;
+use crate::domain::table::{SemanticField, SourceColumn, SourceSchema, TableShape};
 use crate::olap::{OlapBenchmarkOptions, OlapBenchmarkReport, OlapScenarioReport};
-use crate::storage::analytics_columns::AnalyticsColumns;
-use crate::storage::{connection as storage_connection, effective_rows, table_shape};
+use crate::storage::analytics_columns::{AnalyticsColumns, UNKNOWN_CURRENCY_KEY, UNKNOWN_UNIT_KEY};
+use crate::storage::{
+    connection as storage_connection, effective_rows, source_schemas, table_shape,
+};
 
-/// The projection materializes the legacy USD-denominated value column, so its
-/// aggregates form a single known USD cohort by construction. The trust guard
-/// additionally refuses the projection whenever its overview cannot reproduce
-/// the SQLite totals.
-fn projection_usd_compat(
-    total_value_usd: f64,
-    total_net_kg: f64,
-) -> Option<AnalyticsUsdCompatibility> {
+fn projection_usd_compat(measures: &AnalyticsMeasures) -> Option<AnalyticsUsdCompatibility> {
+    let total_value_usd = measures.compatible_usd_total()?;
     Some(AnalyticsUsdCompatibility {
         total_value_usd,
-        avg_value_per_net_kg: (total_net_kg > 0.0).then(|| total_value_usd / total_net_kg),
+        avg_value_per_net_kg: measures.compatible_usd_per_net_kg(),
     })
 }
 
-pub const PROJECTION_SCHEMA_VERSION: &str = "6";
-pub const ROLLUP_SCHEMA_VERSION: &str = "1";
-pub const ROLLUP_RULES_VERSION: &str = "1";
+fn inherited_projection_usd(
+    query_is_usd: bool,
+    total_value: f64,
+    paired_value: f64,
+    paired_weight_kg: f64,
+) -> Option<AnalyticsUsdCompatibility> {
+    query_is_usd.then(|| AnalyticsUsdCompatibility {
+        total_value_usd: total_value,
+        avg_value_per_net_kg: (paired_weight_kg > 0.0).then(|| paired_value / paired_weight_kg),
+    })
+}
+
+pub const PROJECTION_SCHEMA_VERSION: &str = "7";
+pub const ROLLUP_SCHEMA_VERSION: &str = "2";
+pub const ROLLUP_RULES_VERSION: &str = "2";
 
 const ROLLUP_CONTRACT: &str = concat!(
-    "overview:v1;monthly:v1;sections:v1;currency:v1;price_per_kg:v1;",
+    "overview:v2;monthly:v2;sections:v2;currency:v2;price_per_kg:v2;",
     "scope:canonical|occurrences;years:all|calendar;",
-    "money:usd-only-public|partitioned-storage;hs:2-8|10;r7-quantiles"
+    "money:currency-partitioned|usd-compat-only;weight:source-partitioned|normalized-kg;",
+    "schema-context:per-row;hs:2-8|10;r7-quantiles"
 );
 
 const SOURCE_TRACKING_VERSION: &str = "1";
@@ -282,7 +295,7 @@ fn build_projection_file(
     prepare_projection_schema(&duck)?;
 
     let (inserted, max_record_id) = {
-        let sql = projection_select_sql(&transaction);
+        let sql = projection_select_sql(&transaction)?;
         let mut stmt = transaction
             .prepare(&sql)
             .map_err(|err| format!("Could not read projection columns from SQLite: {err}"))?;
@@ -518,6 +531,9 @@ fn source_contract(conn: &SqliteConnection, sqlite_path: &Path) -> Result<Source
 
     let records_schema = schema_sql(conn, "table", "records")?;
     let state_schema = schema_sql(conn, "table", SOURCE_STATE_TABLE)?;
+    let source_schemas_schema = schema_sql(conn, "table", "source_schemas")?;
+    let source_columns_schema = schema_sql(conn, "table", "source_columns")?;
+    let import_sources_schema = schema_sql(conn, "table", "import_sources")?;
     let mut trigger_stmt = conn
         .prepare(
             "SELECT name, COALESCE(sql, '')
@@ -563,7 +579,34 @@ fn source_contract(conn: &SqliteConnection, sqlite_path: &Path) -> Result<Source
     hash_part(&mut hasher, "dirty", &dirty.to_string());
     hash_part(&mut hasher, "records_schema", &records_schema);
     hash_part(&mut hasher, "state_schema", &state_schema);
+    hash_part(&mut hasher, "source_schemas_schema", &source_schemas_schema);
+    hash_part(&mut hasher, "source_columns_schema", &source_columns_schema);
+    hash_part(&mut hasher, "import_sources_schema", &import_sources_schema);
     hash_part(&mut hasher, "semantic_mapping", &semantic_mapping);
+    hash_query_rows(
+        &mut hasher,
+        conn,
+        "source_schemas",
+        "SELECT id, public_id, fingerprint, fingerprint_version,
+                fixed_currency, fixed_weight_unit, created_at
+         FROM source_schemas ORDER BY id",
+    )?;
+    hash_query_rows(
+        &mut hasher,
+        conn,
+        "source_columns",
+        "SELECT id, schema_id, field_id, source_index, raw_header, display_header,
+                normalized_header, role, semantic, storage_kind, storage_name
+         FROM source_columns ORDER BY schema_id, source_index, id",
+    )?;
+    hash_query_rows(
+        &mut hasher,
+        conn,
+        "import_sources",
+        "SELECT id, public_id, schema_id, source_file, table_name,
+                import_fingerprint, imported_at
+         FROM import_sources ORDER BY id",
+    )?;
     for (name, sql) in triggers {
         hash_part(&mut hasher, &name, &sql);
     }
@@ -594,6 +637,56 @@ fn hash_part(hasher: &mut Sha256, label: &str, value: &str) {
     hasher.update(value.as_bytes());
 }
 
+fn hash_query_rows(
+    hasher: &mut Sha256,
+    conn: &SqliteConnection,
+    label: &str,
+    sql: &str,
+) -> Result<(), String> {
+    hash_part(hasher, "table_state", label);
+    let mut statement = conn
+        .prepare(sql)
+        .map_err(|err| format!("Could not prepare {label} projection state: {err}"))?;
+    let column_count = statement.column_count();
+    let mut rows = statement
+        .query([])
+        .map_err(|err| format!("Could not read {label} projection state: {err}"))?;
+    while let Some(row) = rows
+        .next()
+        .map_err(|err| format!("Could not iterate {label} projection state: {err}"))?
+    {
+        hasher.update([0xff]);
+        for index in 0..column_count {
+            hasher.update((index as u64).to_le_bytes());
+            match row
+                .get_ref(index)
+                .map_err(|err| format!("Could not read {label} column {index}: {err}"))?
+            {
+                ValueRef::Null => hasher.update([0]),
+                ValueRef::Integer(value) => {
+                    hasher.update([1]);
+                    hasher.update(value.to_le_bytes());
+                }
+                ValueRef::Real(value) => {
+                    hasher.update([2]);
+                    hasher.update(value.to_bits().to_le_bytes());
+                }
+                ValueRef::Text(value) => {
+                    hasher.update([3]);
+                    hasher.update((value.len() as u64).to_le_bytes());
+                    hasher.update(value);
+                }
+                ValueRef::Blob(value) => {
+                    hasher.update([4]);
+                    hasher.update((value.len() as u64).to_le_bytes());
+                    hasher.update(value);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 pub fn rollup_contract_fingerprint() -> String {
     let mut hasher = Sha256::new();
     hash_part(&mut hasher, "schema", ROLLUP_SCHEMA_VERSION);
@@ -606,48 +699,152 @@ pub fn rollup_contract_fingerprint() -> String {
         .collect()
 }
 
-fn projection_select_sql(conn: &SqliteConnection) -> String {
-    let columns =
+#[derive(Clone, Copy)]
+enum ProjectionValue {
+    Label(SemanticField),
+    Text(SemanticField),
+    Country(SemanticField),
+    Number(SemanticField),
+    Month(SemanticField),
+    CurrencyKey,
+    WeightUnitKey,
+}
+
+impl ProjectionValue {
+    fn semantic(self) -> Option<SemanticField> {
+        match self {
+            Self::Label(field)
+            | Self::Text(field)
+            | Self::Country(field)
+            | Self::Number(field)
+            | Self::Month(field) => Some(field),
+            Self::CurrencyKey => Some(SemanticField::Currency),
+            Self::WeightUnitKey => Some(SemanticField::WeightUnit),
+        }
+    }
+}
+
+fn projection_value_expression(
+    columns: &AnalyticsColumns,
+    value: ProjectionValue,
+) -> Option<String> {
+    match value {
+        ProjectionValue::Label(field) => columns.label(field),
+        ProjectionValue::Text(field) => columns.text(field),
+        ProjectionValue::Country(field) => columns.country_key(field),
+        ProjectionValue::Number(field) => columns.number(field),
+        ProjectionValue::Month(field) => columns.month(field),
+        ProjectionValue::CurrencyKey => Some(columns.measures().currency_key),
+        ProjectionValue::WeightUnitKey => Some(columns.measures().weight_unit_key),
+    }
+}
+
+fn source_schema_shape(schema: &SourceSchema) -> TableShape {
+    TableShape {
+        columns: schema
+            .columns
+            .iter()
+            .map(|field| SourceColumn {
+                id: field.field_id.clone(),
+                header: field.header.clone(),
+                source_index: field.source_index,
+                role: field.role,
+                semantic: field.semantic,
+                storage: field.storage.clone(),
+            })
+            .collect(),
+    }
+}
+
+fn schema_aware_projection_value(
+    conn: &SqliteConnection,
+    value: ProjectionValue,
+    missing: &str,
+) -> Result<String, String> {
+    let legacy_columns =
         AnalyticsColumns::for_alias(table_shape::effective(conn), effective_rows::PAYLOAD_ALIAS);
-    let label = |field| columns.label(field).unwrap_or_else(|| "''".to_string());
-    let text = |field| columns.text(field).unwrap_or_else(|| "''".to_string());
-    let country = |field| {
-        columns
-            .country_key(field)
-            .unwrap_or_else(|| "''".to_string())
-    };
-    let number = |field| columns.number(field).unwrap_or_else(|| "NULL".to_string());
-    let month = columns
-        .month(SemanticField::Date)
-        .unwrap_or_else(|| "''".to_string());
+    let legacy =
+        projection_value_expression(&legacy_columns, value).unwrap_or_else(|| missing.to_string());
+    let schemas = source_schemas::list(conn)
+        .map_err(|err| format!("Could not read source schemas for DuckDB projection: {err}"))?;
+    if schemas.is_empty() {
+        return Ok(legacy);
+    }
+
+    let mut branches = Vec::with_capacity(schemas.len());
+    for schema in schemas {
+        let mapped = value.semantic().is_some_and(|semantic| {
+            schema
+                .columns
+                .iter()
+                .any(|field| field.semantic == Some(semantic))
+        });
+        let columns = AnalyticsColumns::for_alias(
+            Some(source_schema_shape(&schema)),
+            effective_rows::PAYLOAD_ALIAS,
+        )
+        .with_schema_fixed_values(
+            schema.fixed_currency.as_deref().map(sql_string),
+            schema.fixed_weight_unit.as_deref().map(sql_string),
+        );
+        let expression = match value {
+            ProjectionValue::CurrencyKey | ProjectionValue::WeightUnitKey => {
+                projection_value_expression(&columns, value)
+            }
+            _ if mapped => projection_value_expression(&columns, value),
+            _ => None,
+        }
+        .unwrap_or_else(|| missing.to_string());
+        branches.push(format!("WHEN {} THEN {expression}", schema.id));
+    }
+    Ok(format!(
+        "CASE {}.schema_id {} ELSE {legacy} END",
+        effective_rows::PAYLOAD_ALIAS,
+        branches.join(" ")
+    ))
+}
+
+fn projection_select_sql(conn: &SqliteConnection) -> Result<String, String> {
+    let label = |field| schema_aware_projection_value(conn, ProjectionValue::Label(field), "''");
+    let text = |field| schema_aware_projection_value(conn, ProjectionValue::Text(field), "''");
+    let country =
+        |field| schema_aware_projection_value(conn, ProjectionValue::Country(field), "''");
+    let number =
+        |field| schema_aware_projection_value(conn, ProjectionValue::Number(field), "NULL");
+    let month =
+        schema_aware_projection_value(conn, ProjectionValue::Month(SemanticField::Date), "''")?;
     let year = format!(
-        "COALESCE({}.year, CAST(NULLIF(SUBSTR({month}, 1, 4), '') AS INTEGER))",
+        "COALESCE(CAST(NULLIF(SUBSTR({month}, 1, 4), '') AS INTEGER),
+                  CASE WHEN {}.schema_id IS NULL THEN {}.year END)",
+        effective_rows::PAYLOAD_ALIAS,
         effective_rows::PAYLOAD_ALIAS
     );
-    let declaration = label(SemanticField::DeclarationNumber);
-    let sender_label = label(SemanticField::Sender);
-    let sender_text = text(SemanticField::Sender);
-    let recipient_label = label(SemanticField::Recipient);
-    let recipient_text = text(SemanticField::Recipient);
-    let edrpou_label = label(SemanticField::CompanyCode);
-    let edrpou_text = text(SemanticField::CompanyCode);
-    let product_code = label(SemanticField::ProductCode);
-    let product_code_text = text(SemanticField::ProductCode);
-    let description = label(SemanticField::Description);
-    let description_text = text(SemanticField::Description);
-    let trademark_label = label(SemanticField::Trademark);
-    let trademark_text = text(SemanticField::Trademark);
-    let origin = country(SemanticField::OriginCountry);
-    let dispatch = country(SemanticField::DispatchCountry);
-    let trade = country(SemanticField::TradeCountry);
-    let value = number(SemanticField::Value);
-    let net = number(SemanticField::NetWeight);
-    let gross = number(SemanticField::GrossWeight);
-    let quantity = number(SemanticField::Quantity);
-    let currency = text(SemanticField::Currency);
-    let weight_unit = text(SemanticField::WeightUnit);
+    let declaration = label(SemanticField::DeclarationNumber)?;
+    let sender_label = label(SemanticField::Sender)?;
+    let sender_text = text(SemanticField::Sender)?;
+    let recipient_label = label(SemanticField::Recipient)?;
+    let recipient_text = text(SemanticField::Recipient)?;
+    let edrpou_label = label(SemanticField::CompanyCode)?;
+    let edrpou_text = text(SemanticField::CompanyCode)?;
+    let product_code = label(SemanticField::ProductCode)?;
+    let product_code_text = text(SemanticField::ProductCode)?;
+    let description = label(SemanticField::Description)?;
+    let description_text = text(SemanticField::Description)?;
+    let trademark_label = label(SemanticField::Trademark)?;
+    let trademark_text = text(SemanticField::Trademark)?;
+    let origin = country(SemanticField::OriginCountry)?;
+    let dispatch = country(SemanticField::DispatchCountry)?;
+    let trade = country(SemanticField::TradeCountry)?;
+    let value = number(SemanticField::Value)?;
+    let net = number(SemanticField::NetWeight)?;
+    let gross = number(SemanticField::GrossWeight)?;
+    let quantity = number(SemanticField::Quantity)?;
+    let currency =
+        schema_aware_projection_value(conn, ProjectionValue::CurrencyKey, "'__unknown__'")?;
+    let weight_unit =
+        schema_aware_projection_value(conn, ProjectionValue::WeightUnitKey, "'__unknown__'")?;
 
-    format!(
+    Ok(format!(
         "SELECT
             r.id,
             {year},
@@ -677,13 +874,13 @@ fn projection_select_sql(conn: &SqliteConnection) -> String {
             p.rmv_extra_num,
             p.rmv_gross_num,
             p.min_base_num,
-            UPPER(text_key({currency})),
-            UPPER(text_key({weight_unit})),
+            {currency},
+            {weight_unit},
             r.dup_first_file
          FROM records r{}
          ORDER BY r.id",
         effective_rows::payload_join()
-    )
+    ))
 }
 
 pub fn supports_projection_query(query: &Query) -> bool {
@@ -734,7 +931,7 @@ pub fn analytics_scoped_detail(
     let conn = open_projection_read_only(projection_path)?;
     let filter = DuckFilter::from_query(query);
     let overview = projection_overview(&conn, &filter)?;
-    let months = projection_months(&conn, &filter)?;
+    let months = projection_months(&conn, &filter, overview.compatible_usd.is_some())?;
     let mut analytics = Analytics {
         overview,
         months,
@@ -923,7 +1120,7 @@ fn rollup_semantics_are_safe(
     )
     .map(|(money, weight)| {
         matches!(money.as_str(), "single_usd" | "empty")
-            && matches!(weight.as_str(), "kg" | "empty")
+            && matches!(weight.as_str(), "normalized_kg" | "empty")
     })
     .or_else(|err| {
         if matches!(err, duckdb::Error::QueryReturnedNoRows) {
@@ -943,8 +1140,10 @@ fn analytics_from_rollups(
     scope: Option<AnalyticsScope>,
     hs_level: u8,
 ) -> Result<Analytics, String> {
-    let overview = rollup_overview(conn, selector)?;
-    let months = rollup_months(conn, selector)?;
+    let filter = DuckFilter::from_query(query);
+    let measures = projection_measures(conn, &filter)?;
+    let overview = rollup_overview(conn, selector, measures)?;
+    let months = rollup_months(conn, selector, overview.compatible_usd.is_some())?;
     let mut analytics = Analytics {
         overview,
         months,
@@ -1066,9 +1265,11 @@ fn analytics_from_rollups(
 fn rollup_overview(
     conn: &DuckConnection,
     selector: RollupSelector,
+    measures: AnalyticsMeasures,
 ) -> Result<AnalyticsOverview, String> {
-    conn.query_row(
-        "SELECT
+    let mut overview = conn
+        .query_row(
+            "SELECT
             row_count,
             declaration_count,
             distinct_senders,
@@ -1079,54 +1280,53 @@ fn rollup_overview(
             distinct_origin_countries,
             distinct_dispatch_countries,
             distinct_trade_countries,
-            total_value_usd,
-            total_gross_kg,
-            total_net_kg,
             total_quantity
          FROM rollup_overview
          WHERE record_scope = ? AND year_key = ? LIMIT 1",
-        duck_params![selector.record_scope, selector.year_key],
-        |row| {
-            let total_value_usd = row.get::<_, Option<f64>>(10)?.unwrap_or(0.0);
-            let total_net_kg = row.get::<_, Option<f64>>(12)?.unwrap_or(0.0);
-            Ok(AnalyticsOverview {
-                row_count: row.get::<_, i64>(0)?.max(0) as u64,
-                declaration_count: row.get::<_, i64>(1)?.max(0) as u64,
-                distinct_senders: row.get::<_, i64>(2)?.max(0) as u64,
-                distinct_recipients: row.get::<_, i64>(3)?.max(0) as u64,
-                distinct_edrpou: row.get::<_, i64>(4)?.max(0) as u64,
-                distinct_trademarks: row.get::<_, i64>(5)?.max(0) as u64,
-                distinct_product_codes: row.get::<_, i64>(6)?.max(0) as u64,
-                distinct_origin_countries: row.get::<_, i64>(7)?.max(0) as u64,
-                distinct_dispatch_countries: row.get::<_, i64>(8)?.max(0) as u64,
-                distinct_trade_countries: row.get::<_, i64>(9)?.max(0) as u64,
-                total_value_usd,
-                total_gross_kg: row.get::<_, Option<f64>>(11)?.unwrap_or(0.0),
-                total_net_kg,
-                total_quantity: row.get::<_, Option<f64>>(13)?.unwrap_or(0.0),
-                avg_value_per_net_kg: ratio(total_value_usd, total_net_kg),
-                compatible_usd: projection_usd_compat(total_value_usd, total_net_kg),
-                measures: AnalyticsMeasures::default(),
-            })
-        },
-    )
-    .or_else(|err| {
-        if matches!(err, duckdb::Error::QueryReturnedNoRows) {
-            Ok(AnalyticsOverview::default())
-        } else {
-            Err(err)
-        }
-    })
-    .map_err(|err| format!("Could not read DuckDB overview rollup: {err}"))
+            duck_params![selector.record_scope, selector.year_key],
+            |row| {
+                Ok(AnalyticsOverview {
+                    row_count: row.get::<_, i64>(0)?.max(0) as u64,
+                    declaration_count: row.get::<_, i64>(1)?.max(0) as u64,
+                    distinct_senders: row.get::<_, i64>(2)?.max(0) as u64,
+                    distinct_recipients: row.get::<_, i64>(3)?.max(0) as u64,
+                    distinct_edrpou: row.get::<_, i64>(4)?.max(0) as u64,
+                    distinct_trademarks: row.get::<_, i64>(5)?.max(0) as u64,
+                    distinct_product_codes: row.get::<_, i64>(6)?.max(0) as u64,
+                    distinct_origin_countries: row.get::<_, i64>(7)?.max(0) as u64,
+                    distinct_dispatch_countries: row.get::<_, i64>(8)?.max(0) as u64,
+                    distinct_trade_countries: row.get::<_, i64>(9)?.max(0) as u64,
+                    total_quantity: row.get::<_, Option<f64>>(10)?.unwrap_or(0.0),
+                    ..Default::default()
+                })
+            },
+        )
+        .or_else(|err| {
+            if matches!(err, duckdb::Error::QueryReturnedNoRows) {
+                Ok(AnalyticsOverview::default())
+            } else {
+                Err(err)
+            }
+        })
+        .map_err(|err| format!("Could not read DuckDB overview rollup: {err}"))?;
+    overview.total_value_usd = measures.compatible_usd_total().unwrap_or(0.0);
+    overview.total_net_kg = measures.total_net_kg();
+    overview.total_gross_kg = measures.total_gross_kg();
+    overview.avg_value_per_net_kg = measures.compatible_usd_per_net_kg().unwrap_or(0.0);
+    overview.compatible_usd = projection_usd_compat(&measures);
+    overview.measures = measures;
+    Ok(overview)
 }
 
 fn rollup_months(
     conn: &DuckConnection,
     selector: RollupSelector,
+    query_is_usd: bool,
 ) -> Result<Vec<AnalyticsMonthRow>, String> {
     let mut statement = conn
         .prepare(
-            "SELECT month, rows_count, declarations_count, total_value_usd, total_net_kg
+            "SELECT month, rows_count, declarations_count, total_value_usd, total_net_kg,
+                    paired_value, paired_net_kg
              FROM rollup_monthly
              WHERE record_scope = ? AND year_key = ?
              ORDER BY month DESC LIMIT 48",
@@ -1138,13 +1338,22 @@ fn rollup_months(
             |row| {
                 let total_value_usd = row.get::<_, Option<f64>>(3)?.unwrap_or(0.0);
                 let total_net_kg = row.get::<_, Option<f64>>(4)?.unwrap_or(0.0);
+                let compatible_usd = inherited_projection_usd(
+                    query_is_usd,
+                    total_value_usd,
+                    row.get::<_, Option<f64>>(5)?.unwrap_or(0.0),
+                    row.get::<_, Option<f64>>(6)?.unwrap_or(0.0),
+                );
                 Ok(AnalyticsMonthRow {
                     month: row.get(0)?,
                     rows: row.get::<_, i64>(1)?.max(0) as u64,
                     declarations: row.get::<_, i64>(2)?.max(0) as u64,
-                    total_value_usd,
+                    total_value_usd: compatible_usd
+                        .as_ref()
+                        .map(|compatibility| compatibility.total_value_usd)
+                        .unwrap_or(0.0),
                     total_net_kg,
-                    compatible_usd: projection_usd_compat(total_value_usd, total_net_kg),
+                    compatible_usd,
                     measures: AnalyticsMeasures::default(),
                 })
             },
@@ -1169,7 +1378,8 @@ fn rollup_section(
     let mut statement = conn
         .prepare(
             "SELECT label, rows_count, declarations_count, companies_count,
-                    total_value_usd, total_net_kg, total_gross_kg, total_quantity
+                    total_value_usd, total_net_kg, total_gross_kg, total_quantity,
+                    paired_value, paired_net_kg
              FROM rollup_sections
              WHERE record_scope = ? AND year_key = ? AND kind = ? AND hs_level = ?
              ORDER BY total_value_usd DESC NULLS LAST, total_net_kg DESC,
@@ -1193,6 +1403,12 @@ fn rollup_section(
                 let total_net_kg = row.get::<_, Option<f64>>(5)?.unwrap_or(0.0);
                 let total_gross_kg = row.get::<_, Option<f64>>(6)?.unwrap_or(0.0);
                 let total_quantity = row.get::<_, Option<f64>>(7)?.unwrap_or(0.0);
+                let compatible_usd = inherited_projection_usd(
+                    overview.compatible_usd.is_some(),
+                    total_value_usd,
+                    row.get::<_, Option<f64>>(8)?.unwrap_or(0.0),
+                    row.get::<_, Option<f64>>(9)?.unwrap_or(0.0),
+                );
                 let share_base = if overview.total_value_usd > 0.0 {
                     overview.total_value_usd
                 } else if overview.total_net_kg > 0.0 {
@@ -1216,13 +1432,19 @@ fn rollup_section(
                     rows: rows_count,
                     declarations: row.get::<_, i64>(2)?.max(0) as u64,
                     companies: row.get::<_, i64>(3)?.max(0) as u64,
-                    total_value_usd,
+                    total_value_usd: compatible_usd
+                        .as_ref()
+                        .map(|compatibility| compatibility.total_value_usd)
+                        .unwrap_or(0.0),
                     total_net_kg,
                     total_gross_kg,
                     total_quantity,
                     share_percent: ratio(share_value * 100.0, share_base),
-                    avg_value_per_net_kg: ratio(total_value_usd, total_net_kg),
-                    compatible_usd: projection_usd_compat(total_value_usd, total_net_kg),
+                    avg_value_per_net_kg: compatible_usd
+                        .as_ref()
+                        .and_then(|compatibility| compatibility.avg_value_per_net_kg)
+                        .unwrap_or(0.0),
+                    compatible_usd,
                     measures: AnalyticsMeasures::default(),
                 })
             },
@@ -1480,9 +1702,38 @@ fn prepare_projection_schema(conn: &DuckConnection) -> Result<(), String> {
 fn build_rollups(conn: &DuckConnection) -> Result<(), String> {
     conn.execute_batch(
         "CREATE VIEW rollup_records AS
-            SELECT 'occurrences'::VARCHAR AS record_scope, records.* FROM records
+            SELECT
+                'occurrences'::VARCHAR AS record_scope,
+                records.*,
+                CASE weight_unit_key
+                    WHEN 'kg' THEN net_kg_num
+                    WHEN 'g' THEN net_kg_num * 0.001
+                    WHEN 'tonne' THEN net_kg_num * 1000.0
+                    WHEN 'lb' THEN net_kg_num * 0.45359237
+                END AS net_weight_kg,
+                CASE weight_unit_key
+                    WHEN 'kg' THEN gross_kg_num
+                    WHEN 'g' THEN gross_kg_num * 0.001
+                    WHEN 'tonne' THEN gross_kg_num * 1000.0
+                    WHEN 'lb' THEN gross_kg_num * 0.45359237
+                END AS gross_weight_kg
+            FROM records
             UNION ALL
-            SELECT 'canonical'::VARCHAR AS record_scope, records.*
+            SELECT
+                'canonical'::VARCHAR AS record_scope,
+                records.*,
+                CASE weight_unit_key
+                    WHEN 'kg' THEN net_kg_num
+                    WHEN 'g' THEN net_kg_num * 0.001
+                    WHEN 'tonne' THEN net_kg_num * 1000.0
+                    WHEN 'lb' THEN net_kg_num * 0.45359237
+                END AS net_weight_kg,
+                CASE weight_unit_key
+                    WHEN 'kg' THEN gross_kg_num
+                    WHEN 'g' THEN gross_kg_num * 0.001
+                    WHEN 'tonne' THEN gross_kg_num * 1000.0
+                    WHEN 'lb' THEN gross_kg_num * 0.45359237
+                END AS gross_weight_kg
             FROM records WHERE dup_first_file IS NULL;
 
          CREATE VIEW rollup_expanded AS
@@ -1508,41 +1759,46 @@ fn build_rollups(conn: &DuckConnection) -> Result<(), String> {
                 CASE
                     WHEN COUNT(value_num) = 0 THEN 0.0
                     WHEN COUNT(*) FILTER (
-                        WHERE value_num IS NOT NULL AND COALESCE(currency_key, '') = ''
+                        WHERE value_num IS NOT NULL AND (
+                            COALESCE(currency_key, '') = ''
+                            OR starts_with(currency_key, '__unknown__')
+                        )
                     ) > 0 THEN NULL
                     WHEN COUNT(DISTINCT currency_key) FILTER (
-                        WHERE value_num IS NOT NULL AND COALESCE(currency_key, '') <> ''
+                        WHERE value_num IS NOT NULL
+                          AND NOT starts_with(currency_key, '__unknown__')
                     ) = 1 AND MIN(currency_key) FILTER (
-                        WHERE value_num IS NOT NULL AND COALESCE(currency_key, '') <> ''
+                        WHERE value_num IS NOT NULL
+                          AND NOT starts_with(currency_key, '__unknown__')
                     ) = 'USD' THEN SUM(value_num)
                     ELSE NULL
                 END AS total_value_usd,
-                COALESCE(SUM(gross_kg_num), 0.0) AS total_gross_kg,
-                COALESCE(SUM(net_kg_num), 0.0) AS total_net_kg,
+                COALESCE(SUM(gross_weight_kg), 0.0) AS total_gross_kg,
+                COALESCE(SUM(net_weight_kg), 0.0) AS total_net_kg,
                 COALESCE(SUM(quantity_num), 0.0) AS total_quantity,
                 CASE
                     WHEN COUNT(value_num) = 0 THEN 'empty'
                     WHEN COUNT(*) FILTER (
-                        WHERE value_num IS NOT NULL AND COALESCE(currency_key, '') = ''
+                        WHERE value_num IS NOT NULL AND (
+                            COALESCE(currency_key, '') = ''
+                            OR starts_with(currency_key, '__unknown__')
+                        )
                     ) > 0 THEN 'unavailable'
                     WHEN COUNT(DISTINCT currency_key) FILTER (
-                        WHERE value_num IS NOT NULL AND COALESCE(currency_key, '') <> ''
+                        WHERE value_num IS NOT NULL
+                          AND NOT starts_with(currency_key, '__unknown__')
                     ) = 1 AND MIN(currency_key) FILTER (
-                        WHERE value_num IS NOT NULL AND COALESCE(currency_key, '') <> ''
+                        WHERE value_num IS NOT NULL
+                          AND NOT starts_with(currency_key, '__unknown__')
                     ) = 'USD' THEN 'single_usd'
                     ELSE 'partitioned'
                 END AS monetary_mode,
                 CASE
                     WHEN COUNT(net_kg_num) = 0 THEN 'empty'
-                    WHEN COUNT(*) FILTER (
-                        WHERE net_kg_num IS NOT NULL AND COALESCE(weight_unit_key, '') = ''
-                    ) > 0 THEN 'unavailable'
-                    WHEN COUNT(DISTINCT weight_unit_key) FILTER (
-                        WHERE net_kg_num IS NOT NULL AND COALESCE(weight_unit_key, '') <> ''
-                    ) = 1 AND MIN(weight_unit_key) FILTER (
-                        WHERE net_kg_num IS NOT NULL AND COALESCE(weight_unit_key, '') <> ''
-                    ) = 'KG' THEN 'kg'
-                    ELSE 'partitioned'
+                    WHEN COUNT(*) FILTER (WHERE net_kg_num IS NOT NULL
+                                           AND net_weight_kg IS NULL) > 0
+                        THEN 'unavailable'
+                    ELSE 'normalized_kg'
                 END AS weight_mode
             FROM rollup_expanded
             GROUP BY record_scope, year_key;
@@ -1571,16 +1827,25 @@ fn build_rollups(conn: &DuckConnection) -> Result<(), String> {
                 CASE
                     WHEN COUNT(value_num) = 0 THEN 0.0
                     WHEN COUNT(*) FILTER (
-                        WHERE value_num IS NOT NULL AND COALESCE(currency_key, '') = ''
+                        WHERE value_num IS NOT NULL AND (
+                            COALESCE(currency_key, '') = ''
+                            OR starts_with(currency_key, '__unknown__')
+                        )
                     ) > 0 THEN NULL
                     WHEN COUNT(DISTINCT currency_key) FILTER (
-                        WHERE value_num IS NOT NULL AND COALESCE(currency_key, '') <> ''
+                        WHERE value_num IS NOT NULL
+                          AND NOT starts_with(currency_key, '__unknown__')
                     ) = 1 AND MIN(currency_key) FILTER (
-                        WHERE value_num IS NOT NULL AND COALESCE(currency_key, '') <> ''
+                        WHERE value_num IS NOT NULL
+                          AND NOT starts_with(currency_key, '__unknown__')
                     ) = 'USD' THEN SUM(value_num)
                     ELSE NULL
                 END AS total_value_usd,
-                COALESCE(SUM(net_kg_num), 0.0) AS total_net_kg
+                COALESCE(SUM(net_weight_kg), 0.0) AS total_net_kg,
+                COALESCE(SUM(CASE WHEN value_num IS NOT NULL AND net_weight_kg > 0
+                    THEN value_num ELSE 0.0 END), 0.0) AS paired_value,
+                COALESCE(SUM(CASE WHEN value_num IS NOT NULL AND net_weight_kg > 0
+                    THEN net_weight_kg ELSE 0.0 END), 0.0) AS paired_net_kg
             FROM rollup_expanded
             WHERE month IS NOT NULL AND month <> ''
             GROUP BY record_scope, year_key, month;
@@ -1608,7 +1873,9 @@ fn build_rollups(conn: &DuckConnection) -> Result<(), String> {
             total_value_usd DOUBLE,
             total_net_kg DOUBLE,
             total_gross_kg DOUBLE,
-            total_quantity DOUBLE
+            total_quantity DOUBLE,
+            paired_value DOUBLE,
+            paired_net_kg DOUBLE
          );",
     )
     .map_err(|err| format!("Could not create DuckDB rollup foundation: {err}"))?;
@@ -1646,14 +1913,14 @@ fn build_rollups(conn: &DuckConnection) -> Result<(), String> {
                     trademark_label,
                     origin_key,
                     value_num,
-                    net_kg_num,
-                    value_num / net_kg_num AS price_per_kg
+                    net_weight_kg,
+                    value_num / net_weight_kg AS price_per_kg
                 FROM rollup_expanded
                 WHERE value_num IS NOT NULL
-                  AND net_kg_num IS NOT NULL
-                  AND net_kg_num > 0
+                  AND net_weight_kg IS NOT NULL
+                  AND net_weight_kg > 0
                   AND COALESCE(currency_key, '') <> ''
-                  AND COALESCE(weight_unit_key, '') <> ''
+                  AND NOT starts_with(currency_key, '__unknown__')
             ), cohorts AS (
                 SELECT *, 'all'::VARCHAR AS cohort_kind, ''::VARCHAR AS cohort_label
                 FROM priced
@@ -1678,7 +1945,7 @@ fn build_rollups(conn: &DuckConnection) -> Result<(), String> {
                 AVG(price_per_kg) AS average,
                 MIN(price_per_kg) AS minimum,
                 MAX(price_per_kg) AS maximum,
-                SUM(value_num) / NULLIF(SUM(net_kg_num), 0) AS weighted_average,
+                SUM(value_num) / NULLIF(SUM(net_weight_kg), 0) AS weighted_average,
                 quantile_cont(price_per_kg, 0.25) AS p25,
                 quantile_cont(price_per_kg, 0.5) AS median,
                 quantile_cont(price_per_kg, 0.75) AS p75
@@ -1713,8 +1980,8 @@ fn insert_section_rollup(
                 declaration_number,
                 edrpou_label,
                 value_num,
-                net_kg_num,
-                gross_kg_num,
+                net_weight_kg,
+                gross_weight_kg,
                 quantity_num,
                 currency_key
             FROM rollup_expanded
@@ -1731,18 +1998,27 @@ fn insert_section_rollup(
             CASE
                 WHEN COUNT(value_num) = 0 THEN 0.0
                 WHEN COUNT(*) FILTER (
-                    WHERE value_num IS NOT NULL AND COALESCE(currency_key, '') = ''
+                    WHERE value_num IS NOT NULL AND (
+                        COALESCE(currency_key, '') = ''
+                        OR starts_with(currency_key, '__unknown__')
+                    )
                 ) > 0 THEN NULL
                 WHEN COUNT(DISTINCT currency_key) FILTER (
-                    WHERE value_num IS NOT NULL AND COALESCE(currency_key, '') <> ''
+                    WHERE value_num IS NOT NULL
+                      AND NOT starts_with(currency_key, '__unknown__')
                 ) = 1 AND MIN(currency_key) FILTER (
-                    WHERE value_num IS NOT NULL AND COALESCE(currency_key, '') <> ''
+                    WHERE value_num IS NOT NULL
+                      AND NOT starts_with(currency_key, '__unknown__')
                 ) = 'USD' THEN SUM(value_num)
                 ELSE NULL
             END,
-            COALESCE(SUM(net_kg_num), 0.0),
-            COALESCE(SUM(gross_kg_num), 0.0),
-            COALESCE(SUM(quantity_num), 0.0)
+            COALESCE(SUM(net_weight_kg), 0.0),
+            COALESCE(SUM(gross_weight_kg), 0.0),
+            COALESCE(SUM(quantity_num), 0.0),
+            COALESCE(SUM(CASE WHEN value_num IS NOT NULL AND net_weight_kg > 0
+                THEN value_num ELSE 0.0 END), 0.0),
+            COALESCE(SUM(CASE WHEN value_num IS NOT NULL AND net_weight_kg > 0
+                THEN net_weight_kg ELSE 0.0 END), 0.0)
          FROM labeled
          WHERE label IS NOT NULL AND label <> ''
          GROUP BY record_scope, year_key, label",
@@ -1850,10 +2126,216 @@ fn require_rollup_schema(conn: &DuckConnection) -> Result<(), String> {
     Ok(())
 }
 
+fn currency_is_known(currency: &str) -> bool {
+    !currency.is_empty() && !currency.starts_with(UNKNOWN_CURRENCY_KEY)
+}
+
+fn weight_factor(unit: &str) -> Option<f64> {
+    match unit {
+        "kg" => Some(1.0),
+        "g" => Some(0.001),
+        "tonne" => Some(1_000.0),
+        "lb" => Some(0.453_592_37),
+        _ => None,
+    }
+}
+
+fn normalized_weight_sql(weight: &str) -> String {
+    format!(
+        "CASE weight_unit_key
+            WHEN 'kg' THEN {weight}
+            WHEN 'g' THEN {weight} * 0.001
+            WHEN 'tonne' THEN {weight} * 1000.0
+            WHEN 'lb' THEN {weight} * 0.45359237
+         END"
+    )
+}
+
+fn projection_weight_totals(
+    conn: &DuckConnection,
+    filter: &DuckFilter,
+    weight: &str,
+) -> Result<Vec<AnalyticsWeightTotal>, String> {
+    let normalized = normalized_weight_sql(weight);
+    let sql = format!(
+        "SELECT
+            COALESCE(NULLIF(weight_unit_key, ''), '{UNKNOWN_UNIT_KEY}') AS source_unit,
+            COUNT(*) AS weighted_rows,
+            COALESCE(SUM({weight}), 0.0) AS source_total,
+            SUM({normalized}) AS kg_total
+         FROM records
+         {} {weight} IS NOT NULL
+         GROUP BY source_unit
+         ORDER BY source_total DESC, source_unit",
+        filter.where_extra_sql()
+    );
+    let mut statement = conn.prepare(&sql).map_err(|err| err.to_string())?;
+    statement
+        .query_map([], |row| {
+            let source_unit: String = row.get(0)?;
+            let factor = weight_factor(&source_unit);
+            Ok(AnalyticsWeightTotal {
+                source_unit,
+                known: factor.is_some(),
+                normalized_unit: factor.map(|_| "kg".to_string()),
+                factor_to_kg: factor,
+                weighted_rows: row.get::<_, i64>(1)?.max(0) as u64,
+                total_source_weight: row.get::<_, Option<f64>>(2)?.unwrap_or(0.0),
+                total_kg: row.get(3)?,
+            })
+        })
+        .map_err(|err| err.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|err| err.to_string())
+}
+
+fn projection_measures(
+    conn: &DuckConnection,
+    filter: &DuckFilter,
+) -> Result<AnalyticsMeasures, String> {
+    let currency_totals = {
+        let sql = format!(
+            "SELECT
+                COALESCE(NULLIF(currency_key, ''), '{UNKNOWN_CURRENCY_KEY}') AS currency,
+                COUNT(*) AS valued_rows,
+                COALESCE(SUM(value_num), 0.0) AS total_value
+             FROM records
+             {} value_num IS NOT NULL
+             GROUP BY currency
+             ORDER BY total_value DESC, currency",
+            filter.where_extra_sql()
+        );
+        let mut statement = conn.prepare(&sql).map_err(|err| err.to_string())?;
+        statement
+            .query_map([], |row| {
+                let currency: String = row.get(0)?;
+                Ok(AnalyticsCurrencyTotal {
+                    known: currency_is_known(&currency),
+                    currency,
+                    valued_rows: row.get::<_, i64>(1)?.max(0) as u64,
+                    total_value: row.get::<_, Option<f64>>(2)?.unwrap_or(0.0),
+                })
+            })
+            .map_err(|err| err.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|err| err.to_string())?
+    };
+
+    let net_weight_totals = projection_weight_totals(conn, filter, "net_kg_num")?;
+    let gross_weight_totals = projection_weight_totals(conn, filter, "gross_kg_num")?;
+    let net_kg = normalized_weight_sql("net_kg_num");
+    let value_per_net_weight = {
+        let sql = format!(
+            "SELECT
+                COALESCE(NULLIF(currency_key, ''), '{UNKNOWN_CURRENCY_KEY}') AS currency,
+                COALESCE(NULLIF(weight_unit_key, ''), '{UNKNOWN_UNIT_KEY}') AS source_unit,
+                COUNT(*) AS paired_rows,
+                COALESCE(SUM(value_num), 0.0) AS total_value,
+                COALESCE(SUM({net_kg}), 0.0) AS total_weight
+             FROM records
+             {} value_num IS NOT NULL
+               AND net_kg_num IS NOT NULL
+               AND ({net_kg}) > 0
+             GROUP BY currency, source_unit
+             ORDER BY currency, source_unit",
+            filter.where_extra_sql()
+        );
+        let mut statement = conn.prepare(&sql).map_err(|err| err.to_string())?;
+        let mut rows = statement.query([]).map_err(|err| err.to_string())?;
+        let mut totals = BTreeMap::<String, AnalyticsValuePerWeight>::new();
+        while let Some(row) = rows.next().map_err(|err| err.to_string())? {
+            let currency: String = row.get(0).map_err(|err| err.to_string())?;
+            let source_unit: String = row.get(1).map_err(|err| err.to_string())?;
+            let entry = totals
+                .entry(currency.clone())
+                .or_insert_with(|| AnalyticsValuePerWeight {
+                    currency,
+                    normalized_weight_unit: "kg".to_string(),
+                    ..Default::default()
+                });
+            entry.source_weight_units.push(source_unit);
+            entry.paired_rows += row.get::<_, i64>(2).map_err(|err| err.to_string())?.max(0) as u64;
+            entry.total_value += row
+                .get::<_, Option<f64>>(3)
+                .map_err(|err| err.to_string())?
+                .unwrap_or(0.0);
+            entry.total_weight += row
+                .get::<_, Option<f64>>(4)
+                .map_err(|err| err.to_string())?
+                .unwrap_or(0.0);
+        }
+        totals
+            .into_values()
+            .map(|mut total| {
+                total.source_weight_units.sort();
+                total.source_weight_units.dedup();
+                total.value_per_weight =
+                    (total.total_weight > 0.0).then(|| total.total_value / total.total_weight);
+                total
+            })
+            .collect::<Vec<_>>()
+    };
+
+    let unknown_currency = format!(
+        "(COALESCE(currency_key, '') = '' OR starts_with(currency_key, '{UNKNOWN_CURRENCY_KEY}'))"
+    );
+    let unknown_unit = format!(
+        "(COALESCE(weight_unit_key, '') = '' OR starts_with(weight_unit_key, '{UNKNOWN_UNIT_KEY}'))"
+    );
+    let exclusion_sql = format!(
+        "SELECT
+            COALESCE(SUM(CASE WHEN value_num IS NOT NULL AND {unknown_currency}
+                THEN 1 ELSE 0 END), 0),
+            COALESCE(SUM(CASE WHEN net_kg_num IS NOT NULL AND {unknown_unit}
+                THEN 1 ELSE 0 END), 0),
+            COALESCE(SUM(CASE WHEN gross_kg_num IS NOT NULL AND {unknown_unit}
+                THEN 1 ELSE 0 END), 0),
+            COALESCE(SUM(CASE WHEN value_num IS NOT NULL AND net_kg_num IS NOT NULL
+                AND {unknown_currency} THEN 1 ELSE 0 END), 0),
+            COALESCE(SUM(CASE WHEN value_num IS NOT NULL AND net_kg_num IS NOT NULL
+                AND {unknown_unit} THEN 1 ELSE 0 END), 0),
+            COALESCE(SUM(CASE WHEN value_num IS NOT NULL
+                AND (net_kg_num IS NULL OR net_kg_num <= 0) THEN 1 ELSE 0 END), 0)
+         FROM records {}",
+        filter.where_sql()
+    );
+    let exclusions = conn
+        .query_row(&exclusion_sql, [], |row| {
+            Ok(AnalyticsMeasureExclusions {
+                value_without_known_currency: row.get::<_, i64>(0)?.max(0) as u64,
+                net_weight_without_known_unit: row.get::<_, i64>(1)?.max(0) as u64,
+                gross_weight_without_known_unit: row.get::<_, i64>(2)?.max(0) as u64,
+                ratio_without_known_currency: row.get::<_, i64>(3)?.max(0) as u64,
+                ratio_without_known_weight_unit: row.get::<_, i64>(4)?.max(0) as u64,
+                ratio_with_zero_or_missing_weight: row.get::<_, i64>(5)?.max(0) as u64,
+            })
+        })
+        .map_err(|err| err.to_string())?;
+
+    let compatible_value_total = (currency_totals.len() == 1 && currency_totals[0].known)
+        .then(|| currency_totals[0].clone());
+    let compatible_value_per_net_weight = compatible_value_total.as_ref().and_then(|total| {
+        value_per_net_weight
+            .iter()
+            .find(|pair| pair.currency == total.currency)
+            .cloned()
+    });
+    Ok(AnalyticsMeasures {
+        currency_totals,
+        net_weight_totals,
+        gross_weight_totals,
+        value_per_net_weight,
+        compatible_value_total,
+        compatible_value_per_net_weight,
+        exclusions,
+    })
+}
+
 fn projection_overview(
     conn: &DuckConnection,
     filter: &DuckFilter,
 ) -> Result<AnalyticsOverview, String> {
+    let measures = projection_measures(conn, filter)?;
     let sql = format!(
         "SELECT
             COUNT(*),
@@ -1866,14 +2348,11 @@ fn projection_overview(
             COUNT(DISTINCT NULLIF(origin_key, '')),
             COUNT(DISTINCT NULLIF(dispatch_key, '')),
             COUNT(DISTINCT NULLIF(trade_key, '')),
-            COALESCE(SUM(value_num), 0.0),
-            COALESCE(SUM(gross_kg_num), 0.0),
-            COALESCE(SUM(net_kg_num), 0.0),
             COALESCE(SUM(quantity_num), 0.0)
          FROM records {}",
         filter.where_sql()
     );
-    let overview = conn
+    let mut overview = conn
         .query_row(&sql, [], |row| {
             Ok(AnalyticsOverview {
                 row_count: row.get::<_, i64>(0)?.max(0) as u64,
@@ -1886,34 +2365,40 @@ fn projection_overview(
                 distinct_origin_countries: row.get::<_, i64>(7)?.max(0) as u64,
                 distinct_dispatch_countries: row.get::<_, i64>(8)?.max(0) as u64,
                 distinct_trade_countries: row.get::<_, i64>(9)?.max(0) as u64,
-                total_value_usd: row.get::<_, Option<f64>>(10)?.unwrap_or(0.0),
-                total_gross_kg: row.get::<_, Option<f64>>(11)?.unwrap_or(0.0),
-                total_net_kg: row.get::<_, Option<f64>>(12)?.unwrap_or(0.0),
-                total_quantity: row.get::<_, Option<f64>>(13)?.unwrap_or(0.0),
+                total_quantity: row.get::<_, Option<f64>>(10)?.unwrap_or(0.0),
                 avg_value_per_net_kg: 0.0,
                 compatible_usd: None,
                 measures: AnalyticsMeasures::default(),
+                ..Default::default()
             })
         })
         .map_err(|err| err.to_string())?;
-    Ok(AnalyticsOverview {
-        avg_value_per_net_kg: ratio(overview.total_value_usd, overview.total_net_kg),
-        compatible_usd: projection_usd_compat(overview.total_value_usd, overview.total_net_kg),
-        ..overview
-    })
+    overview.total_value_usd = measures.compatible_usd_total().unwrap_or(0.0);
+    overview.total_net_kg = measures.total_net_kg();
+    overview.total_gross_kg = measures.total_gross_kg();
+    overview.avg_value_per_net_kg = measures.compatible_usd_per_net_kg().unwrap_or(0.0);
+    overview.compatible_usd = projection_usd_compat(&measures);
+    overview.measures = measures;
+    Ok(overview)
 }
 
 fn projection_months(
     conn: &DuckConnection,
     filter: &DuckFilter,
+    query_is_usd: bool,
 ) -> Result<Vec<AnalyticsMonthRow>, String> {
+    let net_kg = normalized_weight_sql("net_kg_num");
     let sql = format!(
         "SELECT
             month,
             COUNT(*) AS rows_count,
             COUNT(DISTINCT NULLIF(declaration_number, '')) AS declarations_count,
-            COALESCE(SUM(value_num), 0.0) AS total_value_usd,
-            COALESCE(SUM(net_kg_num), 0.0) AS total_net_kg
+            COALESCE(SUM(value_num), 0.0) AS total_value,
+            COALESCE(SUM({net_kg}), 0.0) AS total_net_kg,
+            COALESCE(SUM(CASE WHEN value_num IS NOT NULL AND ({net_kg}) > 0
+                THEN value_num ELSE 0.0 END), 0.0) AS paired_value,
+            COALESCE(SUM(CASE WHEN value_num IS NOT NULL AND ({net_kg}) > 0
+                THEN ({net_kg}) ELSE 0.0 END), 0.0) AS paired_weight
          FROM records
          {} month IS NOT NULL AND month <> ''
          GROUP BY month
@@ -1924,15 +2409,24 @@ fn projection_months(
     let mut stmt = conn.prepare(&sql).map_err(|err| err.to_string())?;
     let rows = stmt
         .query_map([], |row| {
-            let total_value_usd = row.get::<_, Option<f64>>(3)?.unwrap_or(0.0);
+            let total_value = row.get::<_, Option<f64>>(3)?.unwrap_or(0.0);
             let total_net_kg = row.get::<_, Option<f64>>(4)?.unwrap_or(0.0);
+            let compatible_usd = inherited_projection_usd(
+                query_is_usd,
+                total_value,
+                row.get::<_, Option<f64>>(5)?.unwrap_or(0.0),
+                row.get::<_, Option<f64>>(6)?.unwrap_or(0.0),
+            );
             Ok(AnalyticsMonthRow {
                 month: row.get(0)?,
                 rows: row.get::<_, i64>(1)?.max(0) as u64,
                 declarations: row.get::<_, i64>(2)?.max(0) as u64,
-                total_value_usd,
+                total_value_usd: compatible_usd
+                    .as_ref()
+                    .map(|compatibility| compatibility.total_value_usd)
+                    .unwrap_or(0.0),
                 total_net_kg,
-                compatible_usd: projection_usd_compat(total_value_usd, total_net_kg),
+                compatible_usd,
                 measures: AnalyticsMeasures::default(),
             })
         })
@@ -1959,20 +2453,32 @@ fn projection_section(
         });
     };
     let label_sql = grouping.label_sql;
+    let net_kg = normalized_weight_sql("net_kg_num");
+    let gross_kg = normalized_weight_sql("gross_kg_num");
+    let query_is_usd = overview.compatible_usd.is_some();
+    let order_metric = if query_is_usd {
+        "total_value DESC"
+    } else {
+        "total_net_kg DESC"
+    };
     let sql = format!(
         "SELECT
             {label_sql} AS label,
             COUNT(*) AS rows_count,
             COUNT(DISTINCT NULLIF(declaration_number, '')) AS declarations_count,
             COUNT(DISTINCT NULLIF(edrpou_label, '')) AS companies_count,
-            COALESCE(SUM(value_num), 0.0) AS total_value_usd,
-            COALESCE(SUM(net_kg_num), 0.0) AS total_net_kg,
-            COALESCE(SUM(gross_kg_num), 0.0) AS total_gross_kg,
-            COALESCE(SUM(quantity_num), 0.0) AS total_quantity
+            COALESCE(SUM(value_num), 0.0) AS total_value,
+            COALESCE(SUM({net_kg}), 0.0) AS total_net_kg,
+            COALESCE(SUM({gross_kg}), 0.0) AS total_gross_kg,
+            COALESCE(SUM(quantity_num), 0.0) AS total_quantity,
+            COALESCE(SUM(CASE WHEN value_num IS NOT NULL AND ({net_kg}) > 0
+                THEN value_num ELSE 0.0 END), 0.0) AS paired_value,
+            COALESCE(SUM(CASE WHEN value_num IS NOT NULL AND ({net_kg}) > 0
+                THEN ({net_kg}) ELSE 0.0 END), 0.0) AS paired_weight
          FROM records
          {} {label_sql} IS NOT NULL AND {label_sql} <> ''
          GROUP BY {label_sql}
-         ORDER BY total_value_usd DESC, total_net_kg DESC, rows_count DESC, label
+         ORDER BY {order_metric}, total_net_kg DESC, rows_count DESC, label
          LIMIT {}",
         filter.where_extra_sql(),
         limit.clamp(1, 20_000)
@@ -1982,10 +2488,16 @@ fn projection_section(
         .query_map([], |row| {
             let label: String = row.get(0)?;
             let rows_count = row.get::<_, i64>(1)?.max(0) as u64;
-            let total_value_usd: f64 = row.get::<_, Option<f64>>(4)?.unwrap_or(0.0);
+            let total_value: f64 = row.get::<_, Option<f64>>(4)?.unwrap_or(0.0);
             let total_net_kg: f64 = row.get::<_, Option<f64>>(5)?.unwrap_or(0.0);
             let total_gross_kg: f64 = row.get::<_, Option<f64>>(6)?.unwrap_or(0.0);
             let total_quantity: f64 = row.get::<_, Option<f64>>(7)?.unwrap_or(0.0);
+            let compatible_usd = inherited_projection_usd(
+                query_is_usd,
+                total_value,
+                row.get::<_, Option<f64>>(8)?.unwrap_or(0.0),
+                row.get::<_, Option<f64>>(9)?.unwrap_or(0.0),
+            );
             let share_base = if overview.total_value_usd > 0.0 {
                 overview.total_value_usd
             } else if overview.total_net_kg > 0.0 {
@@ -1994,7 +2506,10 @@ fn projection_section(
                 overview.row_count as f64
             };
             let share_value = if overview.total_value_usd > 0.0 {
-                total_value_usd
+                compatible_usd
+                    .as_ref()
+                    .map(|compatibility| compatibility.total_value_usd)
+                    .unwrap_or(0.0)
             } else if overview.total_net_kg > 0.0 {
                 total_net_kg
             } else {
@@ -2009,13 +2524,19 @@ fn projection_section(
                 rows: rows_count,
                 declarations: row.get::<_, i64>(2)?.max(0) as u64,
                 companies: row.get::<_, i64>(3)?.max(0) as u64,
-                total_value_usd,
+                total_value_usd: compatible_usd
+                    .as_ref()
+                    .map(|compatibility| compatibility.total_value_usd)
+                    .unwrap_or(0.0),
                 total_net_kg,
                 total_gross_kg,
                 total_quantity,
                 share_percent: ratio(share_value * 100.0, share_base),
-                avg_value_per_net_kg: ratio(total_value_usd, total_net_kg),
-                compatible_usd: projection_usd_compat(total_value_usd, total_net_kg),
+                avg_value_per_net_kg: compatible_usd
+                    .as_ref()
+                    .and_then(|compatibility| compatibility.avg_value_per_net_kg)
+                    .unwrap_or(0.0),
+                compatible_usd,
                 measures: AnalyticsMeasures::default(),
             })
         })
@@ -2083,32 +2604,17 @@ fn projection_price_metrics(
     conn: &DuckConnection,
     filter: &DuckFilter,
 ) -> Result<Vec<AnalyticsPriceMetric>, String> {
+    let net_kg = normalized_weight_sql("net_kg_num");
+    let gross_kg = normalized_weight_sql("gross_kg_num");
     Ok(vec![
-        projection_price_metric(
-            conn,
-            filter,
-            PriceMetricKind::ValuePerNetKg,
-            "CASE
-                WHEN value_num IS NOT NULL
-                    AND net_kg_num IS NOT NULL
-                    AND net_kg_num > 0
-                THEN value_num / net_kg_num
-             END",
-            "net_kg_num",
-        )?,
-        projection_price_metric(
-            conn,
-            filter,
-            PriceMetricKind::RfvUsdKg,
-            "rfv_num",
-            "net_kg_num",
-        )?,
+        projection_value_per_net_weight_metric(conn, filter)?,
+        projection_price_metric(conn, filter, PriceMetricKind::RfvUsdKg, "rfv_num", &net_kg)?,
         projection_price_metric(
             conn,
             filter,
             PriceMetricKind::RmvNetUsdKg,
             "rmv_net_num",
-            "net_kg_num",
+            &net_kg,
         )?,
         projection_price_metric(
             conn,
@@ -2122,16 +2628,129 @@ fn projection_price_metrics(
             filter,
             PriceMetricKind::RmvGrossUsdKg,
             "rmv_gross_num",
-            "gross_kg_num",
+            &gross_kg,
         )?,
         projection_price_metric(
             conn,
             filter,
             PriceMetricKind::MinBaseUsdKg,
             "min_base_num",
-            "net_kg_num",
+            &net_kg,
         )?,
     ])
+}
+
+fn projection_value_per_net_weight_metric(
+    conn: &DuckConnection,
+    filter: &DuckFilter,
+) -> Result<AnalyticsPriceMetric, String> {
+    let net_kg = normalized_weight_sql("net_kg_num");
+    let known_currency = format!(
+        "COALESCE(currency_key, '') <> ''
+         AND NOT starts_with(currency_key, '{UNKNOWN_CURRENCY_KEY}')"
+    );
+    let sql = format!(
+        "WITH priced AS (
+            SELECT
+                currency_key,
+                weight_unit_key,
+                value_num,
+                ({net_kg}) AS net_weight_kg,
+                value_num / ({net_kg}) AS price
+            FROM records
+            {} value_num IS NOT NULL
+              AND ({net_kg}) > 0
+              AND {known_currency}
+         )
+         SELECT
+            currency_key,
+            COUNT(*) AS sample_count,
+            AVG(price),
+            MIN(price),
+            MAX(price),
+            SUM(value_num) / NULLIF(SUM(net_weight_kg), 0),
+            quantile_cont(price, 0.25),
+            quantile_cont(price, 0.5),
+            quantile_cont(price, 0.75),
+            SUM(value_num),
+            SUM(net_weight_kg)
+         FROM priced
+         GROUP BY currency_key
+         ORDER BY currency_key",
+        filter.where_extra_sql()
+    );
+    let mut statement = conn.prepare(&sql).map_err(|err| err.to_string())?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok(AnalyticsPriceCohort {
+                currency: row.get(0)?,
+                normalized_weight_unit: "kg".to_string(),
+                source_weight_units: Vec::new(),
+                count: row.get::<_, i64>(1)?.max(0) as u64,
+                average: row.get::<_, Option<f64>>(2)?.unwrap_or(0.0),
+                minimum: row.get::<_, Option<f64>>(3)?.unwrap_or(0.0),
+                maximum: row.get::<_, Option<f64>>(4)?.unwrap_or(0.0),
+                weighted_average: row.get(5)?,
+                p25: row.get::<_, Option<f64>>(6)?.unwrap_or(0.0),
+                median: row.get::<_, Option<f64>>(7)?.unwrap_or(0.0),
+                p75: row.get::<_, Option<f64>>(8)?.unwrap_or(0.0),
+                numerator_total: row.get::<_, Option<f64>>(9)?.unwrap_or(0.0),
+                denominator_total: row.get::<_, Option<f64>>(10)?.unwrap_or(0.0),
+            })
+        })
+        .map_err(|err| err.to_string())?;
+    let mut cohorts = rows
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|err| err.to_string())?;
+
+    let units_sql = format!(
+        "SELECT DISTINCT currency_key, weight_unit_key
+         FROM records
+         {} value_num IS NOT NULL
+           AND ({net_kg}) > 0
+           AND {known_currency}
+         ORDER BY currency_key, weight_unit_key",
+        filter.where_extra_sql()
+    );
+    let mut units_statement = conn.prepare(&units_sql).map_err(|err| err.to_string())?;
+    let unit_rows = units_statement
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .map_err(|err| err.to_string())?;
+    let mut units = BTreeMap::<String, Vec<String>>::new();
+    for row in unit_rows {
+        let (currency, unit) = row.map_err(|err| err.to_string())?;
+        units.entry(currency).or_default().push(unit);
+    }
+    for cohort in &mut cohorts {
+        cohort.source_weight_units = units.remove(&cohort.currency).unwrap_or_default();
+    }
+
+    let excluded_sql = format!(
+        "SELECT COUNT(*) FROM records
+         {} value_num IS NOT NULL AND (
+            NOT ({known_currency}) OR net_kg_num IS NULL OR ({net_kg}) IS NULL OR ({net_kg}) <= 0
+         )",
+        filter.where_extra_sql()
+    );
+    let excluded_rows = query_count(conn, &excluded_sql)?;
+    let compatible = (cohorts.len() == 1).then(|| &cohorts[0]);
+    Ok(AnalyticsPriceMetric {
+        kind: PriceMetricKind::ValuePerNetKg,
+        count: compatible.map(|cohort| cohort.count).unwrap_or(0),
+        average: compatible.map(|cohort| cohort.average).unwrap_or(0.0),
+        minimum: compatible.map(|cohort| cohort.minimum).unwrap_or(0.0),
+        maximum: compatible.map(|cohort| cohort.maximum).unwrap_or(0.0),
+        weighted_average: compatible
+            .and_then(|cohort| cohort.weighted_average)
+            .unwrap_or(0.0),
+        median: compatible.map(|cohort| cohort.median).unwrap_or(0.0),
+        p25: compatible.map(|cohort| cohort.p25).unwrap_or(0.0),
+        p75: compatible.map(|cohort| cohort.p75).unwrap_or(0.0),
+        cohorts,
+        excluded_rows,
+    })
 }
 
 fn projection_price_metric(
@@ -2187,8 +2806,8 @@ fn projection_price_metric(
             p25: row.get::<_, Option<f64>>(6)?.unwrap_or(0.0),
             median: row.get::<_, Option<f64>>(7)?.unwrap_or(0.0),
             p75: row.get::<_, Option<f64>>(8)?.unwrap_or(0.0),
-            // The projection is single-cohort USD by construction; per-cohort
-            // detail is not computed on this path.
+            // These source metrics are explicitly USD-denominated by their
+            // semantic contract; only value-per-weight needs currency cohorts.
             cohorts: Vec::new(),
             excluded_rows: 0,
         })
@@ -2513,14 +3132,7 @@ mod tests {
             projected.overview.distinct_trademarks,
             sqlite.overview.distinct_trademarks
         );
-        assert_eq!(
-            projected.overview.total_value_usd,
-            sqlite.overview.total_value_usd
-        );
-        assert_eq!(
-            projected.overview.total_net_kg,
-            sqlite.overview.total_net_kg
-        );
+        assert_eq!(projected.overview.measures, sqlite.overview.measures);
         assert_eq!(projected.top_trademarks.len(), sqlite.top_trademarks.len());
         assert_eq!(
             projected.top_product_codes.len(),
@@ -2542,14 +3154,18 @@ mod tests {
             projected_prices.price_sections.len(),
             sqlite_prices.price_sections.len()
         );
-        assert_eq!(
-            projected_prices.price_sections[0].count,
-            sqlite_prices.price_sections[0].count
-        );
-        assert_eq!(
-            projected_prices.price_sections[0].median,
-            sqlite_prices.price_sections[0].median
-        );
+        if projected_prices.price_sections[0].cohorts.len() == 1 {
+            assert_eq!(
+                projected_prices.price_sections[0].count,
+                sqlite_prices.price_sections[0].count
+            );
+            assert_eq!(
+                projected_prices.price_sections[0].median,
+                sqlite_prices.price_sections[0].median
+            );
+        } else {
+            assert_eq!(projected_prices.price_sections[0].count, 0);
+        }
         for kind in [
             PriceMetricKind::RfvUsdKg,
             PriceMetricKind::RmvNetUsdKg,

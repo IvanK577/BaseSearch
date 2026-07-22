@@ -355,11 +355,21 @@ pub fn column_glossary(name: &str) -> Option<&'static str> {
 /// Source-file header for a database column name; source_file maps to file.
 pub fn header_for(name: &str) -> &'static str {
     if name == "source_file" {
-        return "Файл";
+        return "File";
     }
     COLUMNS
         .iter()
         .find(|c| c.name == name)
         .map(|c| c.header)
         .unwrap_or("")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::header_for;
+
+    #[test]
+    fn source_file_uses_the_neutral_api_label() {
+        assert_eq!(header_for("source_file"), "File");
+    }
 }

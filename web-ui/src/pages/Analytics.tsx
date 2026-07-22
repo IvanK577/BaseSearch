@@ -5,6 +5,7 @@ import type {
   Analytics,
   AnalyticsFilterAction,
   AnalyticsGroupRow,
+  AnalyticsOverview,
   AnalyticsScope,
   AnalyticsSection,
   Filters,
@@ -14,7 +15,14 @@ import type {
   Query,
   SchemaResponse,
 } from "../api/types";
-import { MonthChart, PriceTable, StatCard } from "../components/analytics";
+import {
+  CurrencySummary,
+  MonthChart,
+  PriceTable,
+  StatCard,
+  ValuePerWeightSummary,
+  WeightSummary,
+} from "../components/analytics";
 import { Icon } from "../components/Icon";
 import { Banner, EmptyState, Loading } from "../components/ui";
 import { useI18n, type MessageKey } from "../lib/i18n";
@@ -22,6 +30,14 @@ import { fieldRefOf } from "../lib/advanced";
 import { copyText } from "../lib/clipboard";
 import { downloadCsv } from "../lib/csv";
 import { buildReportHtml, buildReportText, queryLabel } from "../lib/report";
+import {
+  commonCurrency,
+  compatibleCurrencyTotal,
+  rawNetWeightIsKg,
+  safeNetWeightKg,
+  safeRowShare,
+  safeValuePerNetWeight,
+} from "../lib/analyticsMeasures";
 import {
   formatCompact,
   formatInt,
@@ -45,16 +61,16 @@ type Tab =
   | "report"
   | "compare";
 
-const TABS: { id: Tab; key: MessageKey }[] = [
+const TABS: { id: Tab; key: MessageKey; secondary?: boolean }[] = [
   { id: "overview", key: "analytics_overview" },
   { id: "months", key: "analytics_months" },
   { id: "companies", key: "analytics_companies" },
   { id: "products", key: "analytics_products" },
   { id: "countries", key: "analytics_countries" },
   { id: "prices", key: "analytics_prices" },
-  { id: "pivot", key: "analytics_pivot" },
-  { id: "report", key: "analytics_report" },
   { id: "compare", key: "analytics_compare" },
+  { id: "pivot", key: "analytics_pivot", secondary: true },
+  { id: "report", key: "analytics_report", secondary: true },
 ];
 
 // Tabs that self-fetch (their own state) rather than going through the shared
@@ -147,7 +163,7 @@ export function AnalyticsPage() {
         setAnalytics(res.data);
       } catch (err) {
         if (id !== reqRef.current) return;
-        setError((err as ApiError)?.message ?? "Analytics failed");
+        setError((err as ApiError)?.message ?? t("analytics_failed"));
       } finally {
         if (id === reqRef.current) setLoading(false);
       }
@@ -229,12 +245,14 @@ export function AnalyticsPage() {
         onUndo={undo}
         canUndo={canUndo}
       />
-      <div className="tabs">
+      <div className="tabs" role="tablist" aria-label={t("nav_analytics")}>
         {TABS.map((tabDef) => (
           <button
             key={tabDef.id}
-            className={`tab ${tab === tabDef.id ? "active" : ""}`}
+            className={`tab ${tab === tabDef.id ? "active" : ""} ${tabDef.secondary ? "secondary" : ""}`}
             onClick={() => setTab(tabDef.id)}
+            role="tab"
+            aria-selected={tab === tabDef.id}
           >
             {t(tabDef.key)}
           </button>
@@ -261,6 +279,7 @@ export function AnalyticsPage() {
           {tab === "companies" ? (
             <SectionGroupPanel
               sections={analytics.company_sections}
+              overview={analytics.overview}
               limit={sectionLimit}
               onLimit={setSectionLimit}
               onRow={(section, action) =>
@@ -275,6 +294,7 @@ export function AnalyticsPage() {
           {tab === "products" ? (
             <SectionGroupPanel
               sections={analytics.product_sections}
+              overview={analytics.overview}
               limit={sectionLimit}
               onLimit={setSectionLimit}
               onRow={(_, action) => onAction(action)}
@@ -300,6 +320,7 @@ export function AnalyticsPage() {
           {tab === "countries" ? (
             <SectionGroupPanel
               sections={analytics.country_sections}
+              overview={analytics.overview}
               limit={sectionLimit}
               onLimit={setSectionLimit}
               onRow={(_, action) => onAction(action)}
@@ -318,7 +339,7 @@ export function AnalyticsPage() {
   );
 }
 
-function OverviewPanel({
+export function OverviewPanel({
   analytics,
   onMonth,
 }: {
@@ -327,6 +348,16 @@ function OverviewPanel({
 }) {
   const { t } = useI18n();
   const o = analytics.overview;
+  const legacyRawKg = rawNetWeightIsKg(o.measures);
+  const monthCurrency = commonCurrency(analytics.months);
+  const monthNetIsComparable = analytics.months.every(
+    (month) => safeNetWeightKg(month, legacyRawKg) !== null,
+  );
+  const monthMetric = monthCurrency
+    ? "value"
+    : monthNetIsComparable
+      ? "net_weight"
+      : "rows";
   return (
     <div className="stack">
       <div className="stat-grid">
@@ -339,12 +370,17 @@ function OverviewPanel({
           />
         ) : null}
         <StatCard
-          label={`${t("common_value")} USD`}
-          value={formatCompact(o.total_value_usd)}
-          hint={formatMoney(o.total_value_usd)}
+          label={t("analytics_value_by_currency")}
+          value={<CurrencySummary measures={o.measures} legacyUsd={o.total_value_usd} />}
         />
-        <StatCard label={t("common_net_kg")} value={formatCompact(o.total_net_kg)} />
-        <StatCard label={t("analytics_value_per_kg")} value={formatMoney(o.avg_value_per_net_kg)} />
+        <StatCard
+          label={t("analytics_net_weight")}
+          value={<WeightSummary totals={o.measures.net_weight_totals} />}
+        />
+        <StatCard
+          label={t("analytics_value_per_weight")}
+          value={<ValuePerWeightSummary measures={o.measures} />}
+        />
         <StatCard label={t("analytics_companies")} value={formatInt(o.distinct_edrpou)} />
         <StatCard label={t("analytics_product_codes")} value={formatInt(o.distinct_product_codes)} />
         <StatCard
@@ -364,14 +400,19 @@ function OverviewPanel({
               {formatMonth(analytics.months[analytics.months.length - 1].month)}
             </div>
           </div>
-          <MonthChart months={analytics.months} metric="total_value_usd" onSelect={onMonth} />
+          <MonthChart
+            months={analytics.months}
+            metric={monthMetric}
+            onSelect={onMonth}
+            allowLegacyRawKg={legacyRawKg}
+          />
         </div>
       ) : null}
     </div>
   );
 }
 
-type MonthMetric = "total_value_usd" | "total_net_kg" | "rows";
+type MonthMetric = "value" | "net_weight" | "rows";
 
 type MonthSortField = "month" | "value" | "net_kg" | "rows" | "docs" | "mom";
 
@@ -383,21 +424,54 @@ function MonthsPanel({
   onMonth: (month: string) => void;
 }) {
   const { t } = useI18n();
-  const [metric, setMetric] = useState<MonthMetric>("total_value_usd");
+  const months = analytics.months;
+  const legacyRawKg = rawNetWeightIsKg(analytics.overview.measures);
+  const valueCurrency = commonCurrency(months);
+  const netIsComparable =
+    months.length > 0 &&
+    months.every((month) => safeNetWeightKg(month, legacyRawKg) !== null);
+  const defaultMetric: MonthMetric = valueCurrency
+    ? "value"
+    : netIsComparable
+      ? "net_weight"
+      : "rows";
+  const [metric, setMetric] = useState<MonthMetric>(defaultMetric);
   const [sortField, setSortField] = useState<MonthSortField>("month");
   const [dir, setDir] = useState<"asc" | "desc">("asc");
-  const months = analytics.months;
+
+  useEffect(() => {
+    if (
+      (metric === "value" && !valueCurrency) ||
+      (metric === "net_weight" && !netIsComparable)
+    ) {
+      setMetric(defaultMetric);
+    }
+  }, [defaultMetric, metric, netIsComparable, valueCurrency]);
 
   // Month-over-month is always computed against the chronological previous
   // month, so it stays correct no matter how the table is sorted.
   const enriched = useMemo(
     () =>
       months.map((m, i) => {
-        const prev = i > 0 ? months[i - 1].total_value_usd : null;
-        const mom = prev && prev > 0 ? ((m.total_value_usd - prev) / prev) * 100 : null;
-        return { ...m, mom };
+        const value = valueCurrency
+          ? compatibleCurrencyTotal(m)?.total_value ?? null
+          : null;
+        const previous =
+          i > 0 && valueCurrency
+            ? compatibleCurrencyTotal(months[i - 1])?.total_value ?? null
+            : null;
+        const mom =
+          value !== null && previous !== null && previous > 0
+            ? ((value - previous) / previous) * 100
+            : null;
+        return {
+          ...m,
+          compatibleValue: value,
+          compatibleNetKg: safeNetWeightKg(m, legacyRawKg),
+          mom,
+        };
       }),
-    [months],
+    [legacyRawKg, months, valueCurrency],
   );
 
   const sorted = useMemo(() => {
@@ -406,9 +480,9 @@ function MonthsPanel({
         case "month":
           return r.month;
         case "value":
-          return r.total_value_usd;
+          return r.compatibleValue ?? r.rows;
         case "net_kg":
-          return r.total_net_kg;
+          return r.compatibleNetKg ?? r.rows;
         case "rows":
           return r.rows;
         case "docs":
@@ -430,16 +504,31 @@ function MonthsPanel({
     return <EmptyState icon="analytics" title={t("analytics_no_group_data")} />;
   }
 
-  const totalValue = months.reduce((s, m) => s + m.total_value_usd, 0);
-  const totalNet = months.reduce((s, m) => s + m.total_net_kg, 0);
-  const peak = months.reduce((a, b) => (b.total_value_usd > a.total_value_usd ? b : a));
-  const first = months[0].total_value_usd;
-  const last = months[months.length - 1].total_value_usd;
-  const overall = first > 0 ? ((last - first) / first) * 100 : 0;
+  const totalValue = valueCurrency
+    ? enriched.reduce((sum, month) => sum + (month.compatibleValue ?? 0), 0)
+    : null;
+  const totalNet = netIsComparable
+    ? enriched.reduce((sum, month) => sum + (month.compatibleNetKg ?? 0), 0)
+    : null;
+  const peak = enriched.reduce((a, b) => {
+    const aValue = valueCurrency ? (a.compatibleValue ?? a.rows) : a.rows;
+    const bValue = valueCurrency ? (b.compatibleValue ?? b.rows) : b.rows;
+    return bValue > aValue ? b : a;
+  });
+  const first = enriched[0].compatibleValue;
+  const last = enriched[enriched.length - 1].compatibleValue;
+  const overall =
+    first !== null && last !== null && first > 0
+      ? ((last - first) / first) * 100
+      : null;
 
   const metricOptions: { id: MonthMetric; label: string }[] = [
-    { id: "total_value_usd", label: `${t("common_value")} USD` },
-    { id: "total_net_kg", label: t("common_net_kg") },
+    ...(valueCurrency
+      ? [{ id: "value" as const, label: `${t("common_value")} ${valueCurrency}` }]
+      : []),
+    ...(netIsComparable
+      ? [{ id: "net_weight" as const, label: t("common_net_kg") }]
+      : []),
     { id: "rows", label: t("common_rows") },
   ];
 
@@ -460,21 +549,30 @@ function MonthsPanel({
           the chart and the table below already carry the same numbers. */}
       <div className="panel panel-pad row wrap faint" style={{ gap: 14, fontSize: 12 }}>
         <span>
-          {formatInt(months.length)} {t("common_months").toLowerCase()} ·{" "}
-          {formatMonth(months[0].month)} → {formatMonth(months[months.length - 1].month)}
+          {formatInt(months.length)} {t("common_months").toLowerCase()} /{" "}
+          {formatMonth(months[0].month)} - {formatMonth(months[months.length - 1].month)}
         </span>
         <span>
           {t("analytics_peak_month")}: <strong>{formatMonth(peak.month)}</strong> (
-          {formatCompact(peak.total_value_usd)})
+          {formatCompact(valueCurrency ? (peak.compatibleValue ?? peak.rows) : peak.rows)}{" "}
+          {valueCurrency ?? t("common_rows")})
         </span>
-        <span>
-          {t("analytics_first_last")}:{" "}
-          <strong>{`${overall >= 0 ? "+" : ""}${formatPercent(overall, 0)}`}</strong>
-        </span>
-        <span>
-          {t("common_value")}: <strong>{formatCompact(totalValue)}</strong> ·{" "}
-          {t("common_net_kg")}: <strong>{formatCompact(totalNet)}</strong>
-        </span>
+        {overall !== null ? (
+          <span>
+            {t("analytics_first_last")}:{" "}
+            <strong>{`${overall >= 0 ? "+" : ""}${formatPercent(overall, 0)}`}</strong>
+          </span>
+        ) : null}
+        {totalValue !== null && valueCurrency ? (
+          <span>
+            {t("common_value")}: <strong>{formatCompact(totalValue)} {valueCurrency}</strong>
+          </span>
+        ) : null}
+        {totalNet !== null ? (
+          <span>
+            {t("analytics_net_weight")}: <strong>{formatCompact(totalNet)} kg</strong>
+          </span>
+        ) : null}
       </div>
 
       <div className="panel panel-pad">
@@ -495,7 +593,12 @@ function MonthsPanel({
             ))}
           </div>
         </div>
-        <MonthChart months={months} metric={metric} onSelect={onMonth} />
+        <MonthChart
+          months={months}
+          metric={metric}
+          onSelect={onMonth}
+          allowLegacyRawKg={legacyRawKg}
+        />
       </div>
 
       <div className="panel panel-pad">
@@ -505,8 +608,12 @@ function MonthsPanel({
             <thead>
               <tr>
                 <SortTh label={t("analytics_month")} onClick={() => setSort("month")} arrow={arrow("month")} />
-                <SortTh label={`${t("common_value")} USD`} onClick={() => setSort("value")} arrow={arrow("value")} />
-                <SortTh label={t("common_net_kg")} onClick={() => setSort("net_kg")} arrow={arrow("net_kg")} />
+                <SortTh
+                  label={valueCurrency ? `${t("common_value")} ${valueCurrency}` : t("analytics_value_by_currency")}
+                  onClick={() => setSort("value")}
+                  arrow={arrow("value")}
+                />
+                <SortTh label={t("analytics_net_weight")} onClick={() => setSort("net_kg")} arrow={arrow("net_kg")} />
                 <SortTh label={t("common_rows")} onClick={() => setSort("rows")} arrow={arrow("rows")} />
                 <SortTh label={t("common_declarations")} onClick={() => setSort("docs")} arrow={arrow("docs")} />
                 <SortTh label={t("analytics_mom")} onClick={() => setSort("mom")} arrow={arrow("mom")} />
@@ -516,8 +623,16 @@ function MonthsPanel({
               {sorted.map((m) => (
                 <tr key={m.month} onClick={() => onMonth(m.month)} style={{ cursor: "pointer" }}>
                   <td>{formatMonth(m.month)}</td>
-                  <td>{formatMoney(m.total_value_usd)}</td>
-                  <td>{formatInt(m.total_net_kg)}</td>
+                  <td>
+                    <CurrencySummary measures={m.measures} legacyUsd={m.total_value_usd} />
+                  </td>
+                  <td>
+                    {m.compatibleNetKg !== null ? (
+                      `${formatInt(m.compatibleNetKg)} kg`
+                    ) : (
+                      <WeightSummary totals={m.measures.net_weight_totals} />
+                    )}
+                  </td>
                   <td>{formatInt(m.rows)}</td>
                   <td>{formatInt(m.declarations)}</td>
                   <td
@@ -547,6 +662,7 @@ function MonthsPanel({
 // size, and the visible table gets the full height.
 function SectionGroupPanel({
   sections,
+  overview,
   limit,
   onLimit,
   onRow,
@@ -554,6 +670,7 @@ function SectionGroupPanel({
   extraControls,
 }: {
   sections: AnalyticsSection[];
+  overview: AnalyticsOverview;
   limit: number;
   onLimit: (n: number) => void;
   onRow: (section: AnalyticsSection, action: AnalyticsFilterAction) => void;
@@ -593,6 +710,7 @@ function SectionGroupPanel({
       <SectionTable
         title={sectionTitle(active.kind, t)}
         section={active}
+        overview={overview}
         limit={limit}
         onRow={(action) => onRow(active, action)}
         hint={hintFor?.(active)}
@@ -607,9 +725,10 @@ type SortField = "name" | "share" | "rows" | "value" | "net_kg" | "vpk";
 // A full, sortable, filterable, exportable ranking table — the "see all"
 // replacement for the old top-N teaser. Sort/filter run client-side over the
 // rows already fetched (up to `limit`).
-function SectionTable({
+export function SectionTable({
   title,
   section,
+  overview,
   limit,
   onRow,
   hint,
@@ -617,13 +736,16 @@ function SectionTable({
 }: {
   title: string;
   section: AnalyticsSection;
+  overview: AnalyticsOverview;
   limit: number;
   onRow?: (action: AnalyticsFilterAction) => void;
   hint?: string;
   fullHeight?: boolean;
 }) {
   const { t } = useI18n();
-  const [sortField, setSortField] = useState<SortField>("value");
+  const valueCurrency = compatibleCurrencyTotal(overview)?.currency ?? null;
+  const legacyRawKg = rawNetWeightIsKg(overview.measures);
+  const [sortField, setSortField] = useState<SortField>("rows");
   const [dir, setDir] = useState<"asc" | "desc">("desc");
   const [filter, setFilter] = useState("");
 
@@ -637,15 +759,23 @@ function SectionTable({
         case "name":
           return r.label.toLowerCase();
         case "share":
-          return r.share_percent;
+          return safeRowShare(r, overview.row_count, valueCurrency !== null);
         case "rows":
           return r.rows;
-        case "value":
-          return r.total_value_usd;
+        case "value": {
+          const total = compatibleCurrencyTotal(r);
+          return valueCurrency && total?.currency === valueCurrency
+            ? total.total_value
+            : r.rows;
+        }
         case "net_kg":
-          return r.total_net_kg;
-        case "vpk":
-          return r.avg_value_per_net_kg;
+          return safeNetWeightKg(r, legacyRawKg) ?? r.rows;
+        case "vpk": {
+          const ratio = safeValuePerNetWeight(r, legacyRawKg);
+          return valueCurrency && ratio?.currency === valueCurrency
+            ? (ratio.value_per_weight ?? r.rows)
+            : r.rows;
+        }
       }
     };
     list.sort((a, b) => {
@@ -658,7 +788,7 @@ function SectionTable({
       return dir === "asc" ? cmp : -cmp;
     });
     return list;
-  }, [section.rows, filter, sortField, dir]);
+  }, [section.rows, filter, sortField, dir, legacyRawKg, overview.row_count, valueCurrency]);
 
   const setSort = (field: SortField) => {
     if (field === sortField) {
@@ -672,15 +802,50 @@ function SectionTable({
     sortField === field ? (dir === "asc" ? " ▲" : " ▼") : "";
 
   const exportCsv = () => {
-    const headers = ["Name", "Share %", "Rows", "Value USD", "Net kg", "Value/kg"];
-    const data = rows.map((r) => [
-      r.label,
-      r.share_percent.toFixed(2),
-      r.rows,
-      r.total_value_usd.toFixed(2),
-      r.total_net_kg.toFixed(3),
-      r.avg_value_per_net_kg.toFixed(2),
-    ]);
+    const headers = [
+      t("col_name"),
+      t("analytics_rows_share"),
+      t("common_rows"),
+      t("analytics_value_by_currency"),
+      t("analytics_net_weight"),
+      t("analytics_value_per_weight"),
+    ];
+    const data = rows.map((r) => {
+      const currencyTotals =
+        r.measures.currency_totals.length > 0
+          ? r.measures.currency_totals
+          : compatibleCurrencyTotal(r)
+            ? [compatibleCurrencyTotal(r)!]
+            : [];
+      const value = currencyTotals
+        .map((total) =>
+          `${total.total_value} ${total.known ? total.currency : t("analytics_unknown_currency")}`,
+        )
+        .join(" | ");
+      const weight = r.measures.net_weight_totals
+        .map((total) => {
+          const sourceUnit = total.source_unit || t("analytics_unknown_unit");
+          return total.known && total.normalized_unit === "kg" && total.total_kg !== null
+            ? `${total.total_source_weight} ${sourceUnit} -> ${total.total_kg} kg`
+            : `${total.total_source_weight} ${sourceUnit}`;
+        })
+        .join(" | ");
+      const ratios = r.measures.value_per_net_weight
+        .filter((ratio) => ratio.value_per_weight !== null)
+        .map(
+          (ratio) =>
+            `${ratio.value_per_weight} ${ratio.currency}/${ratio.normalized_weight_unit}`,
+        )
+        .join(" | ");
+      return [
+        r.label,
+        safeRowShare(r, overview.row_count, valueCurrency !== null).toFixed(2),
+        r.rows,
+        value,
+        weight,
+        ratios,
+      ];
+    });
     downloadCsv(title.replace(/[^\w]+/g, "_").toLowerCase() || "section", headers, data);
   };
 
@@ -721,11 +886,11 @@ function SectionTable({
               <thead>
                 <tr>
                   <SortTh label={t("col_name")} onClick={() => setSort("name")} arrow={arrow("name")} />
-                  <SortTh label={t("col_share")} onClick={() => setSort("share")} arrow={arrow("share")} />
+                  <SortTh label={t("analytics_rows_share")} onClick={() => setSort("share")} arrow={arrow("share")} />
                   <SortTh label={t("common_rows")} onClick={() => setSort("rows")} arrow={arrow("rows")} />
-                  <SortTh label={`${t("common_value")} USD`} onClick={() => setSort("value")} arrow={arrow("value")} />
-                  <SortTh label={t("common_net_kg")} onClick={() => setSort("net_kg")} arrow={arrow("net_kg")} />
-                  <SortTh label={t("analytics_value_per_kg")} onClick={() => setSort("vpk")} arrow={arrow("vpk")} />
+                  <SortTh label={t("analytics_value_by_currency")} onClick={() => setSort("value")} arrow={arrow("value")} />
+                  <SortTh label={t("analytics_net_weight")} onClick={() => setSort("net_kg")} arrow={arrow("net_kg")} />
+                  <SortTh label={t("analytics_value_per_weight")} onClick={() => setSort("vpk")} arrow={arrow("vpk")} />
                 </tr>
               </thead>
               <tbody>
@@ -736,11 +901,28 @@ function SectionTable({
                     style={{ cursor: row.filter_action && onRow ? "pointer" : "default" }}
                   >
                     <td title={row.label} style={{ maxWidth: 320 }}>{row.label || "—"}</td>
-                    <td>{formatPercent(row.share_percent)}</td>
+                    <td>
+                      {formatPercent(
+                        safeRowShare(row, overview.row_count, valueCurrency !== null),
+                      )}
+                    </td>
                     <td>{formatInt(row.rows)}</td>
-                    <td>{formatMoney(row.total_value_usd)}</td>
-                    <td>{formatInt(row.total_net_kg)}</td>
-                    <td>{formatMoney(row.avg_value_per_net_kg)}</td>
+                    <td>
+                      <CurrencySummary measures={row.measures} legacyUsd={row.total_value_usd} />
+                    </td>
+                    <td>
+                      {safeNetWeightKg(row, legacyRawKg) !== null ? (
+                        `${formatInt(safeNetWeightKg(row, legacyRawKg) ?? 0)} kg`
+                      ) : (
+                        <WeightSummary totals={row.measures.net_weight_totals} />
+                      )}
+                    </td>
+                    <td>
+                      <ValuePerWeightSummary
+                        measures={row.measures}
+                        legacyUsdPerKg={legacyRawKg ? row.avg_value_per_net_kg : undefined}
+                      />
+                    </td>
                   </tr>
                 ))}
               </tbody>
@@ -757,10 +939,16 @@ function SectionTable({
 }
 
 function SortTh({ label, onClick, arrow }: { label: string; onClick: () => void; arrow: string }) {
+  const ariaSort = arrow.includes("▲")
+    ? "ascending"
+    : arrow.includes("▼")
+      ? "descending"
+      : "none";
   return (
-    <th onClick={onClick} style={{ cursor: "pointer", userSelect: "none" }} title="Sort">
-      {label}
-      {arrow}
+    <th aria-sort={ariaSort}>
+      <button className="sort-button" type="button" onClick={onClick}>
+        {label}<span aria-hidden="true">{arrow}</span>
+      </button>
     </th>
   );
 }
@@ -923,7 +1111,7 @@ function PivotPanel() {
     try {
       setResult(await api.pivot(query, rowDim, colDim, metric, 20, 12));
     } catch (err) {
-      setError((err as ApiError)?.message ?? "Pivot failed");
+      setError((err as ApiError)?.message ?? t("pivot_failed"));
     } finally {
       setLoading(false);
     }
@@ -1044,7 +1232,7 @@ function ReportPanel() {
     api
       .analytics(query, null, 10, 12, "sqlite", true)
       .then((res) => alive && setAnalytics(res.data))
-      .catch((err) => alive && setError((err as ApiError)?.message ?? "Report failed"))
+      .catch((err) => alive && setError((err as ApiError)?.message ?? t("report_failed")))
       .finally(() => alive && setLoading(false));
     return () => {
       alive = false;
@@ -1061,7 +1249,7 @@ function ReportPanel() {
       toast(t("report_popup_blocked"), "error");
       return;
     }
-    win.document.write(buildReportHtml(analytics, query, titleOf));
+    win.document.write(buildReportHtml(analytics, query, titleOf, t));
     win.document.close();
     win.focus();
     setTimeout(() => win.print(), 300);
@@ -1069,7 +1257,7 @@ function ReportPanel() {
 
   const copyReport = async () => {
     if (!analytics) return;
-    const ok = await copyText(buildReportText(analytics, query));
+    const ok = await copyText(buildReportText(analytics, query, t));
     toast(ok ? t("report_copied") : t("report_copy_failed"), ok ? "success" : "error");
   };
 
@@ -1083,7 +1271,7 @@ function ReportPanel() {
       <div className="panel panel-pad row wrap" style={{ justifyContent: "space-between", gap: 10 }}>
         <div>
           <div className="section-title" style={{ margin: 0 }}>{t("report_title")}</div>
-          <div className="faint" style={{ fontSize: 12, marginTop: 4 }}>{queryLabel(query)}</div>
+          <div className="faint" style={{ fontSize: 12, marginTop: 4 }}>{queryLabel(query, t)}</div>
         </div>
         <div className="row" style={{ gap: 8 }}>
           <button className="btn btn-sm" onClick={copyReport}>
@@ -1105,12 +1293,17 @@ function ReportPanel() {
           />
         ) : null}
         <StatCard
-          label={`${t("common_value")} USD`}
-          value={formatCompact(o.total_value_usd)}
-          hint={formatMoney(o.total_value_usd)}
+          label={t("analytics_value_by_currency")}
+          value={<CurrencySummary measures={o.measures} legacyUsd={o.total_value_usd} />}
         />
-        <StatCard label={t("common_net_kg")} value={formatCompact(o.total_net_kg)} />
-        <StatCard label={t("analytics_value_per_kg")} value={formatMoney(o.avg_value_per_net_kg)} />
+        <StatCard
+          label={t("analytics_net_weight")}
+          value={<WeightSummary totals={o.measures.net_weight_totals} />}
+        />
+        <StatCard
+          label={t("analytics_value_per_weight")}
+          value={<ValuePerWeightSummary measures={o.measures} />}
+        />
         <StatCard label={t("analytics_companies")} value={formatInt(o.distinct_edrpou)} />
       </div>
 
@@ -1118,11 +1311,13 @@ function ReportPanel() {
         <ReportSection
           title={t("analytics_companies")}
           sections={analytics.company_sections}
+          overview={o}
           titleOf={titleOf}
         />
         <ReportSection
           title={t("analytics_products")}
           sections={analytics.product_sections}
+          overview={o}
           titleOf={titleOf}
         />
       </div>
@@ -1130,6 +1325,7 @@ function ReportPanel() {
         <ReportSection
           title={t("analytics_countries")}
           sections={analytics.country_sections}
+          overview={o}
           titleOf={titleOf}
         />
         <div className="panel panel-pad">
@@ -1144,10 +1340,12 @@ function ReportPanel() {
 function ReportSection({
   title,
   sections,
+  overview,
   titleOf,
 }: {
   title: string;
   sections: AnalyticsSection[];
+  overview: AnalyticsOverview;
   titleOf: (kind: string) => string;
 }) {
   const { t } = useI18n();
@@ -1180,8 +1378,17 @@ function ReportSection({
                 >
                   {row.label || "—"}
                 </span>
-                <span className="faint">
-                  {formatCompact(row.total_value_usd)} · {formatPercent(row.share_percent)}
+                <span className="report-row-measures">
+                  <CurrencySummary measures={row.measures} legacyUsd={row.total_value_usd} />
+                  <span className="faint">
+                    {formatPercent(
+                      safeRowShare(
+                        row,
+                        overview.row_count,
+                        compatibleCurrencyTotal(overview) !== null,
+                      ),
+                    )}
+                  </span>
                 </span>
               </div>
             ))}
@@ -1248,7 +1455,7 @@ function ComparePanel() {
       setLeftQuery(query);
       setRightQuery(other);
     } catch (err) {
-      setError((err as ApiError)?.message ?? "Compare failed");
+      setError((err as ApiError)?.message ?? t("compare_failed"));
     } finally {
       setLoading(false);
     }
@@ -1289,8 +1496,8 @@ function ComparePanel() {
       {left && right && leftQuery && rightQuery ? (
         <>
           <div className="grid-2">
-            <CompareCard title={t("compare_current")} label={queryLabel(leftQuery)} data={left} />
-            <CompareCard title={t("compare_other")} label={queryLabel(rightQuery)} data={right} />
+            <CompareCard title={t("compare_current")} label={queryLabel(leftQuery, t)} data={left} />
+            <CompareCard title={t("compare_other")} label={queryLabel(rightQuery, t)} data={right} />
           </div>
           <div className="panel panel-pad">
             <div className="section-title">{t("compare_difference")}</div>
@@ -1307,9 +1514,7 @@ function ComparePanel() {
                 <tbody>
                   <CompareRow label={t("common_rows")} a={left.overview.row_count} b={right.overview.row_count} kind="int" />
                   <CompareRow label={t("common_declarations")} a={left.overview.declaration_count} b={right.overview.declaration_count} kind="int" />
-                  <CompareRow label={`${t("common_value")} USD`} a={left.overview.total_value_usd} b={right.overview.total_value_usd} kind="money" />
-                  <CompareRow label={t("common_net_kg")} a={left.overview.total_net_kg} b={right.overview.total_net_kg} kind="int" />
-                  <CompareRow label={t("analytics_value_per_kg")} a={left.overview.avg_value_per_net_kg} b={right.overview.avg_value_per_net_kg} kind="money" />
+                  <MeasureCompareRows left={left.overview} right={right.overview} />
                   <CompareRow label={t("analytics_companies")} a={left.overview.distinct_edrpou} b={right.overview.distinct_edrpou} kind="int" />
                 </tbody>
               </table>
@@ -1324,7 +1529,7 @@ function ComparePanel() {
 function CompareCard({ title, label, data }: { title: string; label: string; data: Analytics }) {
   const { t } = useI18n();
   const o = data.overview;
-  const line = (name: string, value: string) => (
+  const line = (name: string, value: ReactNode) => (
     <div className="row" style={{ justifyContent: "space-between", padding: "3px 0" }}>
       <span className="faint">{name}</span>
       <strong>{value}</strong>
@@ -1337,10 +1542,78 @@ function CompareCard({ title, label, data }: { title: string; label: string; dat
         {label}
       </div>
       {line(t("common_rows"), formatInt(o.row_count))}
-      {line(`${t("common_value")} USD`, formatCompact(o.total_value_usd))}
-      {line(t("common_net_kg"), formatCompact(o.total_net_kg))}
-      {line(t("analytics_value_per_kg"), formatMoney(o.avg_value_per_net_kg))}
+      {line(
+        t("analytics_value_by_currency"),
+        <CurrencySummary measures={o.measures} legacyUsd={o.total_value_usd} />,
+      )}
+      {line(t("analytics_net_weight"), <WeightSummary totals={o.measures.net_weight_totals} />)}
+      {line(
+        t("analytics_value_per_weight"),
+        <ValuePerWeightSummary measures={o.measures} />,
+      )}
     </div>
+  );
+}
+
+function MeasureCompareRows({
+  left,
+  right,
+}: {
+  left: AnalyticsOverview;
+  right: AnalyticsOverview;
+}) {
+  const { t } = useI18n();
+  const leftValue = compatibleCurrencyTotal(left);
+  const rightValue = compatibleCurrencyTotal(right);
+  const leftNet = safeNetWeightKg(left, rawNetWeightIsKg(left.measures));
+  const rightNet = safeNetWeightKg(right, rawNetWeightIsKg(right.measures));
+  const leftRatio = safeValuePerNetWeight(left, rawNetWeightIsKg(left.measures));
+  const rightRatio = safeValuePerNetWeight(right, rawNetWeightIsKg(right.measures));
+  const comparableValue =
+    leftValue && rightValue && leftValue.currency === rightValue.currency
+      ? { currency: leftValue.currency, a: leftValue.total_value, b: rightValue.total_value }
+      : null;
+  const comparableRatio =
+    leftRatio &&
+    rightRatio &&
+    leftRatio.currency === rightRatio.currency &&
+    leftRatio.normalized_weight_unit === rightRatio.normalized_weight_unit &&
+    leftRatio.value_per_weight !== null &&
+    rightRatio.value_per_weight !== null
+      ? {
+          unit: `${leftRatio.currency}/${leftRatio.normalized_weight_unit}`,
+          a: leftRatio.value_per_weight,
+          b: rightRatio.value_per_weight,
+        }
+      : null;
+
+  return (
+    <>
+      {comparableValue ? (
+        <CompareRow
+          label={`${t("common_value")} ${comparableValue.currency}`}
+          a={comparableValue.a}
+          b={comparableValue.b}
+          kind="money"
+        />
+      ) : null}
+      {leftNet !== null && rightNet !== null ? (
+        <CompareRow
+          label={`${t("analytics_net_weight")} (kg)`}
+          a={leftNet}
+          b={rightNet}
+          kind="int"
+        />
+      ) : null}
+      {comparableRatio ? (
+        <CompareRow
+          label={`${t("analytics_value_per_weight")} (${comparableRatio.unit})`}
+          a={comparableRatio.a}
+          b={comparableRatio.b}
+          kind="money"
+        />
+      ) : null}
+    </>
   );
 }
 

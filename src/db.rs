@@ -489,13 +489,29 @@ impl Db {
         )
     }
 
+    pub fn capture_search_snapshot(&self) -> rusqlite::Result<u64> {
+        result_repo::capture_search_snapshot(&self.conn)
+    }
+
     pub fn count(&self, q: &Query) -> rusqlite::Result<u64> {
-        result_repo::count(&self.conn, self.filter_plan(q)?)
+        self.count_at_snapshot(q, self.capture_search_snapshot()?)
+    }
+
+    pub fn count_at_snapshot(&self, q: &Query, snapshot: u64) -> rusqlite::Result<u64> {
+        result_repo::count(&self.conn, self.filter_plan(q)?, snapshot)
     }
 
     /// Legacy fixed-schema result page.
     pub fn search_page(&self, q: &Query, limit: u64, offset: u64) -> rusqlite::Result<SearchPage> {
-        result_repo::legacy_search_page(&self.conn, q, self.filter_plan(q)?, limit, offset)
+        let snapshot = self.capture_search_snapshot()?;
+        result_repo::legacy_search_page(
+            &self.conn,
+            q,
+            self.filter_plan(q)?,
+            snapshot,
+            limit,
+            offset,
+        )
     }
 
     pub fn search_page_dynamic(
@@ -550,6 +566,18 @@ impl Db {
         offset: u64,
         sort: Option<ResultSort>,
     ) -> rusqlite::Result<DynamicSearchPage> {
+        let snapshot = self.capture_search_snapshot()?;
+        self.search_page_dynamic_sorted_at_snapshot(q, limit, offset, sort, snapshot)
+    }
+
+    pub fn search_page_dynamic_sorted_at_snapshot(
+        &self,
+        q: &Query,
+        limit: u64,
+        offset: u64,
+        sort: Option<ResultSort>,
+        snapshot: u64,
+    ) -> rusqlite::Result<DynamicSearchPage> {
         let source_fields = source_schemas::field_lookup(&self.conn)?;
         let fields = self.result_fields_for_query_with(q, &source_fields)?;
         result_repo::dynamic_search_page(
@@ -557,6 +585,7 @@ impl Db {
             q,
             fields,
             self.filter_plan(q)?,
+            snapshot,
             limit,
             offset,
             sort.as_ref(),
@@ -910,15 +939,19 @@ impl Db {
         maintenance::compact_duplicate_payloads(&mut self.conn, cancel, options, progress)
     }
 
-    /// Full cleanup: removes all records and import logs, then returns disk
-    /// space via VACUUM. Settings such as language and theme are preserved.
+    /// Full cleanup: removes imported records and every source-shape artifact,
+    /// then returns disk space via VACUUM. Workspace settings and accounts are
+    /// preserved.
     pub fn clear_all(&mut self) -> rusqlite::Result<()> {
         self.conn.execute_batch("BEGIN IMMEDIATE;")?;
         let result = (|| -> rusqlite::Result<()> {
             self.conn.execute_batch(
-                "DELETE FROM records_fts;
+                "INSERT INTO records_fts(records_fts) VALUES('delete-all');
                  DELETE FROM records;
-                 DELETE FROM import_log;",
+                 DELETE FROM import_log;
+                 DELETE FROM import_sources;
+                 DELETE FROM source_columns;
+                 DELETE FROM source_schemas;",
             )?;
             meta::delete(&self.conn, meta::EXTRA_HEADERS_KEY)?;
             meta::delete(&self.conn, table_shape::TABLE_SHAPE_KEY)?;

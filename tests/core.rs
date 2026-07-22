@@ -222,6 +222,22 @@ fn write_owned_test_xlsx(path: &Path, rows: &[Vec<(String, String)>]) {
     workbook.save(path).unwrap();
 }
 
+fn write_arbitrary_xlsx(path: &Path, headers: &[&str], rows: &[&[&str]]) {
+    let mut workbook = rust_xlsxwriter::Workbook::new();
+    let sheet = workbook.add_worksheet();
+    for (column, header) in headers.iter().enumerate() {
+        sheet.write_string(0, column as u16, *header).unwrap();
+    }
+    for (row_index, row) in rows.iter().enumerate() {
+        for (column, value) in row.iter().enumerate() {
+            sheet
+                .write_string((row_index + 1) as u32, column as u16, *value)
+                .unwrap();
+        }
+    }
+    workbook.save(path).unwrap();
+}
+
 fn sample_rows() -> Vec<Vec<(&'static str, &'static str)>> {
     vec![
         vec![
@@ -3704,4 +3720,106 @@ fn value_normalization() {
     assert_eq!(parse_number_grouped("13804.656"), Some(13804.656));
     assert_eq!(parse_number_grouped("1 234,56"), Some(1234.56));
     assert_eq!(parse_number_grouped("$ 300,25"), Some(300.25));
+
+    // Internal operators and malformed grouping must never be silently
+    // discarded and concatenated into a different valid number.
+    for malformed in [
+        "12-34", "1+2", "1.2.3", "1,2,3", "1 23 456", "1,,234", "12kg34", "1e", "e3", "1e+",
+        "1e 3", "--12",
+    ] {
+        assert_eq!(parse_number(malformed), None, "accepted {malformed:?}");
+        assert_eq!(
+            parse_number_grouped(malformed),
+            None,
+            "accepted grouped {malformed:?}"
+        );
+    }
+
+    // Common locale forms remain supported.
+    assert_eq!(parse_number("+1\u{00a0}234,50"), Some(1234.5));
+    assert_eq!(parse_number("-1'234.50 kg"), Some(-1234.5));
+    assert_eq!(parse_number("EUR 1 234,56"), Some(1234.56));
+    assert_eq!(parse_number("€\u{00a0}300,25"), Some(300.25));
+    assert_eq!(parse_number("25 %"), Some(25.0));
+    assert_eq!(parse_number("12.5 kg"), Some(12.5));
+    assert_eq!(
+        parse_number("1\u{202f}234\u{202f}567,89"),
+        Some(1_234_567.89)
+    );
+    assert_eq!(parse_number("1.234.567,89"), Some(1_234_567.89));
+    assert_eq!(parse_number("1,234,567.89"), Some(1_234_567.89));
+    assert_eq!(parse_number(".5"), Some(0.5));
+    assert_eq!(parse_number("-.5"), Some(-0.5));
+    assert_eq!(parse_number("6.02e23"), Some(6.02e23));
+}
+
+#[test]
+fn clear_all_removes_source_history_without_losing_workspace_settings() {
+    let dir = tempfile::tempdir().unwrap();
+    let first = dir.path().join("first-shape.xlsx");
+    let second = dir.path().join("second-shape.xlsx");
+    let db_path = dir.path().join("clear-shape.db");
+    write_arbitrary_xlsx(
+        &first,
+        &["Legacy SKU", "Legacy Price", "Legacy Warehouse"],
+        &[&["OLD-1", "100", "Old location"]],
+    );
+    write_arbitrary_xlsx(
+        &second,
+        &["Asset Tag", "Current Location", "Condition"],
+        &[&["NEW-1", "Kyiv", "Ready"]],
+    );
+
+    let cancel = AtomicBool::new(false);
+    let mut db = Db::open(&db_path).unwrap();
+    #[cfg(feature = "browser")]
+    base_search::server::add_account(
+        &db_path,
+        "release-owner",
+        "correct horse battery staple",
+        "owner",
+    )
+    .unwrap();
+    db.meta_set("ui_theme", "dark");
+    let first_summary = import::import_file(&mut db, &first, &cancel, &mut |_, _, _| {});
+    assert_eq!(first_summary.error, None);
+    assert_eq!(first_summary.imported, 1);
+    assert!(!db.list_source_schemas().unwrap().is_empty());
+    assert!(!db.list_import_sources().unwrap().is_empty());
+    assert!(
+        db.table_shape()
+            .unwrap()
+            .columns
+            .iter()
+            .any(|column| column.header == "Legacy SKU")
+    );
+
+    db.clear_all().unwrap();
+
+    assert_eq!(db.total_rows(), 0);
+    assert!(db.import_log(10).is_empty());
+    assert!(db.list_source_schemas().unwrap().is_empty());
+    assert!(db.list_import_sources().unwrap().is_empty());
+    assert!(db.table_shape().is_none());
+    assert_eq!(db.meta_get("ui_theme").as_deref(), Some("dark"));
+    #[cfg(feature = "browser")]
+    assert!(
+        base_search::server::list_accounts(&db_path)
+            .unwrap()
+            .iter()
+            .any(|(username, _, _)| username == "release-owner")
+    );
+
+    let second_summary = import::import_file(&mut db, &second, &cancel, &mut |_, _, _| {});
+    assert_eq!(second_summary.error, None);
+    assert_eq!(second_summary.imported, 1);
+    let headers = db
+        .table_shape()
+        .unwrap()
+        .columns
+        .into_iter()
+        .map(|column| column.header)
+        .collect::<Vec<_>>();
+    assert_eq!(headers, vec!["Asset Tag", "Current Location", "Condition"]);
+    assert!(!headers.iter().any(|header| header.starts_with("Legacy")));
 }

@@ -39,6 +39,12 @@ fn run_legacy_desktop() {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("Base Search")
+            .with_icon(
+                eframe::icon_data::from_png_bytes(include_bytes!(
+                    "../web-ui/public/base-search-icon.png"
+                ))
+                .expect("embedded Base Search icon must be a valid PNG"),
+            )
             .with_inner_size([1360.0, 850.0])
             .with_min_inner_size([960.0, 600.0]),
         ..Default::default()

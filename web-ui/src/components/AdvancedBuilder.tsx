@@ -11,6 +11,7 @@ import {
   type AdvancedDraftNode,
   type AdvancedGroupDraft,
 } from "../lib/advanced";
+import { useI18n } from "../lib/i18n";
 import { Icon } from "./Icon";
 
 interface AdvancedBuilderProps {
@@ -64,6 +65,7 @@ function GroupEditor({
   onChange: (group: AdvancedGroupDraft) => void;
   onRemove?: () => void;
 }) {
+  const { t } = useI18n();
   const replaceChild = (key: number, next: AdvancedDraftNode) => {
     onChange({
       ...group,
@@ -99,24 +101,24 @@ function GroupEditor({
           ))}
         </div>
         <span className="faint" style={{ fontSize: 12 }}>
-          {group.op === "And" ? "Match every item" : "Match any item"}
+          {group.op === "And" ? t("adv_match_every") : t("adv_match_any")}
         </span>
         <div className="grow" />
         <label className="check-row" style={{ margin: 0 }}>
           <input
             type="checkbox"
             checked={group.negated}
-            aria-label="Exclude group"
+            aria-label={t("adv_exclude_group")}
             onChange={(event) => onChange({ ...group, negated: event.target.checked })}
           />
-          <span>Exclude group</span>
+          <span>{t("adv_exclude_group")}</span>
         </label>
         {!root && onRemove ? (
           <button
             type="button"
             className="btn btn-ghost btn-sm"
             onClick={onRemove}
-            aria-label="Remove group"
+            aria-label={t("adv_remove_group")}
           >
             <Icon name="close" size={15} />
           </button>
@@ -146,7 +148,7 @@ function GroupEditor({
 
       {group.children.length === 0 ? (
         <div className="faint" style={{ fontSize: 12 }}>
-          No advanced conditions yet.
+          {t("adv_no_conditions")}
         </div>
       ) : null}
 
@@ -162,7 +164,7 @@ function GroupEditor({
           }
           disabled={fields.length === 0}
         >
-          <Icon name="plus" size={15} /> Add condition
+          <Icon name="plus" size={15} /> {t("adv_add_condition")}
         </button>
         <button
           type="button"
@@ -175,7 +177,7 @@ function GroupEditor({
           }
           disabled={fields.length === 0}
         >
-          <Icon name="plus" size={15} /> Add group
+          <Icon name="plus" size={15} /> {t("adv_add_group")}
         </button>
       </div>
     </div>
@@ -195,6 +197,7 @@ function ConditionEditor({
   onChange: (condition: AdvancedConditionDraft) => void;
   onRemove: () => void;
 }) {
+  const { t } = useI18n();
   const field = fields.find((candidate) => candidate.id === condition.fieldId);
   const operators = field?.operators ?? [condition.op];
   const unknownLabel = condition.fallbackField
@@ -225,7 +228,7 @@ function ConditionEditor({
         }}
       >
         {!field && unknownLabel ? (
-          <option value="">Unavailable field: {unknownLabel}</option>
+          <option value="">{t("adv_unavailable_field")} {unknownLabel}</option>
         ) : null}
         {fields.map((candidate) => (
           <option key={candidate.id} value={candidate.id}>
@@ -253,7 +256,7 @@ function ConditionEditor({
           <input
             className="input"
             style={{ width: 120 }}
-            placeholder="from"
+            placeholder={t("adv_from")}
             aria-label={`From ${index + 1}`}
             value={condition.from}
             onChange={(event) => update({ from: event.target.value })}
@@ -261,7 +264,7 @@ function ConditionEditor({
           <input
             className="input"
             style={{ width: 120 }}
-            placeholder="to"
+            placeholder={t("adv_to")}
             aria-label={`To ${index + 1}`}
             value={condition.to}
             onChange={(event) => update({ to: event.target.value })}
@@ -271,7 +274,7 @@ function ConditionEditor({
         <input
           className="input grow"
           style={{ minWidth: 170 }}
-          placeholder={condition.op === "IsAnyOf" ? "value1, value2, …" : "value"}
+          placeholder={condition.op === "IsAnyOf" ? t("adv_value_list") : t("adv_value")}
           aria-label={`Value ${index + 1}`}
           value={condition.single}
           onChange={(event) => update({ single: event.target.value })}
@@ -285,7 +288,7 @@ function ConditionEditor({
           aria-label={`Exclude condition ${index + 1}`}
           onChange={(event) => update({ negated: event.target.checked })}
         />
-        <span>NOT</span>
+        <span>{t("adv_not")}</span>
       </label>
 
       <button

@@ -9,6 +9,11 @@ fi
 platform="$1"
 package_dir="$(cd "$2" && pwd -P)"
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
+if [[ "${BASE_SEARCH_REQUIRE_SIGNING:-0}" == 1 ]]; then
+  require_signed=true
+else
+  require_signed=false
+fi
 
 case "$platform" in
   linux)
@@ -25,7 +30,22 @@ case "$platform" in
     ;;
 esac
 
-node "$repo_root/scripts/release-package.mjs" verify --root "$package_dir" --platform "$platform"
+node "$repo_root/scripts/release-package.mjs" verify \
+  --root "$package_dir" \
+  --platform "$platform" \
+  --require-signed "$require_signed"
+
+if [[ "$platform" == macos ]]; then
+  signing_state="$(node -e 'const m=require(process.argv[1]); process.stdout.write(m.signing.macos_codesign);' "$package_dir/release-manifest.json")"
+  notarization_state="$(node -e 'const m=require(process.argv[1]); process.stdout.write(m.signing.macos_notarization);' "$package_dir/release-manifest.json")"
+  if [[ "$signing_state" == signed ]]; then
+    codesign --verify --strict --verbose=2 "$cli"
+    codesign --verify --deep --strict --verbose=2 "$package_dir/BaseSearch.app"
+  fi
+  if [[ "$notarization_state" == stapled ]]; then
+    xcrun stapler validate "$package_dir/BaseSearch.app"
+  fi
+fi
 
 port="$(node -e 'const net=require("node:net"); const s=net.createServer(); s.listen(0,"127.0.0.1",()=>{process.stdout.write(String(s.address().port)); s.close();});')"
 temp_root="$(mktemp -d "${TMPDIR:-/tmp}/base-search-package-smoke.XXXXXX")"

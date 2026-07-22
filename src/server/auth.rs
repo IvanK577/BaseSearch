@@ -6,7 +6,7 @@
 //! password-backed account and a persistent, server-side session.
 
 use std::path::{Path, PathBuf};
-use std::sync::{LazyLock, Mutex, MutexGuard};
+use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::extract::{Request, State};
@@ -16,6 +16,7 @@ use axum::response::{IntoResponse, Response};
 use rusqlite::{Connection, OptionalExtension, Transaction};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use super::error::ApiError;
 use super::login_limit::LoginRateLimiter;
@@ -28,6 +29,12 @@ pub const CSRF_HEADER_NAME: &str = "x-bs-csrf";
 
 const IDLE_SESSION_TTL: Duration = Duration::from_secs(12 * 3600);
 const ABSOLUTE_SESSION_TTL: Duration = Duration::from_secs(7 * 24 * 3600);
+const SESSION_TOUCH_INTERVAL: Duration = Duration::from_secs(5 * 60);
+const TOKEN_BYTES: usize = 32;
+const TOKEN_HEX_LENGTH: usize = TOKEN_BYTES * 2;
+const MAX_PASSWORD_BYTES: usize = 1_024;
+const MAX_ACTIVE_SESSIONS_PER_USER: usize = 10;
+const MAX_CONCURRENT_PASSWORD_VERIFICATIONS: usize = 2;
 
 static DUMMY_PASSWORD_HASH: LazyLock<String> = LazyLock::new(|| {
     use argon2::password_hash::SaltString;
@@ -155,6 +162,12 @@ pub struct SessionCredentials {
     pub csrf_token: String,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct UserMutation {
+    pub role: Role,
+    pub created: bool,
+}
+
 /// The established `<db>.auth.db` path. This intentionally preserves the V1/V2
 /// companion-file name so existing accounts migrate in place.
 pub fn auth_db_path(db_path: &Path) -> PathBuf {
@@ -198,10 +211,20 @@ impl AuthStore {
         .map_err(|err| err.to_string())
     }
 
-    /// Adds an account or updates an existing account without replacing its
-    /// stable id or creation timestamp. Updating credentials or role revokes all
-    /// previously issued sessions for that user.
+    /// Compatibility wrapper for callers that do not need mutation details.
     pub fn add_user(&self, username: &str, password: &str, role: Role) -> Result<(), String> {
+        self.add_user_with_result(username, password, role)
+            .map(|_| ())
+    }
+
+    /// Creates or updates one account without changing its stable identity.
+    /// The first account must explicitly request the Owner role.
+    pub(crate) fn add_user_with_result(
+        &self,
+        username: &str,
+        password: &str,
+        role: Role,
+    ) -> Result<UserMutation, String> {
         let username = validate_username(username)?;
         validate_password(password)?;
         let password_hash = hash_password(password)?;
@@ -212,8 +235,8 @@ impl AuthStore {
         let tx = conn.transaction().map_err(|err| err.to_string())?;
         let existing = user_by_username(&tx, username)?;
 
-        if let Some(existing) = existing {
-            protect_privileged_transition(&tx, existing.role, existing.enabled, role, true)?;
+        let mutation = if let Some(existing) = existing {
+            protect_owner_transition(&tx, existing.role, existing.enabled, role, true)?;
             tx.execute(
                 "UPDATE users
                  SET password_hash = ?1,
@@ -226,29 +249,30 @@ impl AuthStore {
             )
             .map_err(|err| err.to_string())?;
             revoke_user_sessions_tx(&tx, &existing.id, now)?;
+            UserMutation {
+                role,
+                created: false,
+            }
         } else {
-            let effective_role = if active_privileged_count(&tx)? == 0 {
-                Role::Owner
-            } else {
-                role
-            };
+            if active_owner_count(&tx)? == 0 && role != Role::Owner {
+                return Err("The first account must explicitly use the owner role.".to_string());
+            }
             let id = random_identifier()?;
             tx.execute(
                 "INSERT INTO users(
                      id, username, password_hash, role, enabled, session_epoch,
                      created_at, updated_at
                  ) VALUES (?1, ?2, ?3, ?4, 1, 0, ?5, ?5)",
-                rusqlite::params![
-                    id,
-                    username,
-                    password_hash,
-                    effective_role.as_str(),
-                    now_text
-                ],
+                rusqlite::params![id, username, password_hash, role.as_str(), now_text],
             )
             .map_err(|err| err.to_string())?;
-        }
-        tx.commit().map_err(|err| err.to_string())
+            UserMutation {
+                role,
+                created: true,
+            }
+        };
+        tx.commit().map_err(|err| err.to_string())?;
+        Ok(mutation)
     }
 
     #[allow(dead_code)]
@@ -263,13 +287,7 @@ impl AuthStore {
         if existing.role == role {
             return Ok(());
         }
-        protect_privileged_transition(
-            &tx,
-            existing.role,
-            existing.enabled,
-            role,
-            existing.enabled,
-        )?;
+        protect_owner_transition(&tx, existing.role, existing.enabled, role, existing.enabled)?;
         tx.execute(
             "UPDATE users
              SET role = ?1, session_epoch = session_epoch + 1, updated_at = ?2
@@ -293,13 +311,7 @@ impl AuthStore {
         if existing.enabled == enabled {
             return Ok(());
         }
-        protect_privileged_transition(
-            &tx,
-            existing.role,
-            existing.enabled,
-            existing.role,
-            enabled,
-        )?;
+        protect_owner_transition(&tx, existing.role, existing.enabled, existing.role, enabled)?;
         tx.execute(
             "UPDATE users
              SET enabled = ?1, session_epoch = session_epoch + 1, updated_at = ?2
@@ -333,7 +345,7 @@ impl AuthStore {
         tx.commit().map_err(|err| err.to_string())
     }
 
-    /// Removes a user while preserving at least one enabled owner/admin route.
+    /// Removes a user while preserving at least one enabled workspace owner.
     pub fn remove_user(&self, username: &str) -> Result<bool, String> {
         let username = validate_username(username)?;
         let mut conn = self.connection()?;
@@ -341,8 +353,8 @@ impl AuthStore {
         let Some(existing) = user_by_username(&tx, username)? else {
             return Ok(false);
         };
-        if existing.enabled && existing.role.is_privileged() && active_privileged_count(&tx)? <= 1 {
-            return Err("Cannot remove the last enabled owner or administrator.".to_string());
+        if existing.enabled && existing.role == Role::Owner && active_owner_count(&tx)? <= 1 {
+            return Err("Cannot remove the last enabled owner.".to_string());
         }
         tx.execute("DELETE FROM users WHERE id = ?1", [&existing.id])
             .map_err(|err| err.to_string())?;
@@ -388,6 +400,9 @@ impl AuthStore {
 
     /// Returns the enabled account's role when the password is correct.
     pub fn verify(&self, username: &str, password: &str) -> Result<Option<Role>, String> {
+        if password.len() > MAX_PASSWORD_BYTES {
+            return Ok(None);
+        }
         let conn = self.connection()?;
         let found = conn
             .query_row(
@@ -427,6 +442,13 @@ impl AuthStore {
         let user = user_by_username(&tx, username)?
             .filter(|user| user.enabled)
             .ok_or_else(|| "Account is disabled or does not exist.".to_string())?;
+        prune_sessions_tx(&tx, now)?;
+        trim_user_sessions_tx(
+            &tx,
+            &user.id,
+            now,
+            MAX_ACTIVE_SESSIONS_PER_USER.saturating_sub(1),
+        )?;
         tx.execute(
             "INSERT INTO sessions(
                  token_hash, csrf_hash, user_id, role, session_epoch,
@@ -452,19 +474,19 @@ impl AuthStore {
     /// Resolves and slides a persistent session. Expired, revoked, disabled, or
     /// epoch-stale sessions are rejected and marked revoked.
     pub fn identify_session(&self, token: &str) -> Result<Option<Identity>, String> {
-        if token.is_empty() {
+        if !is_valid_token(token) {
             return Ok(None);
         }
         let token_hash = token_hash(token);
         let now = unix_timestamp()?;
-        let mut conn = self.connection()?;
-        let tx = conn.transaction().map_err(|err| err.to_string())?;
-        let found = tx
+        let conn = self.connection()?;
+        let found = conn
             .query_row(
                 "SELECT
                      u.id, u.username, u.role, u.enabled,
                      u.session_epoch, s.session_epoch,
-                     s.idle_expires_at, s.absolute_expires_at, s.revoked_at
+                     s.last_seen_at, s.idle_expires_at, s.absolute_expires_at,
+                     s.revoked_at
                  FROM sessions s
                  JOIN users u ON u.id = s.user_id
                  WHERE s.token_hash = ?1",
@@ -479,7 +501,8 @@ impl AuthStore {
                         row.get::<_, i64>(5)?,
                         row.get::<_, i64>(6)?,
                         row.get::<_, i64>(7)?,
-                        row.get::<_, Option<i64>>(8)?,
+                        row.get::<_, i64>(8)?,
+                        row.get::<_, Option<i64>>(9)?,
                     ))
                 },
             )
@@ -493,6 +516,7 @@ impl AuthStore {
             enabled,
             user_epoch,
             session_epoch,
+            last_seen_at,
             idle_expires_at,
             absolute_expires_at,
             revoked_at,
@@ -507,25 +531,25 @@ impl AuthStore {
             || now >= idle_expires_at
             || now >= absolute_expires_at;
         if invalid {
-            tx.execute(
+            conn.execute(
                 "UPDATE sessions SET revoked_at = COALESCE(revoked_at, ?1)
                  WHERE token_hash = ?2",
                 rusqlite::params![now, token_hash],
             )
             .map_err(|err| err.to_string())?;
-            tx.commit().map_err(|err| err.to_string())?;
             return Ok(None);
         }
 
-        let next_idle = (now + IDLE_SESSION_TTL.as_secs() as i64).min(absolute_expires_at);
-        tx.execute(
-            "UPDATE sessions
-             SET last_seen_at = ?1, idle_expires_at = ?2
-             WHERE token_hash = ?3",
-            rusqlite::params![now, next_idle, token_hash],
-        )
-        .map_err(|err| err.to_string())?;
-        tx.commit().map_err(|err| err.to_string())?;
+        if now.saturating_sub(last_seen_at) >= SESSION_TOUCH_INTERVAL.as_secs() as i64 {
+            let next_idle = (now + IDLE_SESSION_TTL.as_secs() as i64).min(absolute_expires_at);
+            conn.execute(
+                "UPDATE sessions
+                 SET last_seen_at = ?1, idle_expires_at = ?2
+                 WHERE token_hash = ?3",
+                rusqlite::params![now, next_idle, token_hash],
+            )
+            .map_err(|err| err.to_string())?;
+        }
         Ok(Some(Identity {
             user_id,
             username,
@@ -534,7 +558,7 @@ impl AuthStore {
     }
 
     pub fn revoke_session(&self, token: &str) -> Result<(), String> {
-        if token.is_empty() {
+        if !is_valid_token(token) {
             return Ok(());
         }
         let now = unix_timestamp()?;
@@ -550,7 +574,10 @@ impl AuthStore {
 
     #[allow(dead_code)]
     pub fn validate_csrf(&self, session_token: &str, csrf_token: &str) -> Result<bool, String> {
-        if self.identify_session(session_token)?.is_none() || csrf_token.is_empty() {
+        if !is_valid_token(session_token)
+            || !is_valid_token(csrf_token)
+            || self.identify_session(session_token)?.is_none()
+        {
             return Ok(false);
         }
         let conn = self.connection()?;
@@ -590,10 +617,19 @@ impl AuthStore {
 }
 
 /// Process-local authentication state. Persistent sessions remain in
-/// `AuthStore`; this value only owns bounded login-attempt backoff state.
-#[derive(Default)]
+/// `AuthStore`; this value owns bounded login backoff and Argon2 admission.
 pub struct Sessions {
     login_attempts: LoginRateLimiter,
+    password_verifications: Arc<Semaphore>,
+}
+
+impl Default for Sessions {
+    fn default() -> Self {
+        Self {
+            login_attempts: LoginRateLimiter::default(),
+            password_verifications: Arc::new(Semaphore::new(MAX_CONCURRENT_PASSWORD_VERIFICATIONS)),
+        }
+    }
 }
 
 impl Sessions {
@@ -601,16 +637,29 @@ impl Sessions {
         Self::default()
     }
 
-    pub(crate) fn begin_login(
+    pub(crate) fn check_login(
         &self,
         peer_ip: std::net::IpAddr,
         username: &str,
     ) -> Result<(), Duration> {
-        self.login_attempts.begin(peer_ip, username)
+        self.login_attempts.check(peer_ip, username)
+    }
+
+    pub(crate) fn record_login_failure(&self, peer_ip: std::net::IpAddr, username: &str) {
+        self.login_attempts.record_failure(peer_ip, username);
     }
 
     pub(crate) fn clear_login_attempts(&self, peer_ip: std::net::IpAddr, username: &str) {
         self.login_attempts.clear(peer_ip, username);
+    }
+
+    pub(crate) fn try_acquire_password_verification(
+        &self,
+    ) -> Result<OwnedSemaphorePermit, Duration> {
+        self.password_verifications
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| Duration::from_secs(1))
     }
 }
 
@@ -637,12 +686,12 @@ pub fn clear_csrf_cookie() -> String {
 }
 
 pub fn token_from_headers(headers: &HeaderMap) -> Option<String> {
-    cookie_value(headers, COOKIE_NAME)
+    cookie_value(headers, COOKIE_NAME).filter(|token| is_valid_token(token))
 }
 
 #[allow(dead_code)]
 pub fn csrf_token_from_cookie(headers: &HeaderMap) -> Option<String> {
-    cookie_value(headers, CSRF_COOKIE_NAME)
+    cookie_value(headers, CSRF_COOKIE_NAME).filter(|token| is_valid_token(token))
 }
 
 fn cookie_value(headers: &HeaderMap, name: &str) -> Option<String> {
@@ -813,10 +862,10 @@ fn user_by_username(tx: &Transaction<'_>, username: &str) -> Result<Option<Store
     .map_err(|err| err.to_string())
 }
 
-fn active_privileged_count(tx: &Transaction<'_>) -> Result<u64, String> {
+fn active_owner_count(tx: &Transaction<'_>) -> Result<u64, String> {
     tx.query_row(
         "SELECT COUNT(*) FROM users
-         WHERE enabled = 1 AND lower(role) IN ('owner', 'admin')",
+         WHERE enabled = 1 AND lower(role) = 'owner'",
         [],
         |row| row.get::<_, i64>(0),
     )
@@ -824,19 +873,17 @@ fn active_privileged_count(tx: &Transaction<'_>) -> Result<u64, String> {
     .map_err(|err| err.to_string())
 }
 
-fn protect_privileged_transition(
+fn protect_owner_transition(
     tx: &Transaction<'_>,
     old_role: Role,
     old_enabled: bool,
     new_role: Role,
     new_enabled: bool,
 ) -> Result<(), String> {
-    let removes_active_privilege =
-        old_enabled && old_role.is_privileged() && (!new_enabled || !new_role.is_privileged());
-    if removes_active_privilege && active_privileged_count(tx)? <= 1 {
-        return Err(
-            "Cannot disable or demote the last enabled owner or administrator.".to_string(),
-        );
+    let removes_active_owner =
+        old_enabled && old_role == Role::Owner && (!new_enabled || new_role != Role::Owner);
+    if removes_active_owner && active_owner_count(tx)? <= 1 {
+        return Err("Cannot disable or demote the last enabled owner.".to_string());
     }
     Ok(())
 }
@@ -849,6 +896,42 @@ fn revoke_user_sessions_tx(
     tx.execute(
         "UPDATE sessions SET revoked_at = COALESCE(revoked_at, ?1) WHERE user_id = ?2",
         rusqlite::params![revoked_at, user_id],
+    )
+    .map_err(|err| err.to_string())?;
+    Ok(())
+}
+
+fn prune_sessions_tx(tx: &Transaction<'_>, now: i64) -> Result<(), String> {
+    tx.execute(
+        "DELETE FROM sessions
+         WHERE revoked_at IS NOT NULL
+            OR idle_expires_at <= ?1
+            OR absolute_expires_at <= ?1",
+        [now],
+    )
+    .map_err(|err| err.to_string())?;
+    Ok(())
+}
+
+fn trim_user_sessions_tx(
+    tx: &Transaction<'_>,
+    user_id: &str,
+    now: i64,
+    keep: usize,
+) -> Result<(), String> {
+    tx.execute(
+        "DELETE FROM sessions
+         WHERE user_id = ?1
+           AND id NOT IN (
+               SELECT id FROM sessions
+               WHERE user_id = ?1
+                 AND revoked_at IS NULL
+                 AND idle_expires_at > ?2
+                 AND absolute_expires_at > ?2
+               ORDER BY created_at DESC, id DESC
+               LIMIT ?3
+           )",
+        rusqlite::params![user_id, now, keep as i64],
     )
     .map_err(|err| err.to_string())?;
     Ok(())
@@ -900,18 +983,18 @@ fn migrate_auth_schema(conn: &mut Connection) -> Result<(), String> {
     )
     .map_err(|err| err.to_string())?;
 
-    let owner_count: i64 = tx
+    let enabled_owner_count: i64 = tx
         .query_row(
-            "SELECT COUNT(*) FROM users WHERE lower(role) = 'owner'",
+            "SELECT COUNT(*) FROM users WHERE enabled = 1 AND lower(role) = 'owner'",
             [],
             |row| row.get(0),
         )
         .map_err(|err| err.to_string())?;
-    if owner_count == 0 {
+    if enabled_owner_count == 0 {
         let earliest_admin = tx
             .query_row(
                 "SELECT rowid FROM users
-                 WHERE lower(role) = 'admin'
+                 WHERE enabled = 1 AND lower(role) = 'admin'
                  ORDER BY created_at, rowid LIMIT 1",
                 [],
                 |row| row.get::<_, i64>(0),
@@ -922,7 +1005,8 @@ fn migrate_auth_schema(conn: &mut Connection) -> Result<(), String> {
             Some(rowid) => Some(rowid),
             None => tx
                 .query_row(
-                    "SELECT rowid FROM users ORDER BY created_at, rowid LIMIT 1",
+                    "SELECT rowid FROM users
+                     ORDER BY enabled DESC, created_at, rowid LIMIT 1",
                     [],
                     |row| row.get::<_, i64>(0),
                 )
@@ -930,8 +1014,11 @@ fn migrate_auth_schema(conn: &mut Connection) -> Result<(), String> {
                 .map_err(|err| err.to_string())?,
         };
         if let Some(rowid) = owner_rowid {
-            tx.execute("UPDATE users SET role = 'owner' WHERE rowid = ?1", [rowid])
-                .map_err(|err| err.to_string())?;
+            tx.execute(
+                "UPDATE users SET role = 'owner', enabled = 1 WHERE rowid = ?1",
+                [rowid],
+            )
+            .map_err(|err| err.to_string())?;
         }
     }
 
@@ -1010,6 +1097,10 @@ fn validate_username(username: &str) -> Result<&str, String> {
 fn validate_password(password: &str) -> Result<(), String> {
     if password.len() < 8 {
         Err("Password must be at least 8 characters.".to_string())
+    } else if password.len() > MAX_PASSWORD_BYTES {
+        Err(format!(
+            "Password cannot exceed {MAX_PASSWORD_BYTES} bytes."
+        ))
     } else {
         Ok(())
     }
@@ -1042,7 +1133,7 @@ fn verify_password(password: &str, stored: &str) -> bool {
 }
 
 fn random_token() -> Result<String, String> {
-    let mut bytes = [0u8; 32];
+    let mut bytes = [0u8; TOKEN_BYTES];
     getrandom::getrandom(&mut bytes).map_err(|err| format!("OS random generator failed: {err}"))?;
     Ok(hex_encode(&bytes))
 }
@@ -1055,6 +1146,10 @@ fn random_identifier() -> Result<String, String> {
 
 fn token_hash(token: &str) -> String {
     hex_encode(&Sha256::digest(token.as_bytes()))
+}
+
+fn is_valid_token(token: &str) -> bool {
+    token.len() == TOKEN_HEX_LENGTH && token.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 fn hex_encode(bytes: &[u8]) -> String {
@@ -1166,13 +1261,30 @@ mod tests {
     }
 
     #[test]
+    fn first_account_must_be_an_explicit_owner() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = AuthStore::open(&database_path(&temp)).unwrap();
+
+        let error = store
+            .add_user("viewer", "strong-password", Role::Viewer)
+            .unwrap_err();
+        assert!(error.contains("first account") && error.contains("owner"));
+        assert_eq!(store.user_count().unwrap(), 0);
+
+        store
+            .add_user("owner", "strong-password", Role::Owner)
+            .unwrap();
+        assert_eq!(store.user_role("owner").unwrap(), Some(Role::Owner));
+    }
+
+    #[test]
     fn persistent_session_survives_store_reopen_and_keeps_raw_tokens_out_of_db() {
         let temp = tempfile::tempdir().unwrap();
         let db_path = database_path(&temp);
         let credentials = {
             let store = AuthStore::open(&db_path).unwrap();
             store
-                .add_user("owner", "strong-password", Role::Admin)
+                .add_user("owner", "strong-password", Role::Owner)
                 .unwrap();
             let credentials = store.create_session("owner").unwrap();
             assert_eq!(
@@ -1239,12 +1351,15 @@ mod tests {
     }
 
     #[test]
-    fn last_privileged_account_cannot_be_removed_disabled_or_demoted() {
+    fn last_enabled_owner_cannot_be_removed_disabled_or_demoted() {
         let temp = tempfile::tempdir().unwrap();
         let db_path = database_path(&temp);
         let store = AuthStore::open(&db_path).unwrap();
         store
-            .add_user("owner", "strong-password", Role::Admin)
+            .add_user("owner", "strong-password", Role::Owner)
+            .unwrap();
+        store
+            .add_user("admin", "another-password", Role::Admin)
             .unwrap();
 
         assert!(store.remove_user("owner").is_err());
@@ -1261,10 +1376,101 @@ mod tests {
         );
 
         store
-            .add_user("admin", "another-password", Role::Admin)
+            .add_user("second-owner", "second-owner-password", Role::Owner)
             .unwrap();
         store.set_user_role("owner", Role::Editor).unwrap();
-        assert!(store.remove_user("admin").is_err());
+        assert!(store.remove_user("second-owner").is_err());
+    }
+
+    #[test]
+    fn sessions_are_bounded_and_malformed_tokens_are_rejected() {
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = database_path(&temp);
+        let store = AuthStore::open(&db_path).unwrap();
+        store
+            .add_user("owner", "strong-password", Role::Owner)
+            .unwrap();
+
+        assert!(store.identify_session("short").unwrap().is_none());
+        assert!(!store.validate_csrf("short", "also-short").unwrap());
+
+        let mut credentials = Vec::new();
+        for _ in 0..(MAX_ACTIVE_SESSIONS_PER_USER + 2) {
+            credentials.push(store.create_session("owner").unwrap());
+        }
+        let active: i64 = store
+            .connection()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM sessions WHERE revoked_at IS NULL",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(active as usize, MAX_ACTIVE_SESSIONS_PER_USER);
+        assert!(
+            store
+                .identify_session(&credentials[0].token)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .identify_session(&credentials.last().unwrap().token)
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn session_expiry_is_not_written_on_every_request() {
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = database_path(&temp);
+        let store = AuthStore::open(&db_path).unwrap();
+        store
+            .add_user("owner", "strong-password", Role::Owner)
+            .unwrap();
+        let credentials = store.create_session("owner").unwrap();
+        let token_hash = token_hash(&credentials.token);
+        let now = unix_timestamp().unwrap();
+        let recent = now - 30;
+        store
+            .connection()
+            .unwrap()
+            .execute(
+                "UPDATE sessions SET last_seen_at = ?1 WHERE token_hash = ?2",
+                rusqlite::params![recent, token_hash],
+            )
+            .unwrap();
+
+        assert!(
+            store
+                .identify_session(&credentials.token)
+                .unwrap()
+                .is_some()
+        );
+        let last_seen: i64 = store
+            .connection()
+            .unwrap()
+            .query_row(
+                "SELECT last_seen_at FROM sessions WHERE token_hash = ?1",
+                [&token_hash],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(last_seen, recent);
+    }
+
+    #[test]
+    fn argon2_verification_admission_is_bounded() {
+        let sessions = Sessions::new();
+        let mut permits = Vec::new();
+        for _ in 0..MAX_CONCURRENT_PASSWORD_VERIFICATIONS {
+            permits.push(sessions.try_acquire_password_verification().unwrap());
+        }
+        assert!(sessions.try_acquire_password_verification().is_err());
+        permits.pop();
+        assert!(sessions.try_acquire_password_verification().is_ok());
     }
 
     #[test]

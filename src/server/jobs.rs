@@ -33,6 +33,10 @@ const DEFAULT_MAX_ACTIVE_PREVIEWS: usize = 2;
 const DEFAULT_UPLOAD_TTL_MS: u64 = 24 * 60 * 60 * 1_000;
 const DEFAULT_EXPORT_TTL_MS: u64 = 7 * 24 * 60 * 60 * 1_000;
 const ARTIFACT_CLEANUP_INTERVAL: Duration = Duration::from_secs(30 * 60);
+const AUTHORIZATION_REVOKED_MESSAGE: &str =
+    "Cancelled because the account no longer permits this operation.";
+
+type JobAuthorizer = dyn Fn(&str, Permission) -> bool + Send + Sync + 'static;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct JobQueueLimits {
@@ -301,6 +305,7 @@ pub struct JobRegistry {
     store: Option<Arc<JobStore>>,
     artifacts: Option<ArtifactDirectories>,
     last_artifact_cleanup_ms: Arc<AtomicU64>,
+    authorizer: Arc<Mutex<Option<Arc<JobAuthorizer>>>>,
 }
 
 impl Default for JobRegistry {
@@ -323,6 +328,7 @@ impl JobRegistry {
             store: None,
             artifacts: None,
             last_artifact_cleanup_ms: Arc::new(AtomicU64::new(0)),
+            authorizer: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -376,6 +382,7 @@ impl JobRegistry {
                     .join("exports"),
             }),
             last_artifact_cleanup_ms: Arc::new(AtomicU64::new(now_ms())),
+            authorizer: Arc::new(Mutex::new(None)),
         };
         if let Err(error) = registry.cleanup_default_artifacts() {
             eprintln!("WARNING: {error}");
@@ -384,8 +391,16 @@ impl JobRegistry {
         Ok(registry)
     }
 
+    #[cfg(test)]
     pub(crate) fn queue_limits(&self) -> JobQueueLimits {
         self.limits
+    }
+
+    pub(crate) fn set_authorizer(
+        &self,
+        authorizer: impl Fn(&str, Permission) -> bool + Send + Sync + 'static,
+    ) {
+        *self.authorizer.lock().unwrap() = Some(Arc::new(authorizer));
     }
 
     /// Registers a new job in the `Queued` state and returns a handle the
@@ -401,6 +416,7 @@ impl JobRegistry {
         )
     }
 
+    #[cfg(test)]
     fn create_owned(
         &self,
         kind: JobKind,
@@ -721,6 +737,11 @@ impl JobRegistry {
     }
 
     fn dispatch_available(&self) {
+        enum Dispatch {
+            Start(PendingJob, JobSnapshot),
+            Reject(JobSnapshot, WorkClass),
+        }
+
         loop {
             let next = {
                 let mut state = self.inner.lock().unwrap();
@@ -754,17 +775,51 @@ impl JobRegistry {
                         .entries
                         .get_mut(&pending.id)
                         .expect("queued job entry exists");
+                    let authorized =
+                        self.authorizer
+                            .lock()
+                            .unwrap()
+                            .as_ref()
+                            .is_none_or(|authorize| {
+                                authorize(
+                                    &pending.owner_user_id,
+                                    snapshot.snapshot.kind.permission(),
+                                )
+                            });
+                    if !authorized {
+                        pending.cancel.store(true, Ordering::SeqCst);
+                        snapshot.snapshot.status = JobStatus::Cancelled;
+                        snapshot.snapshot.cancellable = false;
+                        snapshot.snapshot.cancel_requested = true;
+                        snapshot.snapshot.message = Some(AUTHORIZATION_REVOKED_MESSAGE.to_string());
+                        snapshot.snapshot.updated_ms = now_ms();
+                        return Dispatch::Reject(snapshot.snapshot.clone(), pending.class);
+                    }
                     snapshot.snapshot.status = JobStatus::Running;
                     snapshot.snapshot.updated_ms = now_ms();
-                    (pending, snapshot.snapshot.clone())
+                    Dispatch::Start(pending, snapshot.snapshot.clone())
                 })
             };
 
-            let Some((pending, running_snapshot)) = next else {
-                break;
-            };
-            self.persist(&running_snapshot);
-            self.start_worker(pending);
+            match next {
+                Some(Dispatch::Start(pending, running_snapshot)) => {
+                    self.persist(&running_snapshot);
+                    self.start_worker(pending);
+                }
+                Some(Dispatch::Reject(cancelled_snapshot, class)) => {
+                    let mut state = self.inner.lock().unwrap();
+                    match class {
+                        WorkClass::Write => state.active_write = false,
+                        WorkClass::Read => {
+                            state.active_reads = state.active_reads.saturating_sub(1);
+                        }
+                    }
+                    drop(state);
+                    self.persist(&cancelled_snapshot);
+                    self.prune(JOB_HISTORY_LIMIT);
+                }
+                None => break,
+            }
         }
     }
 
@@ -1140,6 +1195,7 @@ impl JobHandle {
         self.cancel.load(Ordering::Relaxed)
     }
 
+    #[cfg(test)]
     pub fn snapshot(&self) -> Option<JobSnapshot> {
         self.registry.snapshot(self.id)
     }

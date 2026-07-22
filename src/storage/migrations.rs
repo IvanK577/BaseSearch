@@ -6,7 +6,15 @@ use crate::storage::{
     derived, fts_index, import_log, meta, records, source_mapping_profiles, source_schemas,
 };
 
-const RECORDS_SCHEMA_VERSION: &str = "7";
+pub(crate) const RECORDS_SCHEMA_VERSION: &str = "7";
+const RECORD_HASH_REBUILD_PENDING_KEY: &str = "records_hash_rebuild_pending_v1";
+
+pub(crate) fn destructive_upgrade_required(conn: &Connection) -> rusqlite::Result<bool> {
+    if !table_exists(conn, "records")? && !table_exists(conn, "records_v2")? {
+        return Ok(false);
+    }
+    Ok(meta::get(conn, "records_schema").as_deref() != Some(RECORDS_SCHEMA_VERSION))
+}
 
 pub(crate) fn ensure_schema(conn: &Connection) -> rusqlite::Result<()> {
     ensure_meta_schema(conn)?;
@@ -144,7 +152,9 @@ fn records_ddl() -> String {
 
 fn migrate_records_schema(conn: &Connection) -> rusqlite::Result<()> {
     let current_schema = meta::get(conn, "records_schema");
-    if current_schema.as_deref() == Some(RECORDS_SCHEMA_VERSION) {
+    let hash_rebuild_pending =
+        meta::get(conn, RECORD_HASH_REBUILD_PENDING_KEY).as_deref() == Some("1");
+    if current_schema.as_deref() == Some(RECORDS_SCHEMA_VERSION) && !hash_rebuild_pending {
         return Ok(());
     }
 
@@ -182,6 +192,16 @@ fn migrate_records_schema(conn: &Connection) -> rusqlite::Result<()> {
             }
             if !has_extra {
                 conn.execute_batch("ALTER TABLE records ADD COLUMN extra TEXT;")?;
+            }
+            if hash_rebuild_pending {
+                let total_rows: i64 =
+                    conn.query_row("SELECT COUNT(*) FROM records", [], |row| row.get(0))?;
+                eprintln!(
+                    "[base-search] One-time database upgrade: resuming an interrupted row fingerprint rebuild."
+                );
+                crate::storage::maintenance::checkpoint_wal_truncate(conn)?;
+                rebuild_record_hashes(conn, total_rows.max(0) as u64)?;
+                meta::delete(conn, RECORD_HASH_REBUILD_PENDING_KEY)?;
             }
             if table_exists(conn, "import_log")? {
                 import_log::reset_file_hashes(conn)?;
@@ -233,6 +253,11 @@ fn migrate_records_schema(conn: &Connection) -> rusqlite::Result<()> {
         }
         conn.execute_batch("BEGIN IMMEDIATE;")?;
         let migration_result = (|| -> rusqlite::Result<()> {
+            conn.execute(
+                "INSERT INTO meta(key, value) VALUES (?1, '1')
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                [RECORD_HASH_REBUILD_PENDING_KEY],
+            )?;
             conn.execute_batch(
                 "DROP TABLE IF EXISTS records_fts; DROP TABLE IF EXISTS records_v2;",
             )?;
@@ -258,7 +283,12 @@ fn migrate_records_schema(conn: &Connection) -> rusqlite::Result<()> {
                 return Err(err);
             }
         }
-        rebuild_record_hashes(conn)?;
+        eprintln!(
+            "[base-search] One-time database upgrade: finalizing the legacy table copy before rebuilding row fingerprints."
+        );
+        crate::storage::maintenance::checkpoint_wal_truncate(conn)?;
+        rebuild_record_hashes(conn, legacy_rows.max(0) as u64)?;
+        meta::delete(conn, RECORD_HASH_REBUILD_PENDING_KEY)?;
         if table_exists(conn, "import_log")? {
             import_log::reset_file_hashes(conn)?;
         }
@@ -368,43 +398,117 @@ fn records_have_known_columns(conn: &Connection) -> rusqlite::Result<bool> {
     Ok(true)
 }
 
-fn rebuild_record_hashes(conn: &Connection) -> rusqlite::Result<()> {
+const HASH_REBUILD_CHUNK_ROWS: usize = 10_000;
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct HashRebuildStats {
+    rows: u64,
+    batches: u64,
+    max_batch_rows: usize,
+}
+
+fn rebuild_record_hashes(conn: &Connection, total_rows: u64) -> rusqlite::Result<()> {
+    rebuild_record_hashes_in_chunks(conn, total_rows, HASH_REBUILD_CHUNK_ROWS).map(|_| ())
+}
+
+fn rebuild_record_hashes_in_chunks(
+    conn: &Connection,
+    total_rows: u64,
+    chunk_rows: usize,
+) -> rusqlite::Result<HashRebuildStats> {
+    assert!(chunk_rows > 0, "hash rebuild chunks must not be empty");
     let select: Vec<String> = COLUMNS
         .iter()
         .map(|column| column.name.to_string())
         .collect();
-    let sql = format!("SELECT id, {}, extra FROM records", select.join(", "));
-    let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt.query_map([], |row| {
-        let id: i64 = row.get(0)?;
-        let mut values = Vec::with_capacity(COLUMNS.len());
-        for i in 0..COLUMNS.len() {
-            values.push(row.get::<_, Option<String>>(i + 1)?.unwrap_or_default());
-        }
-        let extra: Option<String> = row.get(COLUMNS.len() + 1)?;
-        Ok((
-            id,
-            records::canonical_record_hash(&values, extra.as_deref()),
-        ))
-    })?;
-    let updates: Vec<(i64, [u8; 16])> = rows.collect::<rusqlite::Result<_>>()?;
-    drop(stmt);
+    let selected_columns = select.join(", ");
+    let report_progress = total_rows >= BACKFILL_PROGRESS_MIN_ROWS as u64;
+    if report_progress {
+        eprintln!(
+            "[base-search] One-time database upgrade: rebuilding row fingerprints for {total_rows} rows in bounded batches."
+        );
+    }
+    let started = std::time::Instant::now();
+    let mut cursor = None;
+    let mut stats = HashRebuildStats::default();
 
-    conn.execute_batch("BEGIN IMMEDIATE;")?;
-    let update_result = (|| -> rusqlite::Result<()> {
-        let mut stmt = conn.prepare_cached("UPDATE records SET row_hash = ?1 WHERE id = ?2")?;
-        for (id, hash) in updates {
-            stmt.execute(params![&hash[..], id])?;
+    loop {
+        let (sql, parameters) = if let Some(cursor) = cursor {
+            (
+                format!(
+                    "SELECT id, {selected_columns}, extra FROM records
+                     WHERE id > ?1 ORDER BY id LIMIT ?2"
+                ),
+                vec![cursor, i64::try_from(chunk_rows).unwrap_or(i64::MAX)],
+            )
+        } else {
+            (
+                format!(
+                    "SELECT id, {selected_columns}, extra FROM records
+                     ORDER BY id LIMIT ?1"
+                ),
+                vec![i64::try_from(chunk_rows).unwrap_or(i64::MAX)],
+            )
+        };
+        let mut statement = conn.prepare(&sql)?;
+        let mut rows = statement.query(rusqlite::params_from_iter(parameters))?;
+        let mut updates = Vec::with_capacity(chunk_rows);
+        while let Some(row) = rows.next()? {
+            let id: i64 = row.get(0)?;
+            let mut values = Vec::with_capacity(COLUMNS.len());
+            for index in 0..COLUMNS.len() {
+                values.push(row.get::<_, Option<String>>(index + 1)?.unwrap_or_default());
+            }
+            let extra: Option<String> = row.get(COLUMNS.len() + 1)?;
+            updates.push((
+                id,
+                records::canonical_record_hash(&values, extra.as_deref()),
+            ));
         }
-        Ok(())
-    })();
-    match update_result {
-        Ok(()) => conn.execute_batch("COMMIT;"),
-        Err(err) => {
-            let _ = conn.execute_batch("ROLLBACK;");
-            Err(err)
+        drop(rows);
+        drop(statement);
+        if updates.is_empty() {
+            break;
+        }
+
+        let batch_rows = updates.len();
+        cursor = updates.last().map(|(id, _)| *id);
+        conn.execute_batch("BEGIN IMMEDIATE;")?;
+        let update_result = (|| -> rusqlite::Result<()> {
+            let mut statement =
+                conn.prepare_cached("UPDATE records SET row_hash = ?1 WHERE id = ?2")?;
+            for (id, hash) in &updates {
+                statement.execute(params![&hash[..], id])?;
+            }
+            Ok(())
+        })();
+        match update_result {
+            Ok(()) => conn.execute_batch("COMMIT;")?,
+            Err(error) => {
+                let _ = conn.execute_batch("ROLLBACK;");
+                return Err(error);
+            }
+        }
+        crate::storage::maintenance::checkpoint_wal_truncate(conn)?;
+
+        stats.rows = stats.rows.saturating_add(batch_rows as u64);
+        stats.batches = stats.batches.saturating_add(1);
+        stats.max_batch_rows = stats.max_batch_rows.max(batch_rows);
+        if report_progress {
+            let percent = if total_rows == 0 {
+                100.0
+            } else {
+                (stats.rows.min(total_rows) as f64 / total_rows as f64) * 100.0
+            };
+            eprintln!(
+                "[base-search] Database upgrade: row fingerprints {percent:.0}% ({} of {total_rows} rows, {}s elapsed)",
+                stats.rows,
+                started.elapsed().as_secs()
+            );
         }
     }
+
+    Ok(stats)
 }
 
 fn table_exists(conn: &Connection, name: &str) -> rusqlite::Result<bool> {
@@ -432,10 +536,90 @@ fn table_has_column(conn: &Connection, table: &str, column: &str) -> rusqlite::R
 
 #[cfg(test)]
 mod tests {
-    use rusqlite::Connection;
+    use rusqlite::{Connection, params};
 
-    use super::{RECORDS_SCHEMA_VERSION, migrate_records_schema, records_ddl, table_has_column};
-    use crate::storage::meta;
+    use super::{
+        RECORD_HASH_REBUILD_PENDING_KEY, RECORDS_SCHEMA_VERSION, migrate_records_schema,
+        rebuild_record_hashes_in_chunks, records_ddl, table_has_column,
+    };
+    use crate::schema::{COLUMNS, col_index};
+    use crate::storage::{meta, records};
+
+    #[test]
+    fn record_hash_rebuild_uses_bounded_batches_and_sparse_real_ids() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection.execute_batch(&records_ddl()).unwrap();
+        let fixtures = [
+            (-9_i64, "negative sparse row"),
+            (7_i64, "small sparse row"),
+            (9_000_000_000_i64, "large sparse row"),
+        ];
+        for (id, description) in fixtures {
+            connection
+                .execute(
+                    "INSERT INTO records(id, row_hash, source_file, description)
+                     VALUES(?1, zeroblob(16), 'legacy.xlsx', ?2)",
+                    params![id, description],
+                )
+                .unwrap();
+        }
+
+        let stats = rebuild_record_hashes_in_chunks(&connection, fixtures.len() as u64, 2).unwrap();
+
+        assert_eq!(stats.rows, 3);
+        assert_eq!(stats.batches, 2);
+        assert_eq!(stats.max_batch_rows, 2);
+        let description_column = col_index("description").unwrap();
+        for (id, description) in fixtures {
+            let actual: Vec<u8> = connection
+                .query_row("SELECT row_hash FROM records WHERE id = ?1", [id], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            let mut values = vec![String::new(); COLUMNS.len()];
+            values[description_column] = description.to_string();
+            assert_eq!(actual, records::canonical_record_hash(&values, None));
+        }
+    }
+
+    #[test]
+    fn pending_record_hash_rebuild_is_resumed_before_schema_is_marked_current() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT);")
+            .unwrap();
+        connection.execute_batch(&records_ddl()).unwrap();
+        connection
+            .execute(
+                "INSERT INTO records(id, row_hash, source_file, description)
+                 VALUES(9000000000, zeroblob(16), 'legacy.xlsx', 'resume marker row')",
+                [],
+            )
+            .unwrap();
+        meta::set(&connection, "records_schema", "5");
+        meta::set(&connection, RECORD_HASH_REBUILD_PENDING_KEY, "1");
+
+        migrate_records_schema(&connection).unwrap();
+
+        assert_eq!(
+            meta::get(&connection, RECORD_HASH_REBUILD_PENDING_KEY),
+            None
+        );
+        assert_eq!(
+            meta::get(&connection, "records_schema").as_deref(),
+            Some(RECORDS_SCHEMA_VERSION)
+        );
+        let actual: Vec<u8> = connection
+            .query_row(
+                "SELECT row_hash FROM records WHERE id = 9000000000",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let mut values = vec![String::new(); COLUMNS.len()];
+        values[col_index("description").unwrap()] = "resume marker row".to_string();
+        assert_eq!(actual, records::canonical_record_hash(&values, None));
+    }
 
     #[test]
     fn v5_upgrade_adds_canonical_id_without_touching_existing_rows() {

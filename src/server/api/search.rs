@@ -15,6 +15,13 @@ fn default_limit() -> u64 {
     50
 }
 
+fn resolve_snapshot(db: &crate::db::Db, requested: Option<u64>) -> Result<u64, String> {
+    let current = db
+        .capture_search_snapshot()
+        .map_err(|err| err.to_string())?;
+    Ok(requested.unwrap_or(current).min(current))
+}
+
 #[derive(Deserialize)]
 pub struct SearchRequest {
     #[serde(default)]
@@ -25,6 +32,10 @@ pub struct SearchRequest {
     offset: u64,
     #[serde(default)]
     sort: Option<ResultSort>,
+    /// Highest record id visible to this search session. Omitting it starts a
+    /// new snapshot; clients can reuse the returned token for count and pages.
+    #[serde(default)]
+    snapshot: Option<u64>,
 }
 
 #[derive(Serialize)]
@@ -42,6 +53,8 @@ pub struct SearchResponse {
     offset: u64,
     limit: u64,
     has_next: bool,
+    total: u64,
+    snapshot: u64,
 }
 
 pub async fn search(
@@ -52,15 +65,26 @@ pub async fn search(
     let offset = req.offset;
     let query = req.query;
     let sort = req.sort;
+    let requested_snapshot = req.snapshot;
 
     let response = blocking("search", move || {
         let db = state.open_read()?;
-        // Fetch one extra row to learn whether a next page exists without a
-        // second count query.
-        let page = db
+        let (snapshot, page, total) = db
             .with_statement_deadline(crate::server::DB_STATEMENT_TIMEOUT, |db| {
-                db.search_page_dynamic_sorted(&query, limit + 1, offset, sort.clone())
-                    .map_err(|err| err.to_string())
+                let snapshot = resolve_snapshot(db, requested_snapshot)?;
+                let page = db
+                    .search_page_dynamic_sorted_at_snapshot(
+                        &query,
+                        limit + 1,
+                        offset,
+                        sort.clone(),
+                        snapshot,
+                    )
+                    .map_err(|err| err.to_string())?;
+                let total = db
+                    .count_at_snapshot(&query, snapshot)
+                    .map_err(|err| err.to_string())?;
+                Ok((snapshot, page, total))
             })
             .map_err(|err| ApiError::from_db("search", err))?;
         let (fields, ids, mut rows, mut duplicate_of) = page;
@@ -85,6 +109,8 @@ pub async fn search(
             offset,
             limit,
             has_next,
+            total,
+            snapshot,
         })
     })
     .await?;
@@ -95,11 +121,14 @@ pub async fn search(
 pub struct CountRequest {
     #[serde(default)]
     query: Query,
+    #[serde(default)]
+    snapshot: Option<u64>,
 }
 
 #[derive(Serialize)]
 pub struct CountResponse {
     total: u64,
+    snapshot: u64,
 }
 
 pub async fn count(
@@ -107,14 +136,19 @@ pub async fn count(
     Json(req): Json<CountRequest>,
 ) -> Result<Json<CountResponse>, ApiError> {
     let query = req.query;
+    let requested_snapshot = req.snapshot;
     let response = blocking("count", move || {
         let db = state.open_read()?;
-        let total = db
+        let (snapshot, total) = db
             .with_statement_deadline(crate::server::DB_STATEMENT_TIMEOUT, |db| {
-                db.count(&query).map_err(|err| err.to_string())
+                let snapshot = resolve_snapshot(db, requested_snapshot)?;
+                let total = db
+                    .count_at_snapshot(&query, snapshot)
+                    .map_err(|err| err.to_string())?;
+                Ok((snapshot, total))
             })
             .map_err(|err| ApiError::from_db("count", err))?;
-        Ok(CountResponse { total })
+        Ok(CountResponse { total, snapshot })
     })
     .await?;
     Ok(Json(response))

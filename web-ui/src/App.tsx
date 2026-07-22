@@ -1,5 +1,6 @@
 import { Layout } from "./components/Layout";
-import { Banner, ToastHost } from "./components/ui";
+import { Icon } from "./components/Icon";
+import { Banner, EmptyState, Loading, ToastHost } from "./components/ui";
 import { useI18n, type MessageKey } from "./lib/i18n";
 import { useRoute, type Route } from "./lib/router";
 import { useStore } from "./state/store";
@@ -53,12 +54,31 @@ function renderPage(route: Route) {
 export function App() {
   const route = useRoute();
   const { t } = useI18n();
-  const { statusError, auth, needsLogin } = useStore();
+  const { statusError, auth, authReadiness, needsLogin, refreshAuth } = useStore();
 
-  if (auth === null) {
+  if (authReadiness === "unknown") {
     return (
-      <div className="center" style={{ height: "100vh" }}>
-        <div className="spinner" />
+      <div className="auth-gate">
+        <Loading label={t("common_loading")} />
+      </div>
+    );
+  }
+  if (authReadiness === "error" || auth === null) {
+    return (
+      <div className="auth-gate">
+        <section className="panel auth-error-panel">
+          <EmptyState
+            compact
+            icon="alert"
+            title={t("auth_check_failed_title")}
+            hint={t("auth_check_failed_hint")}
+            action={
+              <button className="btn btn-primary" onClick={refreshAuth}>
+                <Icon name="refresh" size={16} /> {t("common_retry")}
+              </button>
+            }
+          />
+        </section>
       </div>
     );
   }

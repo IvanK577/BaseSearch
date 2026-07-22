@@ -11,9 +11,26 @@ if (-not (Test-Path -LiteralPath $packagePath -PathType Container)) {
     throw "Package folder is missing: $packagePath"
 }
 
-& node (Join-Path $PSScriptRoot 'release-package.mjs') verify --root $packagePath --platform windows
+$requireSigning = $env:BASE_SEARCH_REQUIRE_SIGNING -eq '1'
+$requireSigningArg = $requireSigning.ToString().ToLowerInvariant()
+& node (Join-Path $PSScriptRoot 'release-package.mjs') verify `
+    --root $packagePath `
+    --platform windows `
+    --require-signed $requireSigningArg
 if ($LASTEXITCODE -ne 0) {
     throw 'Package layout verification failed.'
+}
+
+$manifest = Get-Content -LiteralPath (Join-Path $packagePath 'release-manifest.json') -Raw |
+    ConvertFrom-Json
+if ($manifest.signing.windows_authenticode -eq 'signed') {
+    foreach ($binary in @('BaseSearch.exe', 'base-search-cli.exe')) {
+        $binaryPath = Join-Path $packagePath $binary
+        $signature = Get-AuthenticodeSignature -FilePath $binaryPath
+        if ($signature.Status -ne [System.Management.Automation.SignatureStatus]::Valid) {
+            throw "Authenticode verification failed for $binary ($($signature.Status)): $($signature.StatusMessage)"
+        }
+    }
 }
 
 $listener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, 0)

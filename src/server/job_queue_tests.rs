@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
@@ -198,6 +198,62 @@ fn write_queue_stays_fifo_when_a_worker_exits_without_a_result() {
     assert_eq!(
         registry.snapshot(first.id).unwrap().error.as_deref(),
         Some("Job worker stopped without publishing a final result.")
+    );
+}
+
+#[test]
+fn queued_job_is_cancelled_when_current_authorization_is_revoked() {
+    let registry = JobRegistry::new();
+    let editor = identity("editor-id", Role::Editor);
+    let authorized = Arc::new(AtomicBool::new(true));
+    let dispatch_authorized = Arc::clone(&authorized);
+    registry.set_authorizer(move |user_id, _permission| {
+        user_id == "local-owner" || dispatch_authorized.load(Ordering::SeqCst)
+    });
+    let (release_tx, release_rx) = mpsc::channel();
+
+    let active = spawn_job_for(
+        &registry,
+        &editor,
+        JobKind::Import,
+        JobVisibility::Workspace,
+        "active import",
+        move |handle| {
+            let _ = release_rx.recv();
+            handle.succeed(None);
+        },
+    )
+    .unwrap();
+    wait_for_status(&registry, active.id, JobStatus::Running);
+
+    let ran = Arc::new(AtomicUsize::new(0));
+    let queued_ran = Arc::clone(&ran);
+    let queued = spawn_job_for(
+        &registry,
+        &editor,
+        JobKind::Import,
+        JobVisibility::Workspace,
+        "revoked import",
+        move |handle| {
+            queued_ran.fetch_add(1, Ordering::SeqCst);
+            handle.succeed(None);
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        registry.snapshot(queued.id).unwrap().status,
+        JobStatus::Queued
+    );
+
+    authorized.store(false, Ordering::SeqCst);
+    release_tx.send(()).unwrap();
+    wait_for_status(&registry, active.id, JobStatus::Succeeded);
+    wait_for_status(&registry, queued.id, JobStatus::Cancelled);
+
+    assert_eq!(ran.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        registry.snapshot(queued.id).unwrap().message.as_deref(),
+        Some("Cancelled because the account no longer permits this operation.")
     );
 }
 

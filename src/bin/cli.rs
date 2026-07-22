@@ -17,13 +17,13 @@ use base_search::import::{self, ImportPhase};
 use base_search::olap::{OlapBenchmarkOptions, OlapBenchmarkReport, run_sqlite_benchmark};
 use base_search::search::FieldInfo;
 
-const USAGE: &str = "base-search-cli - technical database checks for Base Search
+const USAGE: &str = "base-search-cli - diagnostics and automation for Base Search 2
 
 Usage:
   base-search-cli stats  <db>
   base-search-cli compact <db> [--vacuum]
-  base-search-cli peek   <file.xlsx|file.xlsb>
-  base-search-cli import <db> <file.xlsx|file.xlsb> [...]
+  base-search-cli peek   <table-file>
+  base-search-cli import <db> <table-file> [...]
   base-search-cli search <db> [query...] [--limit N] [--year Y] [--code C]
                      [--sender S] [--recipient R] [--edrpou E]
                      [--trademark T] [--description D]
@@ -43,13 +43,18 @@ Usage:
                        [--allow-empty] [--json]
   base-search-cli browser <db> [--host 127.0.0.1] [--port 7833] [--no-open]
                           [--confirm-wildcard-bind]
-  base-search-cli user-add <db> <username> [--role admin|viewer]   (password from stdin)
+  base-search-cli user-add <db> <username> [--role owner|admin|editor|viewer]
+                          [--password-stdin]
+                          (default role: admin; password hidden unless automation is explicit)
   base-search-cli user-list <db>
   base-search-cli user-remove <db> <username>
   base-search-cli olap-build <db> [projection.duckdb]
   base-search-cli olap-benchmark <projection.duckdb> [query...] [--year Y]
                        [--origin C] [--repeat N] [--warmups N] [--json]
-  base-search-cli export <db> <out.csv|out.xlsx> [query...]";
+  base-search-cli export <db> <out.csv|out.xlsx> [query...]
+
+Import formats: .xlsx, .xlsb, .xls, .xlsm, .ods, .csv, .tsv
+Account roles: owner, admin, editor, viewer";
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -973,12 +978,18 @@ fn cmd_browser(_db_path: &Path, _args: &[String]) -> Result<(), String> {
     )
 }
 
-/// Creates or replaces a local account. The password is read from stdin so it
-/// stays out of the shell history and process list.
 #[cfg(feature = "browser")]
-fn cmd_user_add(db_path: &Path, args: &[String]) -> Result<(), String> {
-    let username = &args[0];
+struct UserAddOptions {
+    username: String,
+    role: String,
+    password_stdin: bool,
+}
+
+#[cfg(feature = "browser")]
+fn parse_user_add_options(args: &[String]) -> Result<UserAddOptions, String> {
+    let username = args.first().ok_or("user-add requires a username")?.clone();
     let mut role = "admin".to_string();
+    let mut password_stdin = false;
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
@@ -986,18 +997,71 @@ fn cmd_user_add(db_path: &Path, args: &[String]) -> Result<(), String> {
                 i += 1;
                 role = args.get(i).ok_or("--role requires a value")?.clone();
             }
+            "--password-stdin" => password_stdin = true,
             other => return Err(format!("Unknown option: {other}")),
         }
         i += 1;
     }
-    eprintln!("Enter a password for '{username}' (read from stdin):");
+    role = role.trim().to_ascii_lowercase();
+    if !matches!(role.as_str(), "owner" | "admin" | "editor" | "viewer") {
+        return Err("--role must be owner, admin, editor, or viewer".to_string());
+    }
+    Ok(UserAddOptions {
+        username,
+        role,
+        password_stdin,
+    })
+}
+
+#[cfg(feature = "browser")]
+fn read_password_from_stdin() -> Result<String, String> {
     let mut password = String::new();
     std::io::stdin()
         .read_line(&mut password)
         .map_err(|err| err.to_string())?;
-    let password = password.trim_end_matches(['\n', '\r']);
-    base_search::server::add_account(db_path, username, password, &role)?;
-    println!("Account '{username}' ({role}) created.");
+    Ok(password.trim_end_matches(['\n', '\r']).to_string())
+}
+
+#[cfg(feature = "browser")]
+fn read_hidden_password(username: &str) -> Result<String, String> {
+    let password = rpassword::prompt_password(format!("Password for '{username}': "))
+        .map_err(|err| format!("could not read password from the terminal: {err}"))?;
+    let confirmation = rpassword::prompt_password("Confirm password: ")
+        .map_err(|err| format!("could not read password confirmation: {err}"))?;
+    if password != confirmation {
+        return Err("Passwords do not match.".to_string());
+    }
+    Ok(password)
+}
+
+/// Creates or updates a local account. Interactive input is hidden; pipelines
+/// must opt in explicitly with `--password-stdin`.
+#[cfg(feature = "browser")]
+fn cmd_user_add(db_path: &Path, args: &[String]) -> Result<(), String> {
+    let options = parse_user_add_options(args)?;
+    let accounts_before = base_search::server::list_accounts(db_path)?;
+    if accounts_before.is_empty() && options.role != "owner" {
+        return Err("The first account must explicitly use --role owner.".to_string());
+    }
+    let existed = accounts_before
+        .iter()
+        .any(|(username, _, _)| username.eq_ignore_ascii_case(&options.username));
+    let password = if options.password_stdin {
+        read_password_from_stdin()?
+    } else {
+        read_hidden_password(&options.username)?
+    };
+    base_search::server::add_account(db_path, &options.username, &password, &options.role)?;
+    let effective_role = base_search::server::list_accounts(db_path)?
+        .into_iter()
+        .find(|(username, _, _)| username.eq_ignore_ascii_case(&options.username))
+        .map(|(_, role, _)| role)
+        .ok_or("Account was saved but could not be read back.")?;
+    let action = if existed { "updated" } else { "created" };
+    println!(
+        "Account '{}' {action} with effective role '{effective_role}'.",
+        options.username
+    );
     Ok(())
 }
 
@@ -1133,5 +1197,18 @@ mod tests {
     fn parse_benchmark_options_rejects_invalid_hs_level() {
         assert!(parse_benchmark_args(&args(&["--hs-level", "3"])).is_err());
         assert!(parse_benchmark_args(&args(&["--hs-level"])).is_err());
+    }
+
+    #[cfg(feature = "browser")]
+    #[test]
+    fn user_add_password_stdin_is_an_explicit_automation_option() {
+        let options =
+            parse_user_add_options(&args(&["alice", "--role", "owner", "--password-stdin"]))
+                .unwrap();
+        assert_eq!(options.username, "alice");
+        assert_eq!(options.role, "owner");
+        assert!(options.password_stdin);
+
+        assert!(parse_user_add_options(&args(&["alice", "--unknown"])).is_err());
     }
 }

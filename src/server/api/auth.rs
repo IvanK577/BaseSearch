@@ -37,7 +37,15 @@ pub async fn login(
     let username = req.username.trim().to_string();
     state
         .sessions
-        .begin_login(peer.ip(), &username)
+        .check_login(peer.ip(), &username)
+        .map_err(ApiError::too_many_login_attempts)?;
+    let _verification_permit = state
+        .sessions
+        .try_acquire_password_verification()
+        .map_err(ApiError::too_many_login_attempts)?;
+    state
+        .sessions
+        .check_login(peer.ip(), &username)
         .map_err(ApiError::too_many_login_attempts)?;
     let auth_state = state.clone();
     let verify_username = username.clone();
@@ -60,13 +68,7 @@ pub async fn login(
     })
     .await;
 
-    let authenticated = match authenticated {
-        Ok(authenticated) => authenticated,
-        Err(err) => {
-            state.sessions.clear_login_attempts(peer.ip(), &username);
-            return Err(err);
-        }
-    };
+    let authenticated = authenticated?;
 
     match authenticated {
         Some((role, credentials)) => {
@@ -80,11 +82,14 @@ pub async fn login(
             set_cookie(&mut response, &csrf_cookie(&credentials.csrf_token));
             Ok(response)
         }
-        None => Err(ApiError::new(
-            StatusCode::UNAUTHORIZED,
-            "invalid_credentials",
-            "Wrong username or password.",
-        )),
+        None => {
+            state.sessions.record_login_failure(peer.ip(), &username);
+            Err(ApiError::new(
+                StatusCode::UNAUTHORIZED,
+                "invalid_credentials",
+                "Wrong username or password.",
+            ))
+        }
     }
 }
 
@@ -160,22 +165,27 @@ pub async fn create_user(
     headers: HeaderMap,
     Json(req): Json<CreateUserRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let role = req
-        .role
-        .as_deref()
-        .and_then(Role::parse)
-        .unwrap_or(Role::Viewer);
+    let requested_role = match req.role.as_deref() {
+        Some(value) => Some(Role::parse(value).ok_or_else(|| {
+            ApiError::bad_request("Role must be owner, admin, editor, or viewer.")
+        })?),
+        None => None,
+    };
     let identity = identify_request_result(&state, &headers)
         .map_err(|err| ApiError::internal("identify session", err))?;
     let can_manage_owners = identity
         .as_ref()
         .is_some_and(|identity| authorize(identity, Permission::ManageOwners).is_ok());
-    blocking("create user", move || {
+    let response_username = req.username.trim().to_string();
+    let mutation = blocking("create user", move || {
         let existing_role = state
             .auth
             .user_role(&req.username)
             .map_err(|err| ApiError::internal("inspect user", err))?;
-        if (role == Role::Owner || existing_role == Some(Role::Owner)) && !can_manage_owners {
+        let effective_role = requested_role.or(existing_role).unwrap_or(Role::Viewer);
+        if (effective_role == Role::Owner || existing_role == Some(Role::Owner))
+            && !can_manage_owners
+        {
             return Err(ApiError::new(
                 StatusCode::FORBIDDEN,
                 "forbidden",
@@ -184,11 +194,16 @@ pub async fn create_user(
         }
         state
             .auth
-            .add_user(&req.username, &req.password, role)
+            .add_user_with_result(&req.username, &req.password, effective_role)
             .map_err(ApiError::bad_request)
     })
     .await?;
-    Ok(Json(json!({ "ok": true })))
+    Ok(Json(json!({
+        "ok": true,
+        "username": response_username,
+        "role": mutation.role.as_str(),
+        "action": if mutation.created { "created" } else { "updated" }
+    })))
 }
 
 pub async fn delete_user(

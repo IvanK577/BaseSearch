@@ -2,339 +2,388 @@
 
 [![CI](https://github.com/IvanK577/BaseSearch/actions/workflows/ci.yml/badge.svg)](https://github.com/IvanK577/BaseSearch/actions/workflows/ci.yml)
 
-Base Search is a local desktop application for fast search, filtering,
-analytics, and export across large Excel datasets.
+Base Search turns spreadsheet folders into one fast, searchable local
+workspace. Import tables, search every preserved source column, inspect rows,
+build analytics, and export the result without sending the dataset to a cloud
+service.
 
-It is built for people who have many large spreadsheet files and need to work
-with them as one searchable database instead of opening heavy workbooks one by
-one in Excel. Base Search is document-neutral: ordinary tabular Excel files are
-imported with their real source columns as first-class fields, and optional
-semantic profiles add better analytics when familiar business fields are
-recognized.
+Base Search 2 is browser-first: the native launcher starts a server on your
+computer and opens the workspace in your normal browser. Personal mode is the
+default and needs no account. Trusted LAN mode is optional for a small team on
+the same trusted network.
 
-Base Search runs locally. It does not upload spreadsheets, search results, or
-the database to a cloud service.
+The Personal workspace is the recommended path for everyday use. Trusted LAN,
+DuckDB OLAP, the command-line tool, and the legacy desktop workspace are
+advanced or optional parts of the product.
 
-## What It Does
+## Start Here
 
-- Imports `.xlsx`, `.xlsb`, and `.xls` files into one local SQLite database.
-- Shows an import quality report with detected layout, header row, recognized
-  semantic columns, preserved source columns, table fill rate, and warnings.
-- Preserves every source column from the spreadsheet.
-- Builds a full-text search index for fast repeated searches.
-- Searches across products, companies, codes, invoice/order numbers, countries,
-  brands, and any imported source columns.
-- Supports advanced search rules: all/any groups, excluded rules, nested
-  groups, ranges, empty/not-empty checks, and filters over imported source
-  columns.
-- Shows paged results instead of trying to render millions of rows at once.
-- Opens a full details card for any row.
-- Provides analytics for the current query and filters.
-- Exports results to CSV or XLSX.
-- Works offline on Windows, macOS, and Linux.
+### Windows release package
 
-## Typical Use Cases
+1. Download the Windows ZIP from
+   [GitHub Releases](https://github.com/IvanK577/BaseSearch/releases).
+2. Extract the entire ZIP to a writable folder.
+3. Open `Open Base Search.cmd` or `BaseSearch.exe`.
+4. Leave **Personal workspace** selected and click **Start workspace**.
+5. Wait for **Ready**. Base Search opens the workspace in your default browser.
 
-- Search across many Excel exports as one dataset.
-- Find all rows related to a product, brand, SKU/code, company, country, or year.
-- Compare which companies, SKUs/codes, brands, or countries dominate a selected
-  result set.
-- Inspect suspicious prices or unusual value-per-weight patterns.
-- Prepare filtered CSV/XLSX extracts for further work in Excel, BI tools, or
-  reports.
-- Use generic Excel tables as searchable local data without writing SQL.
+Keep the launcher open while you work. It shows the database path, local URL,
+startup progress, and any startup error. No installation is required.
 
-## Quick Start
+### macOS release package
 
-### Windows
+1. Download and extract the macOS ZIP that matches your Mac.
+2. Open `BaseSearch.app`.
+3. Leave **Personal workspace** selected and click **Start workspace**.
+4. Wait for **Ready** and use the browser window that opens.
 
-Run the prebuilt application from the distribution folder:
+Follow the note in the package `README.txt` if macOS reports that a local build
+is unsigned. A public stable package is expected to be signed and notarized by
+the release pipeline.
 
-```text
-dist\BaseSearch\BaseSearch.exe
-```
+### Linux release package
 
-A small launcher window opens, starts the local server, and opens the
-workspace in your default browser. Two modes are offered:
+1. Download and extract the Linux `.tar.gz` archive.
+2. Open a terminal in the extracted folder.
+3. Run `./Open\ Base\ Search.sh`.
+4. Leave **Personal workspace** selected, click **Start workspace**, and wait
+   for the browser to open.
 
-- **Personal** (default) — binds `127.0.0.1` only; no sign-in, nothing is
-  reachable from other machines.
-- **Trusted LAN** — binds a private LAN/VPN address the launcher discovered, so
-  colleagues on the same network can open the shown URL. Sign-in becomes
-  mandatory and the server refuses to start until at least one account exists.
+A graphical desktop session and a default browser are required.
 
-### macOS
+## Your First Search
 
-Build and run from source:
+1. Start a **Personal workspace**. Personal mode is for one person on this
+   computer and does not ask you to register or sign in.
+2. In the browser, open **Data**, then **Imports**.
+3. Choose one or more table files. Review the detected sheets, columns, sample,
+   and column meanings when a preview is available.
+4. Queue the import. You may continue using existing data while the job runs.
+   Open **Jobs** to see progress or an error.
+5. Open **Search**, enter a word, code, company, identifier, or other value, and
+   press **Search**. Leave the field empty only when you intentionally want an
+   unfiltered result set.
+6. Add simple filters or use the advanced rule builder for AND, OR, exclusions,
+   ranges, empty values, and source-column conditions.
+7. Open a row to inspect every imported field. Use **Analyze** for summaries,
+   rankings, trends, pivots, comparisons, reports, company views, and price
+   checks supported by the current data.
+8. Open **Data**, then **Exports**, to create a CSV or XLSX file from the
+   current query.
 
-```bash
-xcode-select --install 2>/dev/null || true
-git clone https://github.com/IvanK577/BaseSearch.git
-cd BaseSearch
-./start.sh
-```
+Use **Settings** to switch between the dark and light themes or choose one of
+the eleven available interface languages.
 
-The `start.sh` script checks the environment, installs missing Rust tooling
-when needed, builds the app, and launches it.
+## Supported Data
 
-### Linux
+Base Search accepts:
 
-Install Git first, then run the guided setup:
+- Excel: `.xlsx`, `.xlsb`, `.xls`, and `.xlsm`
+- OpenDocument spreadsheets: `.ods`
+- delimited text: `.csv` and `.tsv`
 
-```bash
-sudo apt-get update && sudo apt-get install -y git
-git clone https://github.com/IvanK577/BaseSearch.git
-cd BaseSearch
-./start.sh
-```
+There is no required customs, sales, inventory, or other fixed template. Base
+Search preserves source columns, includes them in search, shows them in row
+details, and keeps them available for export. A one-column text table is valid.
+Macro-enabled workbooks are read as tables; Base Search does not execute
+macros.
 
-On Fedora use `sudo dnf install -y git`. On Arch use
-`sudo pacman -S --needed git`.
+During import, Base Search detects table structure and records a quality report.
+Optional column meanings tell analytics which fields represent a date, company,
+product, country, value, currency, weight, or unit. Generic data remains fully
+searchable and exportable when those meanings are not available; only the
+specialized analytics that need them are limited.
 
-## Browser Workspace (Local)
+The browser importer accepts up to 32 files in one request, 4 GiB per file,
+and 16 GiB for the request. A workbook may contain up to 256 sheets; a table may
+contain up to 16,384 columns. These are safety limits, not recommended working
+sizes.
 
-Base Search also ships a local browser workspace: the same import, search,
-analytics, and export engine behind a modern web UI, served by a small server
-that binds `127.0.0.1` only. Nothing is sent to a cloud.
+## Search And Results
 
-Start it from the desktop binary or the CLI:
-
-```text
-BaseSearch --browser
-base-search-cli browser path\to\base_search.db --port 7833
-```
-
-Options: `--host` (defaults to loopback; anything else explicitly opts in to
-LAN exposure), `--port` (default `7833`), and `--no-open` to skip launching the
-browser. The workspace covers search with filters and advanced rules, a
-many-column results grid with a column picker, record cards, analytics
-(overview, monthly dynamics, companies, goods, countries, prices, pivot, a
-printable report, and side-by-side compare), a price-risk screen, per-company
-dossiers, imports with a pre-import preview plus progress and history, CSV/XLSX
-export, column mapping, and maintenance — all backed by the real API. Long
-operations run as background jobs.
-
-The frontend lives in `web-ui/` (Vite + React + TypeScript). Build it with
-`npm install && npm run build` in `web-ui/`; the compiled assets are embedded
-into the release binary.
-
-### Sharing on a local network (optional)
-
-The easiest path is the launcher's **Trusted LAN** mode. From the CLI, binding
-any non-loopback host turns sign-in on. Create the first administrator locally
-first, then start the server:
-
-```text
-base-search-cli user-add path\to\base_search.db admin --role admin
-base-search-cli browser path\to\base_search.db --host 192.168.1.10
-```
-
-A networked server refuses to start with zero accounts. Accounts are
-argon2-hashed and stored beside the database; sessions use HttpOnly cookies
-with CSRF protection, and sign-in is rate-limited. Roles: **owner/admin**
-(everything, including accounts and maintenance), **editor** (import and column
-mapping), **viewer** (search, analytics, export — read-only). The last enabled
-administrator can never be removed by accident.
-
-The connection is **not encrypted** — keep it on a trusted LAN or behind a TLS
-reverse proxy, and never expose it to the internet. Loopback use stays
-password-free.
-
-### Optional DuckDB OLAP
-
-Build with `--features browser,duckdb-olap` to enable the columnar analytics
-engine. Build a projection (from the Analytics screen or `base-search-cli
-olap-build <db>`) and analytics run on DuckDB when the projection is fresh and
-matches the SQLite totals, falling back to SQLite otherwise.
-
-## Data Location
-
-Base Search stores its database outside the executable.
-
-Default locations:
-
-- distribution folder: `data/base_search.db`
-- fallback home folder: `~/.base-search/base_search.db`
-
-Large real-world databases can grow to many gigabytes. Keeping the database
-outside the executable makes updates and backups simpler.
-
-## Basic Workflow
-
-1. Open Base Search.
-2. Click **Import Excel** and choose one or more files.
-3. Wait until import and indexing finish.
-4. Type a search query or add filters.
-5. Use **Advanced** for structured search logic.
-6. Review the result table.
-7. Open row details when needed.
-8. Use **Analytics** to understand companies, goods, countries, prices, pivots,
-   reports, and comparisons for the current result set.
-9. Export matching rows to CSV or XLSX when needed.
-
-## Universal Tables
-
-Base Search can import regular Excel tables even when they do not follow a
-customs schema. Unknown columns are preserved as dynamic fields, included in
-full-text search, shown in the result table, available in Advanced Search,
-listed on the row card, and exported to CSV/XLSX.
+- Full-text search uses SQLite FTS5 and searches all indexed source values.
+- Advanced rules support nested all/any groups, exclusions, ranges, empty and
+  non-empty checks, and direct source-column filters.
+- Results are paged, so the browser never tries to draw millions of rows at
+  once.
+- Every result can open a full record card.
+- All preserved source columns can be shown, filtered, sorted where supported,
+  and exported.
+- Re-imported identical rows are skipped by duplicate detection.
+- Clearing or changing a query invalidates older in-flight browser results, so
+  a slower previous request cannot replace the current one.
 
 ## Analytics
 
-Analytics are calculated from the same query and filters as the result table.
+Analytics always use the same query and filters as Search. Available views
+include an overview, time trends, companies, products, countries, prices,
+pivots, comparisons, printable reports, company dossiers, and possible
+undervaluation signals.
 
-| Area | Purpose |
-|---|---|
-| Overview | Rows, declarations, companies, value, weight, average value per kg, codes, brands, and countries. |
-| Companies | Recipients, senders, identifiers, totals, shares, and full lists. |
-| Goods | Product codes, trademarks, product groups, values, weights, and participating companies. |
-| Countries | Origin, dispatch, and trade countries counted separately. |
-| Prices | Average and weighted price metrics, medians, quartiles, and possible undervaluation checks. |
-| Pivot | Cross-tab analysis by company, code, country, month, year, or other supported dimensions. |
-| Report | A compact working report that can be copied or saved as print-ready HTML. |
-| Compare | Compare the current result set with another query or year. |
+Base Search does not invent missing business meaning. A view is available only
+when the dataset has suitable mapped columns. Currency totals are kept in
+separate currency groups, and incompatible currencies are not presented as one
+USD total. Weight units are normalized only when the unit is known. Price-risk
+results are signals for review, not legal, accounting, or valuation advice.
 
-For very broad data, Base Search avoids running heavy analytics on an empty
-global query by accident. Add a query or filter first.
+Production packages include two local engines:
+
+- **SQLite + FTS5** is the source of truth and the text-search engine.
+- **DuckDB OLAP** is an optional analytical projection for broad grouping,
+  pivots, comparisons, and rollups. It is built only when requested. Base
+  Search uses it only while the projection is current and agrees with the
+  SQLite data; otherwise analytics safely fall back to SQLite.
+
+You do not need DuckDB to import, search, analyze, or export data.
 
 ## Export
 
-Base Search can export the current result set to:
+- Use CSV for very large result sets and broad compatibility.
+- Use XLSX for an Excel-friendly workbook.
+- XLSX output is subject to Excel worksheet limits. Choose CSV when the result
+  may exceed them.
+- Large exports run as background jobs and appear in **Jobs**.
 
-- CSV for large exports and compatibility with most tools;
-- XLSX for smaller Excel-friendly exports.
+## Personal And Team Use
 
-XLSX export is limited by Excel worksheet limits. CSV is recommended for very
-large result sets.
+### Personal workspace - recommended
 
-## Command-Line Tool
+Personal mode binds only to `127.0.0.1`. It is reachable from this computer,
+does not require an account, and is the simplest choice for one person. The
+launcher and browser are two parts of the same local application; the browser
+does not mean the data is hosted online.
 
-The distribution includes `base-search-cli` for diagnostics, maintenance, and
-automation:
+### Trusted LAN workspace - optional
 
-```powershell
-base-search-cli stats  <db>
+Use LAN mode only when several people on the same trusted private LAN or VPN
+must work with the same database:
+
+1. In the launcher, stop the personal workspace if it is running.
+2. Select **Trusted LAN workspace** and choose a private network interface.
+3. Create the first **owner** account if the workspace has no accounts.
+4. Confirm that the network is trusted, then start the workspace.
+5. Share the displayed LAN URL with authorized people on that network.
+
+LAN visitors must sign in. Roles are:
+
+- `owner`: full control, including other owner accounts
+- `admin`: workspace and account administration except owner management
+- `editor`: search, analytics, imports, mappings, saved queries, and exports
+- `viewer`: read-only search, analytics, and exports
+
+LAN traffic uses ordinary **unencrypted HTTP**. Use it only on a trusted LAN or
+inside a trusted VPN. Do not port-forward Base Search, bind it for public use,
+or expose it directly to the internet. Public internet access requires a
+separately administered TLS reverse proxy or another secure access layer; Base
+Search does not configure that for you.
+
+## Where Data Lives
+
+For a new workspace, the default database is:
+
+| Platform | Default location |
+| --- | --- |
+| Windows | `%LOCALAPPDATA%\Base Search\data\base_search.db` |
+| macOS | `~/Library/Application Support/Base Search/base_search.db` |
+| Linux | `$XDG_DATA_HOME/base-search/base_search.db` when set; otherwise `~/.local/share/base-search/base_search.db` |
+
+The launcher always shows the exact database path. If a valid
+`data/base_search.db` already exists beside the application, Base Search keeps
+using that portable database for compatibility. When a new version finds one
+older sibling package with an existing workspace, it asks before using it and
+does not move or delete it.
+
+Related files and folders can include:
+
+- `base_search.db-wal` and `base_search.db-shm`: normal SQLite working files
+- `base_search.auth.db`: LAN accounts and sessions
+- `base_search.duckdb`: optional DuckDB analytical projection
+- `uploads/` and `exports/`: temporary job input and output
+- `base_search.db.pre-upgrade-...bak`: verified backup retained after a
+  structure-changing database upgrade
+
+To make a manual backup, stop Base Search and copy the whole folder containing
+the database. This keeps the database, LAN accounts, and related state together.
+
+## Updates And Existing Databases
+
+V2 opens compatible V1 SQLite databases in place; re-importing the original
+files is not normally required. Keep your previous application folder and data
+until the upgraded workspace has opened and your searches are verified.
+
+Before a structure-changing upgrade, Base Search:
+
+1. checks the source database;
+2. requires free space equal to about twice the database plus WAL footprint,
+   with 1 GiB extra headroom;
+3. creates and verifies a backup beside the database;
+4. applies the migration with visible progress;
+5. verifies the upgraded database and retains the backup.
+
+Large databases can take time to upgrade. Do not close the launcher while an
+upgrade is active. If free space is insufficient, Base Search refuses to begin
+the destructive step and leaves the original database unchanged.
+
+## Troubleshooting
+
+### The browser says it cannot connect
+
+- Keep the launcher open.
+- Wait until its status is **Ready**, then click **Open workspace**.
+- If startup reports that the port is busy, stop the other Base Search process
+  or choose another preferred port in the launcher and start again.
+- Use the exact Local URL shown by the launcher instead of an old bookmark.
+
+### Import did not finish
+
+- Open **Jobs** and read the failed job message.
+- Confirm that the extension is supported and that the file opens normally in
+  its spreadsheet application.
+- Make sure the disk containing the database has free space. Import needs room
+  for the database, SQLite working files, and the uploaded copy.
+- Retry only after the previous job reaches a final state. Cancelling an import
+  rolls back its unfinished batch.
+
+### Search finds too much or too little
+
+- Clear visible filters as well as the text query.
+- Check **Data > Columns** to confirm the imported source field and its meaning.
+- Use quoted or more specific terms, or add an advanced rule for one column.
+- Remember that specialized filters are unavailable until a suitable column is
+  mapped.
+
+### Analytics are missing or limited
+
+- Import data first and apply a query or filter before requesting a very broad
+  analysis.
+- Map date, company, product, country, value, currency, weight, and unit fields
+  under **Data > Columns** where appropriate.
+- Build or refresh DuckDB from Analytics only when faster broad aggregation is
+  useful. SQLite remains a valid fallback.
+
+### An update opens an empty workspace
+
+Check the database path shown by the launcher. Do not delete the older folder.
+If Base Search did not offer the correct sibling workspace, an advanced user
+can start a specific database explicitly:
+
+```text
+BaseSearch.exe --browser --db "D:\path\to\base_search.db"
+```
+
+On macOS or Linux, use `BaseSearch` instead of `BaseSearch.exe`.
+
+## Privacy And Security Limits
+
+- Source files, imported records, searches, analytics, and exports stay on the
+  machine running Base Search unless you deliberately share them.
+- Base Search has no cloud database or cloud synchronization service.
+- Your browser may have its own sync, extension, download, or history behavior;
+  use a trusted browser profile for sensitive work.
+- Anyone with sufficient access to the computer or database files may be able
+  to read or copy the data. Use operating-system accounts, file permissions,
+  disk encryption, and normal backup controls.
+- Personal mode is not a security boundary against another process already
+  running as the same operating-system user.
+- LAN mode is not safe for direct public-internet exposure because it does not
+  provide built-in TLS.
+
+See [SECURITY.md](SECURITY.md) for the supported-release and vulnerability
+reporting policy.
+
+## Advanced Command Line
+
+The release package includes `base-search-cli` for diagnostics, automation, and
+maintenance. Run it with no arguments to see the complete current usage.
+
+```text
+base-search-cli stats <db>
 base-search-cli compact <db> [--vacuum]
-base-search-cli peek   <file.xlsx|file.xlsb>
-base-search-cli import <db> <file.xlsx|file.xlsb> [...]
+base-search-cli peek <table-file>
+base-search-cli import <db> <table-file> [...]
 base-search-cli search <db> [query...] [--limit N] [--year Y] [--code C]
 base-search-cli analytics <db> [query...] [--year Y] [--code C] [--origin C]
-base-search-cli benchmark <db> [query...] [--year Y] [--code C] [--origin C] [--repeat N]
-base-search-cli olap-build <db> [projection.duckdb]
-base-search-cli olap-benchmark <projection.duckdb> [query...] [--year Y] [--origin C]
 base-search-cli export <db> <out.csv|out.xlsx> [query...]
+base-search-cli browser <db> [--host 127.0.0.1] [--port 7833] [--no-open]
+base-search-cli user-add <db> <username> --role owner
+base-search-cli user-list <db>
+base-search-cli user-remove <db> <username>
+base-search-cli olap-build <db> [projection.duckdb]
+base-search-cli benchmark <db> [query...] [--repeat N] [--json]
 ```
 
-The desktop app is the primary interface. The CLI is mainly for verification,
-batch work, troubleshooting, and database maintenance.
-
-`benchmark` runs practical scenarios for future OLAP and database-backend
-decisions: search count, first result page, analytics overview,
-company/product/country/price aggregations, pivot, and possible undervaluation
-checks. Use `--json` for machine-readable output and `--allow-empty` only when
-a full-database benchmark is intentional.
-
-Optional DuckDB OLAP support can be enabled for technical comparisons and heavy
-aggregate experiments:
-
-```powershell
-cargo build --features duckdb-olap --bin base-search-cli
-base-search-cli olap-build data/base_search.db data/base_search.duckdb
-base-search-cli olap-benchmark data/base_search.duckdb --year 2026 --json
-```
-
-SQLite remains the primary database and full-text search engine. DuckDB is used
-as a separate analytical projection for columnar scans, grouping, pivots, and
-repeatable backend comparisons.
-
-## Database Maintenance
-
-SQLite can temporarily use extra disk space after large imports, cancelled
-imports, deletes, or migrations. This is normal.
-
-Useful commands:
-
-```powershell
-base-search-cli stats data/base_search.db
-base-search-cli compact data/base_search.db
-base-search-cli compact data/base_search.db --vacuum
-```
-
-`compact` checkpoints and truncates the WAL file. `compact --vacuum` rewrites
-the database to return unused pages to the filesystem. Vacuuming a large
-database can take a long time and should be done after closing other Base
-Search windows.
+Passwords entered interactively are hidden. `--password-stdin` exists for
+explicit automation. `compact` checkpoints SQLite; `compact --vacuum` rewrites
+the database to return unused pages to the filesystem and may take a long time.
 
 ## Build From Source
 
-Requirements:
+The tested release toolchain is Rust `1.96.0` and Node.js `22.22.0`. Compatible
+newer stable versions may also work. A clean build needs Git, npm, the Rust
+toolchain, and platform GUI development libraries.
 
-- Rust stable
-- Windows: MSVC toolchain
+- Windows: Visual Studio Build Tools with the C++ workload
 - macOS: Xcode Command Line Tools
-- Linux: build tools, `pkg-config`, `libxkbcommon-dev`, and Wayland/X11 GUI
-  libraries
+- Debian/Ubuntu Linux: a C/C++ toolchain, `pkg-config`, `libxkbcommon-dev`,
+  Wayland development files, and the required XCB development packages
 
-Build and test:
-
-```bash
-cargo test
-cargo build --release
-cargo build --release --features duckdb-olap --bin BaseSearch --bin base-search-cli
-```
-
-Release binaries are created in `target/release/`:
-
-- `BaseSearch` / `BaseSearch.exe`
-- `base-search-cli` / `base-search-cli.exe`
-
-Helper scripts for macOS and Linux:
+### Guided macOS or Linux build
 
 ```bash
+git clone https://github.com/IvanK577/BaseSearch.git
+cd BaseSearch
 ./start.sh
-./run.sh
-./run.sh cli stats data/base_search.db
 ```
+
+`start.sh` checks the platform, guides installation of missing Rust or Linux
+GUI prerequisites, requires a current Node.js/npm installation, builds the
+browser assets, builds Base Search, and launches it. `./run.sh` is the quieter
+equivalent once prerequisites are installed.
+
+### Manual build
+
+```bash
+npm --prefix web-ui ci
+npm --prefix web-ui run build
+cargo build --locked --release --no-default-features --features release-package --bin BaseSearch --bin base-search-cli
+```
+
+Run the application from `target/release/BaseSearch` or
+`target\release\BaseSearch.exe`.
+
+### Quality checks
+
+```bash
+npm --prefix web-ui ci
+npm --prefix web-ui run typecheck
+npm --prefix web-ui run test:unit
+node web-ui/validate-i18n.mjs
+npm --prefix web-ui run build
+cargo fmt --all -- --check
+cargo check --locked --all-targets --no-default-features --features release-package
+cargo test --locked --all-targets --no-default-features --features release-package
+cargo clippy --locked --all-targets --no-default-features --features release-package -- -D warnings
+node --test scripts/release-package.test.mjs
+```
+
+Browser workflow tests use Playwright and the sample database preparation shown
+in `.github/workflows/ci.yml`.
 
 ## Architecture
 
-Base Search is built with:
-
-- Rust for the application core and native executables;
-- egui/eframe for the desktop interface;
-- calamine for reading Excel files;
-- SQLite for local storage;
-- SQLite FTS5 for full-text search;
-- SQLite aggregate queries for analytics;
-- a benchmark command for repeatable search and OLAP baseline measurements;
-- optional DuckDB projections for analytical backend experiments;
-- xxhash for duplicate detection;
-- CSV and XLSX writers for export.
-
-The application is local-first: selected files are imported into a local
-database, searched locally, analyzed locally, and exported locally.
-
-## Privacy
-
-Base Search has no cloud backend. It reads selected local files and writes a
-local database. Users are responsible for protecting the files, exported
-reports, and database on their own machine.
-
-## Limitations
-
-- Base Search is not a spreadsheet editor.
-- It does not replace legal, accounting, compliance, or domain-expert review.
-- Generic tables are searchable and exportable, but semantic analytics require
-  recognizable fields such as dates, values, weights, companies, codes, or
-  countries.
-- Very large databases still need enough disk space and a reasonably fast SSD.
-
-## Changelog
-
-See [CHANGELOG.md](CHANGELOG.md) for release history.
+- Rust core for import, schema detection, query compilation, analytics, export,
+  jobs, migrations, and native executables
+- Axum/Tokio local HTTP server
+- React 19, TypeScript, and Vite browser workspace
+- SQLite as the local source of truth
+- SQLite FTS5 for full-text search
+- optional DuckDB projection for OLAP workloads
+- eframe/egui launcher and explicit legacy desktop fallback
+- Calamine, the Rust CSV reader, and streaming XLSX/XLSB paths for input
+- CSV and XLSX writers for export
 
 ## License
 
-Base Search is released under the MIT License. You can use, copy, modify, and
-redistribute the application and source code as long as the copyright notice
-and license text are included.
+Base Search is available under the [MIT License](LICENSE). You may use, copy,
+modify, and redistribute it as long as the copyright notice and license text
+remain included.

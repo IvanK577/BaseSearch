@@ -34,6 +34,13 @@ pub(crate) fn index(
     cancel: &AtomicBool,
     mut progress: impl FnMut(u64, u64),
 ) -> rusqlite::Result<(u64, bool)> {
+    if meta::get(conn, "fts_schema").as_deref() != Some(SCHEMA_VERSION) {
+        let report = repair(conn, cancel, &mut progress).map_err(|error| match error {
+            FtsRepairError::Database(error) => error,
+            error => rusqlite::Error::UserFunctionError(Box::new(error)),
+        })?;
+        return Ok((report.indexed_rows, report.cancelled));
+    }
     let max_id: i64 = conn.query_row("SELECT COALESCE(MAX(id), 0) FROM records", [], |row| {
         row.get(0)
     })?;
@@ -183,6 +190,18 @@ pub(crate) fn repair(
 }
 
 pub(crate) fn unindexed_rows(conn: &Connection) -> u64 {
+    if meta::get(conn, "fts_schema").as_deref() != Some(SCHEMA_VERSION) {
+        return conn
+            .query_row(
+                &format!(
+                    "SELECT COUNT(*) FROM records WHERE {}",
+                    effective_rows::searchable_payload_clause("records")
+                ),
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap_or(0) as u64;
+    }
     let watermark = meta::get_i64(conn, "fts_watermark");
     conn.query_row(
         &format!(
@@ -429,5 +448,64 @@ fn cancelled_report(
 fn push_issue(issues: &mut Vec<FtsRepairIssue>, issue: FtsRepairIssue) {
     if !issues.contains(&issue) {
         issues.push(issue);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::AtomicBool;
+
+    use super::{SCHEMA_VERSION, index, unindexed_rows};
+    use crate::storage::{connection, meta};
+
+    #[test]
+    fn stale_schema_forces_a_complete_rebuild_even_when_the_watermark_is_current() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("stale-schema.db");
+        let mut conn = connection::open(&path).unwrap();
+        conn.execute(
+            "INSERT INTO records(row_hash, source_file, description)
+             VALUES(zeroblob(16), 'source.xlsx', 'obsoletetoken')",
+            [],
+        )
+        .unwrap();
+        meta::set(&conn, "fts_schema", SCHEMA_VERSION);
+        assert_eq!(
+            index(&mut conn, &AtomicBool::new(false), |_, _| {}).unwrap(),
+            (1, false)
+        );
+
+        conn.execute(
+            "UPDATE records SET description = 'replacementtoken' WHERE id = 1",
+            [],
+        )
+        .unwrap();
+        meta::set(&conn, "fts_schema", "legacy-version");
+
+        assert_eq!(
+            unindexed_rows(&conn),
+            1,
+            "startup must notice a stale schema even with a current watermark"
+        );
+        assert_eq!(
+            index(&mut conn, &AtomicBool::new(false), |_, _| {}).unwrap(),
+            (1, false)
+        );
+        assert_eq!(
+            meta::get(&conn, "fts_schema").as_deref(),
+            Some(SCHEMA_VERSION)
+        );
+        assert_eq!(fts_matches(&conn, "replacementtoken"), 1);
+        assert_eq!(fts_matches(&conn, "obsoletetoken"), 0);
+    }
+
+    fn fts_matches(connection: &rusqlite::Connection, term: &str) -> i64 {
+        connection
+            .query_row(
+                "SELECT COUNT(*) FROM records_fts WHERE records_fts MATCH ?1",
+                [term],
+                |row| row.get(0),
+            )
+            .unwrap()
     }
 }

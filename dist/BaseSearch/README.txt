@@ -1,82 +1,94 @@
-Base Search
-===========
+Base Search 2.0
+===============
 
-How to run
-----------
-Desktop app: double-click "Open Desktop App.cmd" or BaseSearch.exe directly.
+Windows first start
+-------------------
+1. Keep every file in this folder together.
+2. Double-click BaseSearch.exe.
+3. Leave "Personal workspace" selected.
+4. Click "Start workspace" and keep the launcher open.
+5. Wait for "Ready". Base Search opens in your default browser.
+6. Open Data, then Imports, and choose a supported table file.
+7. Wait for the import job to finish, open Search, and enter a value.
 
-Questions menu
---------------
-Use the Questions button after entering a product, company, EDRPOU, year, or
-country. It jumps straight to useful analytics: who imported it, what goods
-dominate, which countries/routes are involved, how prices look, monthly
-dynamics, pivots, full company lists, or a company dossier.
+Personal mode is password-free and available only on this computer. The browser
+is the main interface, but the server and database remain on this computer.
 
-Column hints
-------------
-Hover table headers to decode abbreviated customs fields such as 43, 43_01,
-FV, RFV, RMV, Vaga po MD, Umovy post., Mistse post, 3001, 3002, and 9610.
+If the browser cannot connect, return to the launcher, wait for Ready, and click
+"Open workspace". Use the exact Local URL shown there instead of an old
+bookmark.
 
-What this folder contains
--------------------------
-- BaseSearch.exe: the desktop application.
-- base-search-cli.exe: optional command-line diagnostics.
-- Open Desktop App.cmd: starts the desktop application.
-- data/: local database folder. It is created and used on the user's computer.
+Normal workflow
+---------------
+  Import -> Search and filter -> Inspect rows -> Analyze -> Export
 
-Database maintenance
---------------------
-If data/base_search.db becomes much larger after big imports, close other
-Base Search windows and run:
+Supported imports: XLSX, XLSB, XLS, XLSM, ODS, CSV, and TSV.
+Supported exports: CSV and XLSX.
 
-base-search-cli.exe stats data\base_search.db
-base-search-cli.exe compact data\base_search.db
+Base Search does not require one fixed table layout. It preserves source
+columns for search, row details, filters, and export. Optional column meanings
+enable specialized analytics for dates, companies, products, countries,
+values, currencies, weights, and units.
 
-The compact command safely truncates the SQLite WAL file. For deeper
-compaction, run:
+Imports and large exports run in the background. Open Jobs to see progress or
+the exact error. Use CSV when a result may exceed Excel worksheet limits.
 
-base-search-cli.exe compact data\base_search.db --vacuum
-
-The --vacuum mode keeps records but rewrites the database file. It can take a
-long time on multi-gigabyte databases.
-
-Benchmark / OLAP baseline
--------------------------
-Use the benchmark command for repeatable search and analytics measurements:
-
-base-search-cli.exe benchmark data\base_search.db Apple --year 2024 --repeat 3
-
-It measures search count, first result page, analytics overview, company/goods/
-country/price aggregations, pivot, and possible undervaluation checks on the
-current SQLite backend. Use --json for machine-readable output.
-
-Basic workflow
---------------
-1. Open BaseSearch.exe.
-2. Click Import Excel and select .xlsx, .xlsb, or .xls files.
-3. Search by product, company, product code, declaration number, country,
-   trademark, or any imported source column.
-4. Use filters for year, code, EDRPOU, company, and country fields when those
-   semantic fields exist.
-5. Use + Filter and Advanced when a search needs several rules, any/all logic,
-   excluded rules, ranges, empty/not-empty checks, or extra imported columns.
-6. Use Questions when you want the app to choose the right analytics view.
-7. Open Analytics to understand the current search: rows, declarations,
-   companies, value, net/gross weight, average value per kg, product codes,
-   brands, countries, and price indicators.
-8. Double-click a row to see all imported fields; right-click for quick
-   filters and the company profile.
-9. Export matching rows to CSV or XLSX when needed.
-
-Universal tables
+Data and backups
 ----------------
-Base Search can import regular Excel tables even when they do not follow the
-customs schema. Unknown columns are preserved as dynamic fields, included in
-full-text search, shown in the desktop result table, available in Advanced
-Search, listed on the row card, and exported to CSV/XLSX.
+The launcher shows the exact database path. A new Windows workspace normally
+uses:
 
-Privacy
--------
-Base Search works locally. It does not upload Excel files or databases to a
-cloud service. Imported data is stored in data/base_search.db next to the
-program.
+  %LOCALAPPDATA%\Base Search\data\base_search.db
+
+If data\base_search.db already exists beside BaseSearch.exe, Base Search keeps
+using it as a portable workspace. When an existing workspace is found in one
+older sibling package, Base Search asks before using it and does not move or
+delete it.
+
+To make a manual backup, stop Base Search and copy the complete folder that
+contains base_search.db. Keep any base_search.auth.db, base_search.duckdb, WAL,
+SHM, and pre-upgrade backup files with it.
+
+Before a structure-changing database upgrade, Base Search checks the database
+and free space, creates and verifies a backup beside it, applies the upgrade
+with visible progress, and verifies the result. It needs about twice the
+database plus WAL footprint and 1 GiB extra headroom. If space is insufficient,
+the original database is not changed.
+
+Trusted LAN mode (optional)
+---------------------------
+Use Trusted LAN only when authorized people on the same trusted private LAN or
+VPN need one shared workspace. Select a private interface in the launcher,
+create the first owner account, confirm the network is trusted, and share the
+displayed LAN URL.
+
+LAN traffic is unencrypted HTTP. Never expose the Base Search port directly to
+the public internet and never use LAN mode on an untrusted network. Secure
+remote access requires a separately administered trusted VPN or TLS reverse
+proxy.
+
+Command line (advanced)
+-----------------------
+base-search-cli.exe is included for diagnostics, maintenance, and automation.
+Run it with no arguments to see the complete current usage.
+
+Common examples:
+
+  base-search-cli.exe stats "C:\path\to\base_search.db"
+  base-search-cli.exe compact "C:\path\to\base_search.db"
+  base-search-cli.exe peek "C:\path\to\table.xlsx"
+  base-search-cli.exe search "C:\path\to\base_search.db" example
+  base-search-cli.exe export "C:\path\to\base_search.db" result.csv example
+
+Use compact --vacuum only after closing other Base Search windows. It rewrites
+the database to return unused pages to disk and can take a long time.
+
+Privacy and limits
+------------------
+Base Search does not upload source files, imported records, searches, or the
+database to a Base Search cloud service. Protect the database, backups, browser
+profile, downloaded exports, and Windows account as sensitive data.
+
+Base Search is not a spreadsheet editor and does not replace legal,
+accounting, compliance, or valuation review. Price-risk output is a signal for
+human review, not a professional conclusion.

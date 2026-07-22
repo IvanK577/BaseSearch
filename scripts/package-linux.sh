@@ -29,6 +29,7 @@ fi
 export SOURCE_DATE_EPOCH="$source_date_epoch"
 export CARGO_INCREMENTAL=0
 export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$repo_root/target/package-release/linux-$arch}"
+require_signing="${BASE_SEARCH_REQUIRE_SIGNING:-0}"
 
 echo '==> Installing locked frontend dependencies'
 (cd web-ui && npm ci)
@@ -43,6 +44,9 @@ cargo build --locked --release --no-default-features --features release-package 
 version="$(cargo metadata --locked --no-deps --format-version 1 | \
   node -e 'let text=""; process.stdin.on("data", c => text += c); process.stdin.on("end", () => { const p=JSON.parse(text).packages.find(x => x.name === "base-search"); if (!p) process.exit(2); process.stdout.write(p.version); });')"
 git_sha="$(git rev-parse --short=12 HEAD)"
+if [[ -n "$(git status --porcelain --untracked-files=normal)" ]]; then
+  git_sha="${git_sha}-dirty"
+fi
 package_name="BaseSearch-$version-linux-$arch"
 package_dir="$output_root/$package_name"
 archive_path="$output_root/$package_name.tar.gz"
@@ -70,7 +74,9 @@ node scripts/release-package.mjs render-readme \
   --arch "$arch" \
   --version "$version" \
   --git-sha "$git_sha" \
-  --epoch "$source_date_epoch"
+  --epoch "$source_date_epoch" \
+  --signing unsigned \
+  --notarized false
 
 node scripts/release-package.mjs write-manifest \
   --root "$package_dir" \
@@ -78,8 +84,13 @@ node scripts/release-package.mjs write-manifest \
   --arch "$arch" \
   --version "$version" \
   --git-sha "$git_sha" \
-  --epoch "$source_date_epoch"
-node scripts/release-package.mjs verify --root "$package_dir" --platform linux
+  --epoch "$source_date_epoch" \
+  --signing unsigned \
+  --notarized false
+node scripts/release-package.mjs verify \
+  --root "$package_dir" \
+  --platform linux \
+  --require-signed "$([[ "$require_signing" == 1 ]] && echo true || echo false)"
 
 echo '==> Creating deterministic tar.gz archive'
 mkdir -p "$output_root"

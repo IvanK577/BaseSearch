@@ -26,22 +26,20 @@ export function EmptyState({
   title,
   hint,
   action,
+  compact = false,
 }: {
   icon?: IconName;
   title: string;
   hint?: string;
   action?: ReactNode;
+  compact?: boolean;
 }) {
   return (
-    <div className="empty-state">
-      <Icon name={icon} className="empty-icon" size={48} />
-      <div>
-        <div style={{ fontSize: 16, fontWeight: 600 }}>{title}</div>
-        {hint ? (
-          <div className="faint" style={{ marginTop: 6 }}>
-            {hint}
-          </div>
-        ) : null}
+    <div className={`empty-state ${compact ? "compact" : ""}`}>
+      <Icon name={icon} className="empty-icon" size={compact ? 22 : 30} />
+      <div className="empty-copy">
+        <strong>{title}</strong>
+        {hint ? <span>{hint}</span> : null}
       </div>
       {action}
     </div>
@@ -56,7 +54,11 @@ export function Banner({
   variant?: "error" | "warn";
 }) {
   return (
-    <div className={variant === "warn" ? "banner banner-warn" : "banner"}>
+    <div
+      className={variant === "warn" ? "banner banner-warn" : "banner"}
+      role={variant === "error" ? "alert" : "status"}
+    >
+      <Icon name="alert" size={16} />
       {children}
     </div>
   );
@@ -87,14 +89,23 @@ export function Progress({ percent }: { percent: number | null }) {
 }
 
 export function ToastHost() {
+  const { t } = useI18n();
   const { toasts, dismissToast } = useStore();
   if (toasts.length === 0) return null;
   return (
     <div className="toast-wrap">
-      {toasts.map((t) => (
-        <div key={t.id} className={`toast ${t.kind}`} onClick={() => dismissToast(t.id)}>
-          {t.message}
-        </div>
+      {toasts.map((toast) => (
+        <button
+          key={toast.id}
+          className={`toast ${toast.kind}`}
+          onClick={() => dismissToast(toast.id)}
+          type="button"
+          aria-label={`${toast.message}. ${t("common_close")}`}
+          title={t("common_close")}
+        >
+          {toast.message}
+          <Icon name="close" size={14} />
+        </button>
       ))}
     </div>
   );

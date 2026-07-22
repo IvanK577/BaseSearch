@@ -60,8 +60,12 @@ impl Default for LoginRateLimiter {
 }
 
 impl LoginRateLimiter {
-    pub(crate) fn begin(&self, peer_ip: IpAddr, username: &str) -> Result<(), Duration> {
-        self.begin_at(peer_ip, username, Instant::now())
+    pub(crate) fn check(&self, peer_ip: IpAddr, username: &str) -> Result<(), Duration> {
+        self.check_at(peer_ip, username, Instant::now())
+    }
+
+    pub(crate) fn record_failure(&self, peer_ip: IpAddr, username: &str) {
+        self.record_failure_at(peer_ip, username, Instant::now());
     }
 
     pub(crate) fn clear(&self, peer_ip: IpAddr, username: &str) {
@@ -72,7 +76,7 @@ impl LoginRateLimiter {
         }
     }
 
-    fn begin_at(&self, peer_ip: IpAddr, username: &str, now: Instant) -> Result<(), Duration> {
+    fn check_at(&self, peer_ip: IpAddr, username: &str, now: Instant) -> Result<(), Duration> {
         let username = normalize_username(username);
         let Ok(mut state) = self.state.lock() else {
             return Err(Duration::from_secs(1));
@@ -87,9 +91,18 @@ impl LoginRateLimiter {
             return Err(wait);
         }
 
+        Ok(())
+    }
+
+    fn record_failure_at(&self, peer_ip: IpAddr, username: &str, now: Instant) {
+        let username = normalize_username(username);
+        let Ok(mut state) = self.state.lock() else {
+            return;
+        };
+        prune_stale(&mut state.ips, now, self.policy.stale_after);
+        prune_stale(&mut state.usernames, now, self.policy.stale_after);
         reserve_key(&mut state.ips, peer_ip, now, self.policy);
         reserve_key(&mut state.usernames, username, now, self.policy);
-        Ok(())
     }
 
     #[cfg(test)]
@@ -182,17 +195,19 @@ mod tests {
         for attempt in 0..5 {
             assert!(
                 limiter
-                    .begin_at(ip(1), &format!("unknown-{attempt}"), now)
+                    .check_at(ip(1), &format!("unknown-{attempt}"), now)
                     .is_ok()
             );
+            limiter.record_failure_at(ip(1), &format!("unknown-{attempt}"), now);
         }
-        assert!(limiter.begin_at(ip(1), "new-name", now).is_err());
+        assert!(limiter.check_at(ip(1), "new-name", now).is_err());
 
         let limiter = LoginRateLimiter::default();
         for peer in 1..=5 {
-            assert!(limiter.begin_at(ip(peer), " OWNER ", now).is_ok());
+            assert!(limiter.check_at(ip(peer), " OWNER ", now).is_ok());
+            limiter.record_failure_at(ip(peer), " OWNER ", now);
         }
-        assert!(limiter.begin_at(ip(6), "owner", now).is_err());
+        assert!(limiter.check_at(ip(6), "owner", now).is_err());
     }
 
     #[test]
@@ -200,11 +215,28 @@ mod tests {
         let limiter = LoginRateLimiter::default();
         let now = Instant::now();
         for _ in 0..5 {
-            assert!(limiter.begin_at(ip(1), "owner", now).is_ok());
+            assert!(limiter.check_at(ip(1), "owner", now).is_ok());
+            limiter.record_failure_at(ip(1), "owner", now);
         }
-        assert!(limiter.begin_at(ip(1), "owner", now).is_err());
+        assert!(limiter.check_at(ip(1), "owner", now).is_err());
         limiter.clear(ip(1), "OWNER");
-        assert!(limiter.begin_at(ip(1), "owner", now).is_ok());
+        assert!(limiter.check_at(ip(1), "owner", now).is_ok());
+    }
+
+    #[test]
+    fn backoff_starts_when_the_failure_finishes() {
+        let limiter = LoginRateLimiter::default();
+        let started = Instant::now();
+        let finished = started + Duration::from_secs(10);
+
+        for _ in 0..4 {
+            assert!(limiter.check_at(ip(1), "owner", started).is_ok());
+            limiter.record_failure_at(ip(1), "owner", started);
+        }
+        assert!(limiter.check_at(ip(1), "owner", started).is_ok());
+        limiter.record_failure_at(ip(1), "owner", finished);
+
+        assert!(limiter.check_at(ip(1), "owner", finished).is_err());
     }
 
     #[test]
@@ -219,21 +251,27 @@ mod tests {
         for peer in 1..=3 {
             assert!(
                 limiter
-                    .begin_at(
+                    .check_at(
                         ip(peer),
                         &format!("user-{peer}"),
                         start + Duration::from_secs(peer.into()),
                     )
                     .is_ok()
             );
+            limiter.record_failure_at(
+                ip(peer),
+                &format!("user-{peer}"),
+                start + Duration::from_secs(peer.into()),
+            );
         }
         assert_eq!(limiter.entry_counts(), (2, 2));
 
         assert!(
             limiter
-                .begin_at(ip(10), "fresh", start + Duration::from_secs(20))
+                .check_at(ip(10), "fresh", start + Duration::from_secs(20))
                 .is_ok()
         );
+        limiter.record_failure_at(ip(10), "fresh", start + Duration::from_secs(20));
         assert_eq!(limiter.entry_counts(), (1, 1));
     }
 }

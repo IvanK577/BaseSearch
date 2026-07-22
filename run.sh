@@ -18,6 +18,14 @@ if ! command -v cargo >/dev/null 2>&1; then
     exit 1
 fi
 
+if ! command -v node >/dev/null 2>&1 || ! command -v npm >/dev/null 2>&1; then
+    echo "Node.js and npm are required. Install them from https://nodejs.org and re-run." >&2
+    exit 1
+fi
+
+npm --prefix web-ui ci
+npm --prefix web-ui run build
+test -f web-ui/dist/index.html
 cargo build --release
 
 if [ "$1" = "cli" ]; then

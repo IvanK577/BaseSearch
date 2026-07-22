@@ -4,6 +4,7 @@ import { cleanup, fireEvent, render, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type {
+  Job,
   SourceMappingProfile,
   SourceMappingProfileCollection,
   WorkbookPeek,
@@ -17,6 +18,7 @@ const saveMappingProfile = vi.fn();
 const deleteMappingProfile = vi.fn();
 const refreshJobs = vi.fn();
 const toast = vi.fn();
+const jobs: Job[] = [];
 
 vi.mock("../api/client", () => ({
   ApiError: class ApiError extends Error {
@@ -40,7 +42,7 @@ vi.mock("../api/client", () => ({
 
 vi.mock("../state/store", () => ({
   useStore: () => ({
-    jobs: [],
+    jobs,
     refreshJobs,
     toast,
     canEditData: true,
@@ -105,6 +107,7 @@ function chooseSingleFile(container: HTMLElement) {
 }
 
 beforeEach(() => {
+  jobs.splice(0);
   importLog.mockResolvedValue([]);
   mappingProfiles.mockResolvedValue(profileCollection);
   peekImport.mockResolvedValue(peek);
@@ -128,6 +131,25 @@ afterEach(() => {
 });
 
 describe("ImportsPage source mapping profiles", () => {
+  it("keeps a failed import visible with its error", async () => {
+    jobs.push({
+      id: 41,
+      kind: "import",
+      status: "failed",
+      title: "supplier.xlsx",
+      progress: { phase: "reading", done: 0, total: 0, percent: 0 },
+      error: "The workbook is damaged",
+      cancellable: false,
+      created_ms: 1,
+      updated_ms: 2,
+    });
+
+    const { ImportsPage } = await import("./Imports");
+    const view = render(<ImportsPage />);
+
+    expect(view.getByText("The workbook is damaged")).toBeTruthy();
+  });
+
   it("applies an exact suggestion while preserving explicit mapping and fixed-value overrides", async () => {
     const { ImportsPage } = await import("./Imports");
     const view = render(<ImportsPage />);

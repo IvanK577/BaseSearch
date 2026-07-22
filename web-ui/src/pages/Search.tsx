@@ -15,7 +15,7 @@ import { Icon } from "../components/Icon";
 import { RecordDrawer } from "../components/RecordDrawer";
 import { ResultsTable } from "../components/ResultsTable";
 import { Banner, EmptyState, Loading } from "../components/ui";
-import { useI18n } from "../lib/i18n";
+import { useI18n, type MessageKey } from "../lib/i18n";
 import { readActiveResultSort, writeActiveResultSort } from "../lib/exportContext";
 import { navigate, updateRouteQuery, useRouteQuery } from "../lib/router";
 import { formatInt } from "../lib/format";
@@ -30,17 +30,17 @@ import { useStore } from "../state/store";
 
 const LIMIT = 50;
 
-const FILTER_FIELDS: { key: keyof Filters; label: string }[] = [
-  { key: "year", label: "Year" },
-  { key: "product_code", label: "Product code" },
-  { key: "edrpou", label: "Company code (EDRPOU)" },
-  { key: "recipient", label: "Recipient" },
-  { key: "sender", label: "Sender" },
-  { key: "trademark", label: "Trademark" },
-  { key: "description", label: "Description" },
-  { key: "origin_country", label: "Origin country" },
-  { key: "dispatch_country", label: "Dispatch country" },
-  { key: "trade_country", label: "Trade country" },
+const FILTER_FIELDS: { key: keyof Filters; labelKey: MessageKey }[] = [
+  { key: "year", labelKey: "filter_year" },
+  { key: "product_code", labelKey: "filter_product_code" },
+  { key: "edrpou", labelKey: "filter_company_code" },
+  { key: "recipient", labelKey: "filter_recipient" },
+  { key: "sender", labelKey: "filter_sender" },
+  { key: "trademark", labelKey: "filter_trademark" },
+  { key: "description", labelKey: "filter_description" },
+  { key: "origin_country", labelKey: "filter_origin_country" },
+  { key: "dispatch_country", labelKey: "filter_dispatch_country" },
+  { key: "trade_country", labelKey: "filter_trade_country" },
 ];
 
 // Result columns that map onto a structured filter, for "search this value".
@@ -88,6 +88,7 @@ export function SearchPage() {
   const drawerRecord = useRouteQuery("record");
   const drawerId = drawerRecord && /^\d+$/.test(drawerRecord) ? Number(drawerRecord) : null;
   const inputRef = useRef<HTMLInputElement>(null);
+  const requestIdRef = useRef(0);
 
   useEffect(() => {
     api
@@ -116,23 +117,32 @@ export function SearchPage() {
 
   const runSearch = useCallback(
     async (nextOffset: number, useSort: ResultSort | null, q: Query) => {
+      const requestId = ++requestIdRef.current;
       setLoading(true);
       setError(null);
       const [searchRes, countRes] = await Promise.allSettled([
         api.search(q, LIMIT, nextOffset, useSort),
         api.count(q),
       ]);
+      if (requestId !== requestIdRef.current) return;
       if (searchRes.status === "fulfilled") {
         setResults(searchRes.value);
         setOffset(nextOffset);
         recordSearch(q);
       } else {
-        setError((searchRes.reason as ApiError)?.message ?? "Search failed");
+        setError((searchRes.reason as ApiError)?.message ?? t("search_failed"));
         setResults(null);
       }
       setTotal(countRes.status === "fulfilled" ? countRes.value.total : null);
       setLoading(false);
       setSearched(true);
+    },
+    [t],
+  );
+
+  useEffect(
+    () => () => {
+      requestIdRef.current += 1;
     },
     [],
   );
@@ -203,8 +213,8 @@ export function SearchPage() {
 
   return (
     <div className="stack">
-      <div className="panel panel-pad stack" style={{ gap: 14 }}>
-        <div className="searchbar">
+      <section className="panel search-workbench" aria-label={t("nav_search")}>
+        <div className="searchbar search-command">
           <div className="input-wrap">
             <span className="search-icon">
               <Icon name="search" size={18} />
@@ -219,101 +229,120 @@ export function SearchPage() {
             />
           </div>
           <button className="btn btn-primary" onClick={submit} disabled={loading}>
+            <Icon name="search" size={16} />
             {t("search_run")}
           </button>
         </div>
 
+        <div className="search-options">
+          <div className="toolbar search-actions">
+            <button
+              className={`btn btn-sm ${showFilters ? "" : "btn-ghost"}`}
+              onClick={() => setShowFilters((value) => !value)}
+              aria-expanded={showFilters}
+            >
+              <Icon name="filter" size={15} /> {t("search_filters")}
+              {activeFilters.length > 0 ? ` (${activeFilters.length})` : ""}
+            </button>
+            <button
+              className={`btn btn-sm ${showAdvanced ? "" : "btn-ghost"}`}
+              onClick={() => setShowAdvanced((value) => !value)}
+              aria-expanded={showAdvanced}
+            >
+              <Icon name="columns" size={15} /> {t("search_advanced")}
+              {query.advanced ? " •" : ""}
+            </button>
+
+            <div className="popover">
+              <button
+                className="btn btn-sm btn-ghost"
+                onClick={() => setShowSaved((value) => !value)}
+                aria-expanded={showSaved}
+              >
+                <Icon name="bookmark" size={15} /> {t("search_saved_recent")}
+              </button>
+              {showSaved ? (
+                <div
+                  className="popover-panel saved-searches-popover"
+                  onMouseLeave={() => setShowSaved(false)}
+                >
+                  <SavedList
+                    saved={saved}
+                    recent={recent}
+                    onPick={loadEntryQuery}
+                    onRemove={removeSaved}
+                  />
+                </div>
+              ) : null}
+            </div>
+
+            <button
+              className="btn btn-sm btn-ghost"
+              title={t("search_save_current")}
+              onClick={() => {
+                const name = window.prompt(t("search_name_prompt")) ?? undefined;
+                saveSearch(query, name);
+                toast(t("search_saved_toast"), "success");
+              }}
+            >
+              <Icon name="bookmark" size={15} /> {t("search_save_current")}
+            </button>
+          </div>
+
+          <div className="toolbar search-scope-actions">
+            <div className="segmented-control" aria-label={t("search_scope")}>
+              <button
+                type="button"
+                className={query.record_scope !== "occurrences" ? "active" : ""}
+                onClick={() => setRecordScope("canonical")}
+                aria-pressed={query.record_scope !== "occurrences"}
+              >
+                {t("search_scope_canonical")}
+              </button>
+              <button
+                type="button"
+                className={query.record_scope === "occurrences" ? "active" : ""}
+                onClick={() => setRecordScope("occurrences")}
+                aria-pressed={query.record_scope === "occurrences"}
+              >
+                {t("search_scope_occurrences")}
+              </button>
+            </div>
+            <button
+              className="icon-button"
+              onClick={() => {
+                requestIdRef.current += 1;
+                setLoading(false);
+                setError(null);
+                reset();
+                setResults(null);
+                setTotal(null);
+                setSearched(false);
+                setSort(null);
+                writeActiveResultSort(null);
+              }}
+              aria-label={t("common_reset")}
+              title={t("common_reset")}
+            >
+              <Icon name="refresh" size={15} />
+            </button>
+            <button className="btn btn-sm" onClick={() => navigate("exports")}>
+              <Icon name="export" size={15} /> {t("search_export")}
+            </button>
+          </div>
+        </div>
+
         {isDirty ? (
-          <div className="faint" role="status">
-            Search controls changed. Run the search to apply them to results and analytics.
+          <div className="query-dirty" role="status">
+            {t("search_dirty")}
           </div>
         ) : null}
-
-        <div className="toolbar">
-          <button
-            className={`btn btn-sm ${showFilters ? "" : "btn-ghost"}`}
-            onClick={() => setShowFilters((v) => !v)}
-          >
-            <Icon name="filter" size={15} /> {t("search_filters")}
-            {activeFilters.length > 0 ? ` (${activeFilters.length})` : ""}
-          </button>
-          <button
-            className={`btn btn-sm ${showAdvanced ? "" : "btn-ghost"}`}
-            onClick={() => setShowAdvanced((v) => !v)}
-          >
-            <Icon name="columns" size={15} /> {t("search_advanced")}
-            {query.advanced ? " •" : ""}
-          </button>
-
-          <div className="popover">
-            <button className="btn btn-sm btn-ghost" onClick={() => setShowSaved((v) => !v)}>
-              <Icon name="jobs" size={15} /> Saved & recent
-            </button>
-            {showSaved ? (
-              <div
-                className="popover-panel"
-                style={{ width: 320, left: 0, right: "auto" }}
-                onMouseLeave={() => setShowSaved(false)}
-              >
-                <SavedList
-                  saved={saved}
-                  recent={recent}
-                  onPick={loadEntryQuery}
-                  onRemove={removeSaved}
-                />
-              </div>
-            ) : null}
-          </div>
-
-          <button
-            className="btn btn-sm btn-ghost"
-            title="Save current search"
-            onClick={() => {
-              const name = window.prompt("Name this search (optional):") ?? undefined;
-              saveSearch(query, name);
-              toast("Search saved", "success");
-            }}
-          >
-            <Icon name="plus" size={15} /> Save
-          </button>
-
-          <div className="grow" />
-          <label className="field-inline">
-            <span className="field-label">{t("search_scope")}</span>
-            <select
-              className="input input-compact"
-              value={query.record_scope ?? "canonical"}
-              onChange={(event) =>
-                setRecordScope(event.target.value as "canonical" | "occurrences")
-              }
-            >
-              <option value="canonical">{t("search_scope_canonical")}</option>
-              <option value="occurrences">{t("search_scope_occurrences")}</option>
-            </select>
-          </label>
-          <button
-            className="btn btn-sm btn-ghost"
-            onClick={() => {
-              reset();
-              setResults(null);
-              setTotal(null);
-              setSearched(false);
-              setSort(null);
-              writeActiveResultSort(null);
-            }}
-          >
-            {t("common_reset")}
-          </button>
-          <button className="btn btn-sm" onClick={() => navigate("exports")}>
-            <Icon name="export" size={15} /> {t("search_export")}
-          </button>
-        </div>
 
         {showFilters ? (
           <div className="filters-grid">
             {FILTER_FIELDS.map((f) => (
               <div key={f.key}>
-                <label className="field-label">{f.label}</label>
+                <label className="field-label">{t(f.labelKey)}</label>
                 <input
                   className="input"
                   value={query.filters[f.key]}
@@ -337,7 +366,7 @@ export function SearchPage() {
             />
           </div>
         ) : null}
-      </div>
+      </section>
 
       {error ? <Banner>{error}</Banner> : null}
       {loading && !results ? <Loading label={t("common_loading")} /> : null}
@@ -363,7 +392,7 @@ export function SearchPage() {
 
       {results && results.rows.length > 0 ? (
         <div className="stack" style={{ gap: 12 }}>
-          <div className="row" style={{ justifyContent: "space-between" }}>
+          <div className="results-summary">
             <div className="muted">
               {t("search_found")}:{" "}
               <strong style={{ color: "var(--text)" }}>
@@ -379,20 +408,24 @@ export function SearchPage() {
                 {formatInt(offset + 1)}–{formatInt(offset + results.rows.length)}
               </span>
             </div>
-            <div className="row" style={{ gap: 8 }}>
+            <div className="row pagination-controls" style={{ gap: 4 }}>
               <button
-                className="btn btn-sm btn-ghost"
+                className="icon-button"
                 disabled={offset === 0 || loading}
                 onClick={() => runSearch(Math.max(0, offset - LIMIT), sort, appliedQuery)}
+                aria-label={t("search_previous_page")}
+                title={t("search_previous_page")}
               >
-                Prev
+                <Icon name="arrow-left" size={16} />
               </button>
               <button
-                className="btn btn-sm btn-ghost"
+                className="icon-button"
                 disabled={!results.has_next || loading}
                 onClick={() => runSearch(offset + LIMIT, sort, appliedQuery)}
+                aria-label={t("search_next_page")}
+                title={t("search_next_page")}
               >
-                Next
+                <Icon name="arrow-right" size={16} />
               </button>
             </div>
           </div>
@@ -406,7 +439,9 @@ export function SearchPage() {
             companyFieldId={companyFieldId}
             onOpenCompany={openCompany}
             onSearchValue={searchValue}
-            onCopied={(ok) => toast(ok ? "Copied" : "Copy blocked", ok ? "success" : "error")}
+            onCopied={(ok) =>
+              toast(ok ? t("report_copied") : t("report_copy_failed"), ok ? "success" : "error")
+            }
           />
         </div>
       ) : null}
@@ -429,12 +464,13 @@ function SavedList({
   onPick: (query: Query) => void;
   onRemove: (id: string) => void;
 }) {
+  const { t } = useI18n();
   return (
     <div className="stack" style={{ gap: 4 }}>
       {saved.length > 0 ? (
         <>
           <div className="field-label" style={{ margin: "2px 4px" }}>
-            Saved
+            {t("search_saved_label")}
           </div>
           {saved.map((e) => (
             <div key={e.id} className="check-row" style={{ justifyContent: "space-between" }}>
@@ -445,7 +481,12 @@ function SavedList({
               >
                 {e.label}
               </button>
-              <button className="btn btn-ghost btn-sm" onClick={() => onRemove(e.id)}>
+              <button
+                className="btn btn-ghost btn-sm"
+                onClick={() => onRemove(e.id)}
+                aria-label={t("search_remove_saved", { name: e.label })}
+                title={t("search_remove_saved", { name: e.label })}
+              >
                 <Icon name="trash" size={14} />
               </button>
             </div>
@@ -453,11 +494,11 @@ function SavedList({
         </>
       ) : null}
       <div className="field-label" style={{ margin: "6px 4px 2px" }}>
-        Recent
+        {t("search_recent_label")}
       </div>
       {recent.length === 0 ? (
         <div className="faint" style={{ padding: "4px 8px" }}>
-          No recent searches yet.
+          {t("search_no_recent")}
         </div>
       ) : (
         recent.map((e) => (

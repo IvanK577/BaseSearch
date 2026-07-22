@@ -3,8 +3,12 @@ name: CI
 on:
   push:
     branches: [master, main]
+    tags: ["v*"]
   pull_request:
   workflow_dispatch:
+
+permissions:
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
@@ -12,6 +16,7 @@ env:
   RELEASE_FEATURES: release-package
   RUST_VERSION: 1.96.0
   NODE_VERSION: 22.22.0
+  BASE_SEARCH_REQUIRE_SIGNING: ${{ github.ref_type == 'tag' && '1' || '0' }}
 
 jobs:
   quality:
@@ -41,6 +46,19 @@ jobs:
           toolchain: ${{ env.RUST_VERSION }}
           components: rustfmt, clippy
 
+      - name: Validate canonical release tag
+        if: github.ref_type == 'tag'
+        run: |
+          if [[ ! "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Release tags must use the canonical vMAJOR.MINOR.PATCH form." >&2
+            exit 1
+          fi
+          cargo_version=$(cargo metadata --locked --no-deps --format-version 1 | \
+            node -e 'let t="";process.stdin.on("data",c=>t+=c);process.stdin.on("end",()=>{const p=JSON.parse(t).packages.find(v=>v.name==="base-search");if(!p)process.exit(2);process.stdout.write(p.version);});')
+          frontend_version=$(node -p "require('./web-ui/package.json').version")
+          test "$GITHUB_REF_NAME" = "v$cargo_version"
+          test "$frontend_version" = "$cargo_version"
+
       - name: Cache Cargo downloads
         uses: actions/cache@v4
         with:
@@ -53,6 +71,11 @@ jobs:
         run: |
           rm -rf web-ui/dist
           test ! -e web-ui/dist
+
+      - name: Check release script contracts and shell syntax
+        run: |
+          node --test scripts/release-package.test.mjs
+          bash -n start.sh run.sh scripts/package-macos.sh scripts/package-linux.sh scripts/smoke-package.sh
 
       - name: Install locked frontend dependencies
         working-directory: web-ui
@@ -155,9 +178,72 @@ jobs:
             ~/.cargo/git
           key: ${{ runner.os }}-cargo-${{ env.RUST_VERSION }}-${{ hashFiles('Cargo.lock') }}
 
+      - name: Configure Windows Authenticode certificate
+        if: github.ref_type == 'tag' && matrix.platform == 'windows'
+        shell: pwsh
+        env:
+          CERTIFICATE_BASE64: ${{ secrets.WINDOWS_SIGNING_CERTIFICATE_BASE64 }}
+          CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_SIGNING_CERTIFICATE_PASSWORD }}
+          TIMESTAMP_URL: ${{ vars.WINDOWS_SIGNING_TIMESTAMP_URL }}
+        run: |
+          $missing = @()
+          if ([string]::IsNullOrWhiteSpace($env:CERTIFICATE_BASE64)) { $missing += 'WINDOWS_SIGNING_CERTIFICATE_BASE64 secret' }
+          if ([string]::IsNullOrWhiteSpace($env:CERTIFICATE_PASSWORD)) { $missing += 'WINDOWS_SIGNING_CERTIFICATE_PASSWORD secret' }
+          if ([string]::IsNullOrWhiteSpace($env:TIMESTAMP_URL)) { $missing += 'WINDOWS_SIGNING_TIMESTAMP_URL variable' }
+          if ($missing.Count -gt 0) { throw "Stable tag signing is not configured: $($missing -join ', ')" }
+          $certificate = Join-Path $env:RUNNER_TEMP 'base-search-authenticode.pfx'
+          try {
+            [IO.File]::WriteAllBytes($certificate, [Convert]::FromBase64String($env:CERTIFICATE_BASE64))
+          } catch {
+            throw "WINDOWS_SIGNING_CERTIFICATE_BASE64 is not valid base64: $($_.Exception.Message)"
+          }
+          "BASE_SEARCH_WINDOWS_CERTIFICATE=$certificate" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Configure macOS Developer ID certificate
+        if: github.ref_type == 'tag' && matrix.platform == 'macos'
+        env:
+          CERTIFICATE_BASE64: ${{ secrets.MACOS_SIGNING_CERTIFICATE_BASE64 }}
+          CERTIFICATE_PASSWORD: ${{ secrets.MACOS_SIGNING_CERTIFICATE_PASSWORD }}
+          SIGNING_IDENTITY: ${{ secrets.MACOS_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+        run: |
+          set -euo pipefail
+          missing=()
+          [[ -n "$CERTIFICATE_BASE64" ]] || missing+=(MACOS_SIGNING_CERTIFICATE_BASE64)
+          [[ -n "$CERTIFICATE_PASSWORD" ]] || missing+=(MACOS_SIGNING_CERTIFICATE_PASSWORD)
+          [[ -n "$SIGNING_IDENTITY" ]] || missing+=(MACOS_SIGNING_IDENTITY)
+          [[ -n "$APPLE_ID" ]] || missing+=(APPLE_ID)
+          [[ -n "$APPLE_TEAM_ID" ]] || missing+=(APPLE_TEAM_ID)
+          [[ -n "$APPLE_APP_PASSWORD" ]] || missing+=(APPLE_APP_SPECIFIC_PASSWORD)
+          if (( ${#missing[@]} > 0 )); then
+            printf 'Stable tag signing is not configured. Missing secrets: %s\n' "${missing[*]}" >&2
+            exit 1
+          fi
+          certificate="$RUNNER_TEMP/base-search-developer-id.p12"
+          keychain="$RUNNER_TEMP/base-search-signing.keychain-db"
+          keychain_password=$(openssl rand -hex 24)
+          if ! printf '%s' "$CERTIFICATE_BASE64" | openssl base64 -d -A -out "$certificate"; then
+            echo 'MACOS_SIGNING_CERTIFICATE_BASE64 is not valid base64.' >&2
+            exit 1
+          fi
+          security create-keychain -p "$keychain_password" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$keychain_password" "$keychain"
+          security import "$certificate" -k "$keychain" -P "$CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$keychain_password" "$keychain"
+          security list-keychains -d user -s "$keychain"
+          security find-identity -v -p codesigning "$keychain"
+          echo "BASE_SEARCH_MACOS_KEYCHAIN=$keychain" >> "$GITHUB_ENV"
+          echo "BASE_SEARCH_MACOS_CERTIFICATE=$certificate" >> "$GITHUB_ENV"
+
       - name: Build Windows folder and ZIP
         if: matrix.platform == 'windows'
         shell: pwsh
+        env:
+          BASE_SEARCH_WINDOWS_CERTIFICATE_PASSWORD: ${{ github.ref_type == 'tag' && secrets.WINDOWS_SIGNING_CERTIFICATE_PASSWORD || '' }}
+          BASE_SEARCH_WINDOWS_TIMESTAMP_URL: ${{ github.ref_type == 'tag' && vars.WINDOWS_SIGNING_TIMESTAMP_URL || '' }}
         run: ./scripts/package-release.ps1 -OutputRoot release_packages
 
       - name: Smoke extracted Windows package
@@ -174,6 +260,11 @@ jobs:
 
       - name: Build macOS app folder and ZIP
         if: matrix.platform == 'macos'
+        env:
+          BASE_SEARCH_MACOS_SIGN_IDENTITY: ${{ github.ref_type == 'tag' && secrets.MACOS_SIGNING_IDENTITY || '' }}
+          BASE_SEARCH_APPLE_ID: ${{ github.ref_type == 'tag' && secrets.APPLE_ID || '' }}
+          BASE_SEARCH_APPLE_TEAM_ID: ${{ github.ref_type == 'tag' && secrets.APPLE_TEAM_ID || '' }}
+          BASE_SEARCH_APP_PASSWORD: ${{ github.ref_type == 'tag' && secrets.APPLE_APP_SPECIFIC_PASSWORD || '' }}
         run: bash scripts/package-macos.sh release_packages
 
       - name: Smoke extracted macOS package
@@ -182,7 +273,7 @@ jobs:
           archive=$(find release_packages -maxdepth 1 -type f -name 'BaseSearch-*-macos-*.zip' | head -n 1)
           test -n "$archive"
           mkdir -p target/archive-smoke/macos
-          unzip -q "$archive" -d target/archive-smoke/macos
+          ditto -x -k "$archive" target/archive-smoke/macos
           package=$(find target/archive-smoke/macos -mindepth 1 -maxdepth 1 -type d | head -n 1)
           bash scripts/smoke-package.sh macos "$package"
 
@@ -229,3 +320,63 @@ jobs:
             release_packages/BaseSearch-*-linux-*.tar.gz
             release_packages/BaseSearch-*-linux-*.tar.gz.sha256
           if-no-files-found: error
+
+      - name: Remove temporary signing credentials
+        if: always() && github.ref_type == 'tag'
+        shell: bash
+        run: |
+          if [[ "${{ matrix.platform }}" == macos ]]; then
+            [[ -z "${BASE_SEARCH_MACOS_KEYCHAIN:-}" ]] || security delete-keychain "$BASE_SEARCH_MACOS_KEYCHAIN" || true
+            [[ -z "${BASE_SEARCH_MACOS_CERTIFICATE:-}" ]] || rm -f -- "$BASE_SEARCH_MACOS_CERTIFICATE"
+          elif [[ "${{ matrix.platform }}" == windows ]]; then
+            powershell -NoProfile -Command 'if ($env:BASE_SEARCH_WINDOWS_CERTIFICATE) { Remove-Item -LiteralPath $env:BASE_SEARCH_WINDOWS_CERTIFICATE -Force -ErrorAction SilentlyContinue }'
+          fi
+
+  release:
+    name: Publish checksummed GitHub Release
+    if: github.ref_type == 'tag'
+    needs: packages
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download gated package artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: BaseSearch-*-package
+          merge-multiple: true
+          path: release_assets
+
+      - name: Verify archives and create consolidated checksums
+        run: |
+          set -euo pipefail
+          mapfile -d '' checksum_files < <(find release_assets -maxdepth 1 -type f -name '*.sha256' -print0 | sort -z)
+          [[ ${#checksum_files[@]} -eq 3 ]] || { echo "Expected three platform checksum files." >&2; exit 1; }
+          for checksum in "${checksum_files[@]}"; do
+            (cd "$(dirname "$checksum")" && sha256sum --check "$(basename "$checksum")")
+          done
+          mapfile -d '' archives < <(find release_assets -maxdepth 1 -type f \( -name '*.zip' -o -name '*.tar.gz' \) -print0 | sort -z)
+          [[ ${#archives[@]} -eq 3 ]] || { echo "Expected three platform archives." >&2; exit 1; }
+          sums="release_assets/BaseSearch-${GITHUB_REF_NAME#v}-SHA256SUMS.txt"
+          : > "$sums"
+          for archive in "${archives[@]}"; do
+            printf '%s  %s\n' "$(sha256sum "$archive" | cut -d ' ' -f1)" "$(basename "$archive")" >> "$sums"
+          done
+
+      - name: Publish release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          assets=(release_assets/*.zip release_assets/*.tar.gz release_assets/*.sha256 release_assets/*-SHA256SUMS.txt)
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" "${assets[@]}" --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" "${assets[@]}" \
+              --verify-tag \
+              --generate-notes \
+              --title "Base Search ${GITHUB_REF_NAME#v}"
+          fi

@@ -8,8 +8,9 @@
 use std::path::{Path, PathBuf};
 
 use crate::db::{
-    Analytics, AnalyticsGroupRow, AnalyticsMonthRow, AnalyticsOverview, AnalyticsPriceMetric,
-    AnalyticsScope, AnalyticsSection, Db, Query,
+    Analytics, AnalyticsCurrencyTotal, AnalyticsGroupRow, AnalyticsMeasures, AnalyticsMonthRow,
+    AnalyticsOverview, AnalyticsPriceMetric, AnalyticsScope, AnalyticsSection,
+    AnalyticsUsdCompatibility, AnalyticsValuePerWeight, AnalyticsWeightTotal, Db, Query,
 };
 use crate::duckdb_olap;
 use crate::engines::{AnalyticsEngine, DuckDbAnalyticsEngine};
@@ -104,11 +105,9 @@ fn overview_matches(a: &AnalyticsOverview, b: &AnalyticsOverview) -> bool {
         && a.distinct_origin_countries == b.distinct_origin_countries
         && a.distinct_dispatch_countries == b.distinct_dispatch_countries
         && a.distinct_trade_countries == b.distinct_trade_countries
-        && close(a.total_value_usd, b.total_value_usd)
-        && close(a.total_net_kg, b.total_net_kg)
-        && close(a.total_gross_kg, b.total_gross_kg)
         && close(a.total_quantity, b.total_quantity)
-        && close(a.avg_value_per_net_kg, b.avg_value_per_net_kg)
+        && usd_compatibility_matches(a.compatible_usd.as_ref(), b.compatible_usd.as_ref())
+        && measures_match(&a.measures, &b.measures)
 }
 
 fn analytics_matches(a: &Analytics, b: &Analytics) -> bool {
@@ -126,34 +125,164 @@ fn months_match(a: &[AnalyticsMonthRow], b: &[AnalyticsMonthRow]) -> bool {
             a.month == b.month
                 && a.rows == b.rows
                 && a.declarations == b.declarations
-                && close(a.total_value_usd, b.total_value_usd)
-                && close(a.total_net_kg, b.total_net_kg)
+                && usd_compatibility_matches(a.compatible_usd.as_ref(), b.compatible_usd.as_ref())
+                && measures_match(&a.measures, &b.measures)
         })
 }
 
 fn sections_match(a: &[AnalyticsSection], b: &[AnalyticsSection]) -> bool {
     a.len() == b.len()
-        && a.iter().zip(b).all(|(a, b)| {
-            a.kind == b.kind
-                && a.rows.len() == b.rows.len()
-                && a.rows
-                    .iter()
-                    .zip(&b.rows)
-                    .all(|(a, b)| group_rows_match(a, b))
+        && a.iter().all(|left_section| {
+            b.iter()
+                .find(|right_section| right_section.kind == left_section.kind)
+                .is_some_and(|right_section| {
+                    left_section.rows.len() == right_section.rows.len()
+                        && left_section.rows.iter().all(|left_row| {
+                            right_section
+                                .rows
+                                .iter()
+                                .find(|right_row| right_row.label == left_row.label)
+                                .is_some_and(|right_row| group_rows_match(left_row, right_row))
+                        })
+                })
         })
 }
 
 fn group_rows_match(a: &AnalyticsGroupRow, b: &AnalyticsGroupRow) -> bool {
+    let compatible_share_matches = match (a.compatible_usd.as_ref(), b.compatible_usd.as_ref()) {
+        (None, None) => true,
+        (Some(_), Some(_)) => close(a.share_percent, b.share_percent),
+        _ => false,
+    };
     a.label == b.label
         && a.rows == b.rows
         && a.declarations == b.declarations
         && a.companies == b.companies
-        && close(a.total_value_usd, b.total_value_usd)
-        && close(a.total_net_kg, b.total_net_kg)
-        && close(a.total_gross_kg, b.total_gross_kg)
         && close(a.total_quantity, b.total_quantity)
-        && close(a.share_percent, b.share_percent)
-        && close(a.avg_value_per_net_kg, b.avg_value_per_net_kg)
+        && compatible_share_matches
+        && usd_compatibility_matches(a.compatible_usd.as_ref(), b.compatible_usd.as_ref())
+        && measures_match(&a.measures, &b.measures)
+}
+
+fn usd_compatibility_matches(
+    a: Option<&AnalyticsUsdCompatibility>,
+    b: Option<&AnalyticsUsdCompatibility>,
+) -> bool {
+    match (a, b) {
+        (None, None) => true,
+        (Some(a), Some(b)) => {
+            close(a.total_value_usd, b.total_value_usd)
+                && optional_close(a.avg_value_per_net_kg, b.avg_value_per_net_kg)
+        }
+        _ => false,
+    }
+}
+
+fn measures_match(a: &AnalyticsMeasures, b: &AnalyticsMeasures) -> bool {
+    currency_totals_match(&a.currency_totals, &b.currency_totals)
+        && weight_totals_match(&a.net_weight_totals, &b.net_weight_totals)
+        && weight_totals_match(&a.gross_weight_totals, &b.gross_weight_totals)
+        && value_per_weight_match(&a.value_per_net_weight, &b.value_per_net_weight)
+        && currency_total_option_matches(
+            a.compatible_value_total.as_ref(),
+            b.compatible_value_total.as_ref(),
+        )
+        && value_per_weight_option_matches(
+            a.compatible_value_per_net_weight.as_ref(),
+            b.compatible_value_per_net_weight.as_ref(),
+        )
+        && a.exclusions == b.exclusions
+}
+
+fn currency_totals_match(a: &[AnalyticsCurrencyTotal], b: &[AnalyticsCurrencyTotal]) -> bool {
+    a.len() == b.len()
+        && a.iter().all(|left| {
+            b.iter()
+                .find(|right| right.currency == left.currency)
+                .is_some_and(|right| currency_total_matches(left, right))
+        })
+}
+
+fn currency_total_matches(a: &AnalyticsCurrencyTotal, b: &AnalyticsCurrencyTotal) -> bool {
+    a.currency == b.currency
+        && a.known == b.known
+        && a.valued_rows == b.valued_rows
+        && close(a.total_value, b.total_value)
+}
+
+fn currency_total_option_matches(
+    a: Option<&AnalyticsCurrencyTotal>,
+    b: Option<&AnalyticsCurrencyTotal>,
+) -> bool {
+    match (a, b) {
+        (None, None) => true,
+        (Some(a), Some(b)) => currency_total_matches(a, b),
+        _ => false,
+    }
+}
+
+fn weight_totals_match(a: &[AnalyticsWeightTotal], b: &[AnalyticsWeightTotal]) -> bool {
+    a.len() == b.len()
+        && a.iter().all(|left| {
+            b.iter()
+                .find(|right| right.source_unit == left.source_unit)
+                .is_some_and(|right| weight_total_matches(left, right))
+        })
+}
+
+fn weight_total_matches(a: &AnalyticsWeightTotal, b: &AnalyticsWeightTotal) -> bool {
+    a.source_unit == b.source_unit
+        && a.known == b.known
+        && a.normalized_unit == b.normalized_unit
+        && optional_close(a.factor_to_kg, b.factor_to_kg)
+        && a.weighted_rows == b.weighted_rows
+        && close(a.total_source_weight, b.total_source_weight)
+        && optional_close(a.total_kg, b.total_kg)
+}
+
+fn value_per_weight_match(a: &[AnalyticsValuePerWeight], b: &[AnalyticsValuePerWeight]) -> bool {
+    a.len() == b.len()
+        && a.iter().all(|left| {
+            b.iter()
+                .find(|right| {
+                    right.currency == left.currency
+                        && right.normalized_weight_unit == left.normalized_weight_unit
+                })
+                .is_some_and(|right| value_per_weight_row_matches(left, right))
+        })
+}
+
+fn value_per_weight_row_matches(a: &AnalyticsValuePerWeight, b: &AnalyticsValuePerWeight) -> bool {
+    let mut a_units = a.source_weight_units.clone();
+    let mut b_units = b.source_weight_units.clone();
+    a_units.sort();
+    b_units.sort();
+    a.currency == b.currency
+        && a.normalized_weight_unit == b.normalized_weight_unit
+        && a_units == b_units
+        && a.paired_rows == b.paired_rows
+        && close(a.total_value, b.total_value)
+        && close(a.total_weight, b.total_weight)
+        && optional_close(a.value_per_weight, b.value_per_weight)
+}
+
+fn value_per_weight_option_matches(
+    a: Option<&AnalyticsValuePerWeight>,
+    b: Option<&AnalyticsValuePerWeight>,
+) -> bool {
+    match (a, b) {
+        (None, None) => true,
+        (Some(a), Some(b)) => value_per_weight_row_matches(a, b),
+        _ => false,
+    }
+}
+
+fn optional_close(a: Option<f64>, b: Option<f64>) -> bool {
+    match (a, b) {
+        (None, None) => true,
+        (Some(a), Some(b)) => close(a, b),
+        _ => false,
+    }
 }
 
 fn prices_match(a: &[AnalyticsPriceMetric], b: &[AnalyticsPriceMetric]) -> bool {
@@ -179,7 +308,9 @@ fn close(a: f64, b: f64) -> bool {
 #[cfg(test)]
 mod tests {
     use super::overview_matches;
-    use crate::db::AnalyticsOverview;
+    use crate::db::{
+        AnalyticsCurrencyTotal, AnalyticsMeasures, AnalyticsOverview, AnalyticsUsdCompatibility,
+    };
 
     #[test]
     fn verification_rejects_dimension_rollup_drift() {
@@ -198,10 +329,48 @@ mod tests {
     fn verification_rejects_material_numeric_drift() {
         let sqlite = AnalyticsOverview {
             total_value_usd: 1_000.0,
+            compatible_usd: Some(AnalyticsUsdCompatibility {
+                total_value_usd: 1_000.0,
+                avg_value_per_net_kg: None,
+            }),
             ..Default::default()
         };
         let duck = AnalyticsOverview {
             total_value_usd: 1_001.0,
+            compatible_usd: Some(AnalyticsUsdCompatibility {
+                total_value_usd: 1_001.0,
+                avg_value_per_net_kg: None,
+            }),
+            ..Default::default()
+        };
+
+        assert!(!overview_matches(&sqlite, &duck));
+    }
+
+    #[test]
+    fn verification_rejects_currency_cohort_drift() {
+        let sqlite = AnalyticsOverview {
+            measures: AnalyticsMeasures {
+                currency_totals: vec![AnalyticsCurrencyTotal {
+                    currency: "USD".to_string(),
+                    known: true,
+                    valued_rows: 2,
+                    total_value: 1_000.0,
+                }],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let duck = AnalyticsOverview {
+            measures: AnalyticsMeasures {
+                currency_totals: vec![AnalyticsCurrencyTotal {
+                    currency: "EUR".to_string(),
+                    known: true,
+                    valued_rows: 2,
+                    total_value: 1_000.0,
+                }],
+                ..Default::default()
+            },
             ..Default::default()
         };
 

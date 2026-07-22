@@ -107,6 +107,26 @@ async fn serve(config: ServerConfig) -> Result<(), String> {
         sessions: auth::Sessions::new(),
         projection_trust: std::sync::Mutex::new(None),
     });
+    let weak_state = Arc::downgrade(&state);
+    state.jobs.set_authorizer(move |owner_user_id, permission| {
+        if owner_user_id == "local-owner" {
+            return true;
+        }
+        let Some(state) = weak_state.upgrade() else {
+            return false;
+        };
+        state
+            .auth
+            .list_users()
+            .ok()
+            .and_then(|users| {
+                users
+                    .into_iter()
+                    .find(|user| user.id == owner_user_id && user.enabled)
+            })
+            .and_then(|user| auth::Role::parse(&user.role))
+            .is_some_and(|role| role.allows(permission))
+    });
     state.jobs.start_artifact_cleanup_task();
 
     spawn_startup_reindex(&state);

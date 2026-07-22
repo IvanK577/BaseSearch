@@ -135,6 +135,13 @@ impl UploadCleanupGuard {
     fn disarm(&mut self) {
         self.armed = false;
     }
+
+    fn cleanup_on_error<T>(&self, result: Result<T, ApiError>) -> Result<T, ApiError> {
+        if result.is_err() {
+            cleanup(&self.files);
+        }
+        result
+    }
 }
 
 impl std::ops::Deref for UploadCleanupGuard {
@@ -169,6 +176,28 @@ fn ensure_upload_space(directory: &std::path::Path, incoming_bytes: u64) -> Resu
         )));
     }
     Ok(())
+}
+
+async fn read_bounded_metadata(
+    field: &mut axum::extract::multipart::Field<'_>,
+    max_bytes: usize,
+    read_context: &str,
+    limit_message: &str,
+) -> Result<Vec<u8>, ApiError> {
+    let mut bytes = Vec::with_capacity(max_bytes.min(8 * 1024));
+    loop {
+        let chunk = field
+            .chunk()
+            .await
+            .map_err(|err| ApiError::bad_request(format!("{read_context}: {err}")))?;
+        let Some(chunk) = chunk else {
+            return Ok(bytes);
+        };
+        if chunk.len() > max_bytes.saturating_sub(bytes.len()) {
+            return Err(ApiError::payload_too_large(limit_message));
+        }
+        bytes.extend_from_slice(&chunk);
+    }
 }
 
 pub async fn upload(
@@ -207,18 +236,20 @@ pub async fn upload(
                     "Sheet selection was provided more than once.",
                 ));
             }
-            let bytes = field
-                .bytes()
-                .await
-                .map_err(|err| ApiError::bad_request(format!("Read sheet selection: {err}")))?;
-            if bytes.len() > MAX_SHEET_OPTIONS_BYTES {
-                cleanup(&saved);
-                return Err(ApiError::payload_too_large(
+            let bytes = saved.cleanup_on_error(
+                read_bounded_metadata(
+                    &mut field,
+                    MAX_SHEET_OPTIONS_BYTES,
+                    "Read sheet selection",
                     "Sheet selection metadata is too large.",
-                ));
-            }
-            let names: Vec<String> = serde_json::from_slice(&bytes)
-                .map_err(|_| ApiError::bad_request("Sheet selection is not valid JSON."))?;
+                )
+                .await,
+            )?;
+            let names: Vec<String> =
+                saved
+                    .cleanup_on_error(serde_json::from_slice(&bytes).map_err(|_| {
+                        ApiError::bad_request("Sheet selection is not valid JSON.")
+                    }))?;
             if names.is_empty() || names.len() > MAX_SELECTED_SHEETS {
                 cleanup(&saved);
                 return Err(ApiError::bad_request(format!(
@@ -247,19 +278,20 @@ pub async fn upload(
                     "Column mapping was provided more than once.",
                 ));
             }
-            let bytes = field
-                .bytes()
-                .await
-                .map_err(|err| ApiError::bad_request(format!("Read column mapping: {err}")))?;
-            if bytes.len() > MAX_SEMANTIC_OPTIONS_BYTES {
-                cleanup(&saved);
-                return Err(ApiError::payload_too_large(
+            let bytes = saved.cleanup_on_error(
+                read_bounded_metadata(
+                    &mut field,
+                    MAX_SEMANTIC_OPTIONS_BYTES,
+                    "Read column mapping",
                     "Column mapping metadata is too large.",
-                ));
-            }
-            let raw: BTreeMap<String, BTreeMap<usize, Option<SemanticField>>> =
-                serde_json::from_slice(&bytes)
-                    .map_err(|_| ApiError::bad_request("Column mapping is not valid JSON."))?;
+                )
+                .await,
+            )?;
+            let raw: BTreeMap<String, BTreeMap<usize, Option<SemanticField>>> = saved
+                .cleanup_on_error(
+                    serde_json::from_slice(&bytes)
+                        .map_err(|_| ApiError::bad_request("Column mapping is not valid JSON.")),
+                )?;
             let override_count = raw.values().map(BTreeMap::len).sum::<usize>();
             if raw.len() > MAX_SELECTED_SHEETS || override_count > MAX_SEMANTIC_OVERRIDES {
                 cleanup(&saved);
@@ -297,19 +329,19 @@ pub async fn upload(
                     "Source profile selection was provided more than once.",
                 ));
             }
-            let bytes = field
-                .bytes()
-                .await
-                .map_err(|err| ApiError::bad_request(format!("Read source profiles: {err}")))?;
-            if bytes.len() > MAX_PROFILE_OPTIONS_BYTES {
-                cleanup(&saved);
-                return Err(ApiError::payload_too_large(
+            let bytes = saved.cleanup_on_error(
+                read_bounded_metadata(
+                    &mut field,
+                    MAX_PROFILE_OPTIONS_BYTES,
+                    "Read source profiles",
                     "Source profile selection metadata is too large.",
-                ));
-            }
-            let raw: BTreeMap<String, i64> = serde_json::from_slice(&bytes).map_err(|_| {
-                ApiError::bad_request("Source profile selection is not valid JSON.")
-            })?;
+                )
+                .await,
+            )?;
+            let raw: BTreeMap<String, i64> =
+                saved.cleanup_on_error(serde_json::from_slice(&bytes).map_err(|_| {
+                    ApiError::bad_request("Source profile selection is not valid JSON.")
+                }))?;
             if raw.len() > MAX_SELECTED_SHEETS {
                 cleanup(&saved);
                 return Err(ApiError::bad_request(format!(
@@ -338,21 +370,20 @@ pub async fn upload(
                     "Fixed source values were provided more than once.",
                 ));
             }
-            let bytes = field
-                .bytes()
-                .await
-                .map_err(|err| ApiError::bad_request(format!("Read fixed source values: {err}")))?;
-            if bytes.len() > MAX_FIXED_OPTIONS_BYTES {
-                cleanup(&saved);
-                return Err(ApiError::payload_too_large(
+            let bytes = saved.cleanup_on_error(
+                read_bounded_metadata(
+                    &mut field,
+                    MAX_FIXED_OPTIONS_BYTES,
+                    "Read fixed source values",
                     "Fixed source value metadata is too large.",
-                ));
-            }
-            let raw: BTreeMap<String, BTreeMap<SemanticField, String>> =
-                serde_json::from_slice(&bytes).map_err(|_| {
+                )
+                .await,
+            )?;
+            let raw: BTreeMap<String, BTreeMap<SemanticField, String>> = saved
+                .cleanup_on_error(serde_json::from_slice(&bytes).map_err(|_| {
                     ApiError::bad_request("Fixed source values are not valid JSON.")
-                })?;
-            sheet_fixed_values = Some(validate_sheet_fixed_values(raw)?);
+                }))?;
+            sheet_fixed_values = Some(saved.cleanup_on_error(validate_sheet_fixed_values(raw))?);
             continue;
         }
 
@@ -581,7 +612,6 @@ fn run_import(
                 selected_sheets: selected_sheets.clone(),
                 sheet_semantics: sheet_semantics.clone(),
                 sheet_fixed_values: sheet_fixed_values.clone(),
-                ..import::ImportOptions::default()
             }
         } else {
             import::ImportOptions::default()
@@ -1013,16 +1043,114 @@ pub async fn log(
 
 #[cfg(test)]
 mod tests {
+    use std::pin::Pin;
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
     use std::sync::{Arc, Mutex};
+    use std::task::{Context, Poll};
 
     use axum::body::Body;
     use axum::http::{Method, Request, StatusCode, header};
+    use tokio::io::{AsyncRead, ReadBuf};
+    use tokio_util::io::ReaderStream;
     use tower::ServiceExt;
 
     use super::*;
     use crate::server::auth::{AuthStore, Identity, Sessions};
     use crate::server::jobs::{JobKind, JobQueueLimits, JobRegistry};
     use crate::server::state::AppStateInner;
+
+    struct CountingReader {
+        bytes: Vec<u8>,
+        offset: usize,
+        consumed: Arc<AtomicUsize>,
+        yield_pending: bool,
+    }
+
+    impl AsyncRead for CountingReader {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            if self.yield_pending {
+                self.yield_pending = false;
+                cx.waker().wake_by_ref();
+                return Poll::Pending;
+            }
+            if self.offset == self.bytes.len() {
+                return Poll::Ready(Ok(()));
+            }
+            let count = buf.remaining().min(self.bytes.len() - self.offset);
+            let end = self.offset + count;
+            buf.put_slice(&self.bytes[self.offset..end]);
+            self.offset = end;
+            self.consumed.store(end, AtomicOrdering::Relaxed);
+            self.yield_pending = true;
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn oversized_metadata_is_rejected_before_the_request_stream_finishes() {
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join("workspace.db");
+        Db::open(&db_path).unwrap();
+        let uploads_dir = temp.path().join("uploads");
+        let state = Arc::new(AppStateInner {
+            auth: AuthStore::open(&db_path).unwrap(),
+            db_path,
+            jobs: JobRegistry::new(),
+            uploads_dir: uploads_dir.clone(),
+            exports_dir: temp.path().join("exports"),
+            lan_exposed: false,
+            require_auth: false,
+            sessions: Sessions::new(),
+            projection_trust: Mutex::new(None),
+        });
+        let boundary = "bounded-metadata";
+        let mut bytes = format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"files\"; filename=\"rows.csv\"\r\nContent-Type: text/csv\r\n\r\nname,value\r\nrow,1\r\n\
+             --{boundary}\r\nContent-Disposition: form-data; name=\"selected_sheets\"\r\n\r\n"
+        )
+        .into_bytes();
+        bytes.resize(bytes.len() + MAX_SHEET_OPTIONS_BYTES + 1024 * 1024, b'x');
+        bytes.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+        let body_bytes = bytes.len();
+        let consumed = Arc::new(AtomicUsize::new(0));
+        let body = Body::from_stream(ReaderStream::with_capacity(
+            CountingReader {
+                bytes,
+                offset: 0,
+                consumed: Arc::clone(&consumed),
+                yield_pending: false,
+            },
+            1024,
+        ));
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri("/api/imports")
+            .header(
+                header::CONTENT_TYPE,
+                format!("multipart/form-data; boundary={boundary}"),
+            )
+            .body(body)
+            .unwrap();
+
+        let response = crate::server::api::router(state)
+            .oneshot(request)
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert!(
+            consumed.load(AtomicOrdering::Relaxed) < body_bytes / 2,
+            "metadata rejection must stop polling the request body near the field cap"
+        );
+        assert!(
+            !uploads_dir.exists() || std::fs::read_dir(&uploads_dir).unwrap().next().is_none(),
+            "oversized metadata must clean files streamed earlier in the request"
+        );
+    }
 
     #[tokio::test]
     async fn upload_rejects_more_than_the_bounded_file_count() {

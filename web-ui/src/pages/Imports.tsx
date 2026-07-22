@@ -55,6 +55,7 @@ export function ImportsPage() {
   const { jobs, refreshJobs, toast, canEditData } = useStore();
   const [drag, setDrag] = useState(false);
   const [log, setLog] = useState<ImportLogEntry[]>([]);
+  const [logError, setLogError] = useState<string | null>(null);
   const fileRef = useRef<HTMLInputElement>(null);
   const peekRef = useRef<HTMLInputElement>(null);
   const [peek, setPeek] = useState<{
@@ -82,10 +83,27 @@ export function ImportsPage() {
     () => jobs.filter((j) => j.kind === "import"),
     [jobs],
   );
+  const visibleImportJobs = useMemo(
+    () =>
+      importJobs
+        .filter((job) =>
+          job.status === "queued" || job.status === "running" || job.status === "failed",
+        )
+        .slice(0, 4),
+    [importJobs],
+  );
   const signature = importJobs.map((j) => `${j.id}:${j.status}`).join(",");
 
   useEffect(() => {
-    api.importLog(50).then(setLog).catch(() => {});
+    api
+      .importLog(50)
+      .then((entries) => {
+        setLog(entries);
+        setLogError(null);
+      })
+      .catch((error) =>
+        setLogError((error as ApiError)?.message ?? t("imports_history_unavailable")),
+      );
   }, [signature]);
 
   useEffect(() => {
@@ -365,45 +383,71 @@ export function ImportsPage() {
   };
 
   return (
-    <div className="stack content-narrow">
+    <div className="stack content-narrow imports-page">
       {!canEditData ? (
         <div className="banner banner-warn">
           {t("imports_editor_required")}
         </div>
       ) : (
-      <div
-        className={`dropzone ${drag ? "drag" : ""}`}
-        onDragOver={(e) => {
-          e.preventDefault();
-          setDrag(true);
-        }}
-        onDragLeave={() => setDrag(false)}
-        onDrop={(e) => {
-          e.preventDefault();
-          setDrag(false);
-          chooseFiles(e.dataTransfer.files);
-        }}
-        onClick={() => fileRef.current?.click()}
-      >
-        <Icon name="import" size={34} className="empty-icon" />
-        <div style={{ fontSize: 16, fontWeight: 600, marginTop: 10 }}>
-          {t("imports_drop")}
-        </div>
-        <div className="faint" style={{ marginTop: 6 }}>
-          {t("imports_hint")}
-        </div>
-        <input
-          ref={fileRef}
-          type="file"
-          multiple
-          accept=".xlsx,.xlsb,.xls,.xlsm,.ods,.csv,.tsv"
-          style={{ display: "none" }}
-          onChange={(e) => {
-            if (e.target.files) chooseFiles(e.target.files);
-            e.target.value = "";
-          }}
-        />
-      </div>
+        <section className="panel import-intake">
+          <div
+            className={`dropzone ${drag ? "drag" : ""}`}
+            role="button"
+            tabIndex={0}
+            onDragOver={(event) => {
+              event.preventDefault();
+              setDrag(true);
+            }}
+            onDragLeave={() => setDrag(false)}
+            onDrop={(event) => {
+              event.preventDefault();
+              setDrag(false);
+              chooseFiles(event.dataTransfer.files);
+            }}
+            onClick={() => fileRef.current?.click()}
+            onKeyDown={(event) => {
+              if (event.key === "Enter" || event.key === " ") {
+                event.preventDefault();
+                fileRef.current?.click();
+              }
+            }}
+          >
+            <Icon name="import" size={26} className="empty-icon" />
+            <div className="dropzone-copy">
+              <strong>{t("imports_drop")}</strong>
+              <span>{t("imports_hint")}</span>
+            </div>
+            <input
+              ref={fileRef}
+              type="file"
+              multiple
+              accept=".xlsx,.xlsb,.xls,.xlsm,.ods,.csv,.tsv"
+              onChange={(event) => {
+                if (event.target.files) chooseFiles(event.target.files);
+                event.target.value = "";
+              }}
+            />
+          </div>
+          <div className="import-intake-actions">
+            <span className="faint">{t("imports_preview_hint")}</span>
+            <button
+              className="btn btn-sm"
+              onClick={() => peekRef.current?.click()}
+              disabled={peeking}
+            >
+              {peeking ? <Spinner /> : <Icon name="search" size={14} />} {t("imports_preview")}
+            </button>
+            <input
+              ref={peekRef}
+              type="file"
+              accept=".xlsx,.xlsb,.xls,.xlsm,.ods,.csv,.tsv"
+              onChange={(event) => {
+                preview(event.target.files?.[0]);
+                event.target.value = "";
+              }}
+            />
+          </div>
+        </section>
       )}
 
       {batchFiles.length > 1 ? (
@@ -432,29 +476,6 @@ export function ImportsPage() {
               </button>
             </div>
           </div>
-        </div>
-      ) : null}
-
-      {canEditData ? (
-        <div className="row wrap" style={{ gap: 10, justifyContent: "space-between" }}>
-          <span className="faint" style={{ fontSize: 12 }}>{t("imports_preview_hint")}</span>
-          <button
-            className="btn btn-sm"
-            onClick={() => peekRef.current?.click()}
-            disabled={peeking}
-          >
-            {peeking ? <Spinner /> : <Icon name="search" size={14} />} {t("imports_preview")}
-          </button>
-          <input
-            ref={peekRef}
-            type="file"
-            accept=".xlsx,.xlsb,.xls,.xlsm,.ods,.csv,.tsv"
-            style={{ display: "none" }}
-            onChange={(e) => {
-              preview(e.target.files?.[0]);
-              e.target.value = "";
-            }}
-          />
         </div>
       ) : null}
 
@@ -718,21 +739,34 @@ export function ImportsPage() {
         </div>
       ) : null}
 
-      {importJobs.length > 0 ? (
-        <div className="panel panel-pad stack" style={{ gap: 12 }}>
-          <div className="section-title" style={{ margin: 0 }}>
-            {t("nav_jobs")}
+      {visibleImportJobs.length > 0 ? (
+        <section className="panel panel-pad stack import-activity" style={{ gap: 10 }}>
+          <div className="row" style={{ justifyContent: "space-between" }}>
+            <div className="section-title" style={{ margin: 0 }}>
+              {t("nav_jobs")}
+            </div>
+            <a className="icon-button" href="#/jobs" aria-label={t("nav_jobs")} title={t("nav_jobs")}>
+              <Icon name="arrow-right" size={15} />
+            </a>
           </div>
-          {importJobs.slice(0, 4).map((job) => (
+          {visibleImportJobs.map((job) => (
             <ImportJobRow key={job.id} job={job} />
           ))}
-        </div>
+        </section>
       ) : null}
 
-      <div className="panel panel-pad">
+      <section className="panel panel-pad import-history">
         <div className="section-title">{t("imports_history")}</div>
-        {log.length === 0 ? (
-          <div className="faint">{t("common_none")}</div>
+        {logError ? (
+          <div className="banner">{logError}</div>
+        ) : log.length === 0 ? (
+          <div className="import-history-empty">
+            <Icon name="database" size={20} />
+            <div>
+              <strong>{t("common_none")}</strong>
+              <span>{t("imports_hint")}</span>
+            </div>
+          </div>
         ) : (
           <div className="table-wrap" style={{ maxHeight: "none" }}>
             <table className="grid" style={{ width: "100%" }}>
@@ -770,7 +804,7 @@ export function ImportsPage() {
             </table>
           </div>
         )}
-      </div>
+      </section>
     </div>
   );
 }
@@ -780,11 +814,10 @@ function ImportJobRow({ job }: { job: Job }) {
   const active = job.status === "running" || job.status === "queued";
   const result = job.result as ImportJobResult | undefined;
   return (
-    <div className="stack" style={{ gap: 6 }}>
-      <div className="row" style={{ justifyContent: "space-between" }}>
-        <span style={{ minWidth: 0, overflowWrap: "anywhere" }}>
-          {jobTitleLabel(t, job)}
-        </span>
+    <div className="import-job-row" data-status={job.status}>
+      <div className="import-job-head">
+        <span className="job-status-dot" aria-hidden="true" />
+        <strong>{jobTitleLabel(t, job)}</strong>
         <span className="faint">
           {jobPhaseLabel(t, active ? job.progress.phase : "", job.status)}
         </span>
@@ -793,8 +826,9 @@ function ImportJobRow({ job }: { job: Job }) {
         <Progress percent={job.progress.total > 0 ? job.progress.percent : null} />
       ) : null}
       {job.message ? <div className="faint">{job.message}</div> : null}
+      {job.error ? <div className="banner">{job.error}</div> : null}
       {result && !active ? (
-        <div className="faint">
+        <div className="import-job-result faint">
           {result.files.map((f, i) => (
             <div key={i}>
               {f.error

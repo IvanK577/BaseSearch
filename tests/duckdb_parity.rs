@@ -12,12 +12,11 @@ use std::path::Path;
 use std::sync::atomic::AtomicBool;
 
 use base_search::db::{
-    Analytics, AnalyticsPriceMetric, AnalyticsScope, AnalyticsSection, Db, Filters, ImportRecord,
-    Query, RecordScope, canonical_record_hash,
+    Analytics, AnalyticsMeasures, AnalyticsPriceMetric, AnalyticsScope, AnalyticsSection,
+    AnalyticsWeightTotal, Db, Filters, ImportRecord, PriceMetricKind, Query, RecordScope,
+    canonical_record_hash,
 };
-use base_search::domain::table::{
-    ColumnRole, ColumnStorage, SemanticField, SourceColumn, TableShape,
-};
+use base_search::domain::table::{ColumnStorage, SemanticField, TableShape};
 use base_search::duckdb_olap;
 use base_search::import;
 use base_search::schema::{COLUMNS, col_index};
@@ -37,6 +36,58 @@ fn write_fixture_xlsx(path: &Path, rows: &[Vec<(&str, &str)>]) {
         }
     }
     workbook.save(path).unwrap();
+}
+
+fn write_table_xlsx(path: &Path, headers: &[&str], rows: &[Vec<&str>]) {
+    let mut workbook = rust_xlsxwriter::Workbook::new();
+    let sheet = workbook.add_worksheet();
+    for (column, header) in headers.iter().enumerate() {
+        sheet.write_string(0, column as u16, *header).unwrap();
+    }
+    for (row_index, row) in rows.iter().enumerate() {
+        for (column, value) in row.iter().enumerate() {
+            sheet
+                .write_string(row_index as u32 + 1, column as u16, *value)
+                .unwrap();
+        }
+    }
+    workbook.save(path).unwrap();
+}
+
+fn import_with_fixed_context(
+    db: &mut Db,
+    path: &Path,
+    currency: &str,
+    weight_unit: &str,
+    amount: &str,
+    net_weight: &str,
+) {
+    write_table_xlsx(
+        path,
+        &["Invoice number", "Product", "Amount", "Net weight"],
+        &[vec![
+            path.file_stem().unwrap().to_str().unwrap(),
+            "Industrial controller",
+            amount,
+            net_weight,
+        ]],
+    );
+    let options = import::ImportOptions::selected_sheets(["Sheet1"]).with_sheet_fixed_values(
+        "Sheet1",
+        [
+            (SemanticField::Currency, currency),
+            (SemanticField::WeightUnit, weight_unit),
+        ],
+    );
+    let summary = import::import_file_with_options(
+        db,
+        path,
+        &options,
+        &AtomicBool::new(false),
+        &mut |_, _, _| {},
+    );
+    assert_eq!(summary.error, None);
+    assert_eq!(summary.imported, 1);
 }
 
 fn fixture_rows() -> Vec<Vec<(&'static str, &'static str)>> {
@@ -279,6 +330,100 @@ fn assert_close(actual: f64, expected: f64, context: &str) {
     );
 }
 
+fn assert_optional_close(actual: Option<f64>, expected: Option<f64>, context: &str) {
+    match (actual, expected) {
+        (None, None) => {}
+        (Some(actual), Some(expected)) => assert_close(actual, expected, context),
+        _ => panic!("{context}: optional values differ: {actual:?} vs {expected:?}"),
+    }
+}
+
+fn compare_measures(duck: &AnalyticsMeasures, sqlite: &AnalyticsMeasures, context: &str) {
+    assert_eq!(
+        duck.currency_totals.len(),
+        sqlite.currency_totals.len(),
+        "{context}: currency cohort count"
+    );
+    for expected in &sqlite.currency_totals {
+        let actual = duck
+            .currency_totals
+            .iter()
+            .find(|total| total.currency == expected.currency)
+            .unwrap_or_else(|| panic!("{context}: missing currency {}", expected.currency));
+        assert_eq!(actual.known, expected.known, "{context}: currency known");
+        assert_eq!(
+            actual.valued_rows, expected.valued_rows,
+            "{context}: valued rows"
+        );
+        assert_close(actual.total_value, expected.total_value, context);
+    }
+
+    let compare_weights =
+        |actual: &[AnalyticsWeightTotal], expected: &[AnalyticsWeightTotal], label: &str| {
+            assert_eq!(actual.len(), expected.len(), "{context}: {label} cohorts");
+            for expected in expected {
+                let actual = actual
+                    .iter()
+                    .find(|total| total.source_unit == expected.source_unit)
+                    .unwrap_or_else(|| {
+                        panic!("{context}: missing {label} unit {}", expected.source_unit)
+                    });
+                assert_eq!(actual.known, expected.known, "{context}: {label} known");
+                assert_eq!(
+                    actual.normalized_unit, expected.normalized_unit,
+                    "{context}: {label} normalized unit"
+                );
+                assert_optional_close(actual.factor_to_kg, expected.factor_to_kg, context);
+                assert_eq!(
+                    actual.weighted_rows, expected.weighted_rows,
+                    "{context}: {label} rows"
+                );
+                assert_close(
+                    actual.total_source_weight,
+                    expected.total_source_weight,
+                    context,
+                );
+                assert_optional_close(actual.total_kg, expected.total_kg, context);
+            }
+        };
+    compare_weights(
+        &duck.net_weight_totals,
+        &sqlite.net_weight_totals,
+        "net weight",
+    );
+    compare_weights(
+        &duck.gross_weight_totals,
+        &sqlite.gross_weight_totals,
+        "gross weight",
+    );
+
+    assert_eq!(
+        duck.value_per_net_weight.len(),
+        sqlite.value_per_net_weight.len(),
+        "{context}: value/weight cohort count"
+    );
+    for expected in &sqlite.value_per_net_weight {
+        let actual = duck
+            .value_per_net_weight
+            .iter()
+            .find(|metric| metric.currency == expected.currency)
+            .unwrap_or_else(|| panic!("{context}: missing ratio {}", expected.currency));
+        let mut actual_units = actual.source_weight_units.clone();
+        let mut expected_units = expected.source_weight_units.clone();
+        actual_units.sort();
+        expected_units.sort();
+        assert_eq!(actual_units, expected_units, "{context}: ratio units");
+        assert_eq!(
+            actual.paired_rows, expected.paired_rows,
+            "{context}: ratio rows"
+        );
+        assert_close(actual.total_value, expected.total_value, context);
+        assert_close(actual.total_weight, expected.total_weight, context);
+        assert_optional_close(actual.value_per_weight, expected.value_per_weight, context);
+    }
+    assert_eq!(duck.exclusions, sqlite.exclusions, "{context}: exclusions");
+}
+
 fn compare_analytics(duck: &Analytics, sqlite: &Analytics, context: &str) {
     let (d, s) = (&duck.overview, &sqlite.overview);
     assert_eq!(d.row_count, s.row_count, "{context}: row_count");
@@ -304,11 +449,16 @@ fn compare_analytics(duck: &Analytics, sqlite: &Analytics, context: &str) {
         d.distinct_origin_countries, s.distinct_origin_countries,
         "{context}: origin countries"
     );
-    assert_close(d.total_value_usd, s.total_value_usd, context);
-    assert_close(d.total_gross_kg, s.total_gross_kg, context);
-    assert_close(d.total_net_kg, s.total_net_kg, context);
     assert_close(d.total_quantity, s.total_quantity, context);
-    assert_close(d.avg_value_per_net_kg, s.avg_value_per_net_kg, context);
+    match (d.compatible_usd.as_ref(), s.compatible_usd.as_ref()) {
+        (None, None) => {}
+        (Some(d), Some(s)) => {
+            assert_close(d.total_value_usd, s.total_value_usd, context);
+            assert_optional_close(d.avg_value_per_net_kg, s.avg_value_per_net_kg, context);
+        }
+        _ => panic!("{context}: USD compatibility differs"),
+    }
+    compare_measures(&d.measures, &s.measures, context);
 
     assert_eq!(duck.months.len(), sqlite.months.len(), "{context}: months");
     for (dm, sm) in duck.months.iter().zip(sqlite.months.iter()) {
@@ -319,8 +469,14 @@ fn compare_analytics(duck: &Analytics, sqlite: &Analytics, context: &str) {
             "{context}: month declarations {}",
             sm.month
         );
-        assert_close(dm.total_value_usd, sm.total_value_usd, context);
-        assert_close(dm.total_net_kg, sm.total_net_kg, context);
+        match (dm.compatible_usd.as_ref(), sm.compatible_usd.as_ref()) {
+            (None, None) => {}
+            (Some(dm), Some(sm)) => {
+                assert_close(dm.total_value_usd, sm.total_value_usd, context);
+                assert_optional_close(dm.avg_value_per_net_kg, sm.avg_value_per_net_kg, context);
+            }
+            _ => panic!("{context}: month USD compatibility differs"),
+        }
     }
 
     compare_section_lists(&duck.company_sections, &sqlite.company_sections, context);
@@ -331,7 +487,11 @@ fn compare_analytics(duck: &Analytics, sqlite: &Analytics, context: &str) {
 
 fn compare_section_lists(duck: &[AnalyticsSection], sqlite: &[AnalyticsSection], context: &str) {
     assert_eq!(duck.len(), sqlite.len(), "{context}: section count");
-    for (ds, ss) in duck.iter().zip(sqlite.iter()) {
+    for ss in sqlite {
+        let ds = duck
+            .iter()
+            .find(|section| section.kind == ss.kind)
+            .unwrap_or_else(|| panic!("{context}: missing {:?} section", ss.kind));
         assert_eq!(ds.kind, ss.kind, "{context}: section kind");
         assert_eq!(
             ds.rows.len(),
@@ -339,18 +499,32 @@ fn compare_section_lists(duck: &[AnalyticsSection], sqlite: &[AnalyticsSection],
             "{context}: {:?} group count",
             ss.kind
         );
-        for (dr, sr) in ds.rows.iter().zip(ss.rows.iter()) {
+        for sr in &ss.rows {
+            let dr = ds
+                .rows
+                .iter()
+                .find(|row| row.label == sr.label)
+                .unwrap_or_else(|| panic!("{context}: missing {:?} / {}", ss.kind, sr.label));
             let group = format!("{context}: {:?} / {}", ss.kind, sr.label);
             assert_eq!(dr.label, sr.label, "{group}: label order");
             assert_eq!(dr.rows, sr.rows, "{group}: rows");
             assert_eq!(dr.declarations, sr.declarations, "{group}: declarations");
             assert_eq!(dr.companies, sr.companies, "{group}: companies");
-            assert_close(dr.total_value_usd, sr.total_value_usd, &group);
-            assert_close(dr.total_net_kg, sr.total_net_kg, &group);
-            assert_close(dr.total_gross_kg, sr.total_gross_kg, &group);
             assert_close(dr.total_quantity, sr.total_quantity, &group);
-            assert_close(dr.share_percent, sr.share_percent, &group);
-            assert_close(dr.avg_value_per_net_kg, sr.avg_value_per_net_kg, &group);
+            match (dr.compatible_usd.as_ref(), sr.compatible_usd.as_ref()) {
+                (None, None) => {}
+                (Some(duck_usd), Some(sqlite_usd)) => {
+                    assert_close(duck_usd.total_value_usd, sqlite_usd.total_value_usd, &group);
+                    assert_optional_close(
+                        duck_usd.avg_value_per_net_kg,
+                        sqlite_usd.avg_value_per_net_kg,
+                        &group,
+                    );
+                    assert_close(dr.share_percent, sr.share_percent, &group);
+                }
+                _ => panic!("{group}: USD compatibility differs"),
+            }
+            compare_measures(&dr.measures, &sr.measures, &group);
         }
     }
 }
@@ -364,6 +538,10 @@ fn compare_price_lists(
     for (dm, sm) in duck.iter().zip(sqlite.iter()) {
         let metric = format!("{context}: price {:?}", sm.kind);
         assert_eq!(dm.kind, sm.kind, "{metric}: kind");
+        if sm.kind == PriceMetricKind::ValuePerNetKg && dm.cohorts.len() != 1 {
+            assert_eq!(dm.count, 0, "{metric}: unsafe scalar count");
+            continue;
+        }
         assert_eq!(dm.count, sm.count, "{metric}: count");
         assert_close(dm.average, sm.average, &metric);
         assert_close(dm.minimum, sm.minimum, &metric);
@@ -533,6 +711,163 @@ fn duckdb_rollups_match_sqlite_for_json_backed_semantics() {
 }
 
 #[test]
+fn mixed_currency_detail_never_exposes_a_usd_compatibility_sum() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("mixed-currency.db");
+    let input = dir.path().join("mixed-currency.xlsx");
+    write_table_xlsx(
+        &input,
+        &[
+            "Invoice number",
+            "Product",
+            "Amount",
+            "Currency",
+            "Net weight",
+            "Weight unit",
+        ],
+        &[
+            vec!["INV-USD", "Controller", "1000", "USD", "10", "kg"],
+            vec!["INV-EUR", "Controller", "900", "EUR", "5", "kg"],
+        ],
+    );
+    let mut db = Db::open(&db_path).unwrap();
+    let summary = import::import_file(&mut db, &input, &AtomicBool::new(false), &mut |_, _, _| {});
+    assert_eq!(summary.error, None);
+    assert_eq!(summary.imported, 2);
+    let projection = duckdb_olap::default_projection_path(&db_path);
+    duckdb_olap::build_projection_atomic(&db_path, &projection).unwrap();
+
+    let (analytics, source) =
+        duckdb_olap::analytics_scoped_with_source(&projection, &Query::default(), 20, None, 10)
+            .unwrap();
+    assert_eq!(source, duckdb_olap::DuckAnalyticsSource::Detail);
+    assert!(analytics.overview.compatible_usd.is_none());
+    assert_eq!(analytics.overview.total_value_usd, 0.0);
+    assert!(analytics.overview.measures.compatible_value_total.is_none());
+    assert_eq!(analytics.overview.measures.currency_totals.len(), 2);
+    let usd = analytics
+        .overview
+        .measures
+        .currency_totals
+        .iter()
+        .find(|total| total.currency == "USD")
+        .unwrap();
+    let eur = analytics
+        .overview
+        .measures
+        .currency_totals
+        .iter()
+        .find(|total| total.currency == "EUR")
+        .unwrap();
+    assert_close(usd.total_value, 1_000.0, "USD cohort");
+    assert_close(eur.total_value, 900.0, "EUR cohort");
+    let wire = serde_json::to_value(&analytics.overview).unwrap();
+    assert!(wire.get("total_value_usd").is_none());
+    assert!(wire.get("avg_value_per_net_kg").is_none());
+}
+
+#[test]
+fn projection_uses_fixed_currency_context_from_each_source_schema() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("fixed-context.db");
+    let mut db = Db::open(&db_path).unwrap();
+    import_with_fixed_context(
+        &mut db,
+        &dir.path().join("fixed-usd.xlsx"),
+        "USD",
+        "kg",
+        "125",
+        "5",
+    );
+    import_with_fixed_context(
+        &mut db,
+        &dir.path().join("fixed-eur.xlsx"),
+        "EUR",
+        "kg",
+        "80",
+        "4",
+    );
+    let projection = duckdb_olap::default_projection_path(&db_path);
+    duckdb_olap::build_projection_atomic(&db_path, &projection).unwrap();
+
+    let analytics =
+        duckdb_olap::analytics_scoped(&projection, &Query::default(), 20, None, 10).unwrap();
+    let totals = &analytics.overview.measures.currency_totals;
+    assert_eq!(totals.len(), 2);
+    assert_close(
+        totals
+            .iter()
+            .find(|total| total.currency == "USD")
+            .unwrap()
+            .total_value,
+        125.0,
+        "fixed USD",
+    );
+    assert_close(
+        totals
+            .iter()
+            .find(|total| total.currency == "EUR")
+            .unwrap()
+            .total_value,
+        80.0,
+        "fixed EUR",
+    );
+    assert!(analytics.overview.compatible_usd.is_none());
+}
+
+#[test]
+fn known_mixed_weight_units_are_normalized_without_mixing_source_totals() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("mixed-units.db");
+    let mut db = Db::open(&db_path).unwrap();
+    import_with_fixed_context(
+        &mut db,
+        &dir.path().join("weights-kg.xlsx"),
+        "USD",
+        "kg",
+        "100",
+        "10",
+    );
+    import_with_fixed_context(
+        &mut db,
+        &dir.path().join("weights-g.xlsx"),
+        "USD",
+        "g",
+        "50",
+        "1000",
+    );
+    let projection = duckdb_olap::default_projection_path(&db_path);
+    duckdb_olap::build_projection_atomic(&db_path, &projection).unwrap();
+
+    let (analytics, source) =
+        duckdb_olap::analytics_scoped_with_source(&projection, &Query::default(), 20, None, 10)
+            .unwrap();
+    assert_eq!(source, duckdb_olap::DuckAnalyticsSource::Rollup);
+    assert_close(analytics.overview.total_net_kg, 11.0, "normalized kg");
+    assert_eq!(analytics.overview.measures.net_weight_totals.len(), 2);
+    let grams = analytics
+        .overview
+        .measures
+        .net_weight_totals
+        .iter()
+        .find(|total| total.source_unit == "g")
+        .unwrap();
+    assert_close(grams.total_source_weight, 1_000.0, "source grams");
+    assert_optional_close(grams.total_kg, Some(1.0), "normalized grams");
+    let ratio = analytics
+        .overview
+        .measures
+        .compatible_value_per_net_weight
+        .as_ref()
+        .unwrap();
+    assert_close(ratio.total_value, 150.0, "paired value");
+    assert_close(ratio.total_weight, 11.0, "paired kg");
+    assert_optional_close(ratio.value_per_weight, Some(150.0 / 11.0), "USD/kg");
+    let wire = serde_json::to_value(&analytics.overview).unwrap();
+    assert_eq!(wire["total_value_usd"], 150.0);
+}
+
+#[test]
 fn projection_contract_invalidates_data_schema_and_semantic_changes() {
     let dir = tempfile::tempdir().unwrap();
     let (mut db, projection) = build_fixture(dir.path());
@@ -609,20 +944,12 @@ fn failed_rebuild_preserves_last_projection_and_falls_back() {
     let db_path = dir.path().join("parity.db");
     let before = duckdb_olap::read_projection_meta(&projection).unwrap();
 
-    let invalid_shape = TableShape {
-        columns: vec![SourceColumn {
-            id: "broken_value".to_string(),
-            header: "Broken value".to_string(),
-            source_index: 0,
-            role: ColumnRole::Money,
-            semantic: Some(SemanticField::Value),
-            storage: ColumnStorage::SchemaColumn("column_that_does_not_exist".to_string()),
-        }],
-    };
-    db.meta_set(
-        "table_shape_v1",
-        &serde_json::to_string(&invalid_shape).unwrap(),
-    );
+    db.diagnostic_execute(
+        "UPDATE source_columns
+         SET storage_name = 'column_that_does_not_exist'
+         WHERE semantic = 'value' AND storage_kind = 'schema_column'",
+    )
+    .unwrap();
 
     let error = duckdb_olap::build_projection_atomic(&db_path, &projection).unwrap_err();
     assert!(error.contains("column_that_does_not_exist"), "{error}");
@@ -631,11 +958,17 @@ fn failed_rebuild_preserves_last_projection_and_falls_back() {
     assert_eq!(after.source_fingerprint, before.source_fingerprint);
     assert_eq!(after.rollup_fingerprint, before.rollup_fingerprint);
     assert_eq!(after.rollup_rules_version, before.rollup_rules_version);
-    assert!(!duckdb_olap::projection_is_current(&db_path, &projection).unwrap());
     assert!(
         std::fs::read_dir(dir.path())
             .unwrap()
             .filter_map(Result::ok)
             .all(|entry| !entry.file_name().to_string_lossy().contains(".tmp"))
     );
+    db.diagnostic_execute(
+        "UPDATE source_columns
+         SET storage_name = 'currency_control_value'
+         WHERE semantic = 'value' AND storage_kind = 'schema_column'",
+    )
+    .unwrap();
+    assert!(duckdb_olap::projection_is_current(&db_path, &projection).unwrap());
 }

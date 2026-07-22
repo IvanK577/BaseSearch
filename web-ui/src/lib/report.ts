@@ -1,21 +1,27 @@
-// Builds a clean, self-contained working report from the analytics of the
-// current query — a printable HTML document (Save as PDF from the browser
-// print dialog) and a plain-text version for copying. Mirrors the desktop's
-// report so the two interfaces produce the same deliverable.
-
-import type { Analytics, AnalyticsSection, Query } from "../api/types";
+import type {
+  Analytics,
+  AnalyticsGroupRow,
+  AnalyticsOverview,
+  AnalyticsSection,
+  Query,
+} from "../api/types";
+import {
+  compatibleCurrencyTotal,
+  safeRowShare,
+} from "./analyticsMeasures";
 import { formatInt, formatMoney, formatPercent } from "./format";
+import type { Translate } from "./i18n";
 
-/** A short human label for the query the report was run on. */
-export function queryLabel(query: Query): string {
+type MeasureCarrier = AnalyticsOverview | AnalyticsGroupRow;
+
+export function queryLabel(query: Query, t?: Translate): string {
   const parts: string[] = [];
   if (query.text.trim()) parts.push(`"${query.text.trim()}"`);
-  const f = query.filters;
-  for (const [name, value] of Object.entries(f)) {
-    if (value && value.trim()) parts.push(`${name}: ${value.trim()}`);
+  for (const [name, value] of Object.entries(query.filters)) {
+    if (value?.trim()) parts.push(`${name}: ${value.trim()}`);
   }
-  if (query.advanced) parts.push("advanced filter");
-  return parts.length ? parts.join(" · ") : "Whole database";
+  if (query.advanced) parts.push(t ? t("search_advanced") : "Advanced filter");
+  return parts.length ? parts.join(" / ") : t ? t("analytics_whole_db") : "Whole database";
 }
 
 function escapeHtml(value: string): string {
@@ -26,19 +32,82 @@ function escapeHtml(value: string): string {
     .replace(/"/g, "&quot;");
 }
 
-function sectionRowsHtml(sections: AnalyticsSection[], titleOf: (kind: string) => string): string {
+function currencyText(value: MeasureCarrier, t: Translate): string {
+  const totals =
+    value.measures.currency_totals.length > 0
+      ? value.measures.currency_totals
+      : compatibleCurrencyTotal(value)
+        ? [compatibleCurrencyTotal(value)!]
+        : [];
+  return (
+    totals
+      .map(
+        (total) =>
+          `${formatMoney(total.total_value)} ${
+            total.known ? total.currency : t("analytics_unknown_currency")
+          }`,
+      )
+      .join(" / ") || "-"
+  );
+}
+
+function weightText(value: MeasureCarrier, t: Translate): string {
+  return (
+    value.measures.net_weight_totals
+      .map((total) => {
+        const sourceUnit = total.source_unit || t("analytics_unknown_unit");
+        if (total.known && total.normalized_unit === "kg" && total.total_kg !== null) {
+          return total.source_unit.toLowerCase() === "kg"
+            ? `${formatInt(total.total_kg)} kg`
+            : `${formatInt(total.total_source_weight)} ${sourceUnit} -> ${formatInt(
+                total.total_kg,
+              )} kg`;
+        }
+        return `${formatInt(total.total_source_weight)} ${sourceUnit}`;
+      })
+      .join(" / ") || "-"
+  );
+}
+
+function ratioText(value: MeasureCarrier): string {
+  return (
+    value.measures.value_per_net_weight
+      .filter((ratio) => ratio.value_per_weight !== null)
+      .map(
+        (ratio) =>
+          `${formatMoney(ratio.value_per_weight ?? 0)} ${ratio.currency}/${
+            ratio.normalized_weight_unit
+          }`,
+      )
+      .join(" / ") || "-"
+  );
+}
+
+function sectionRowsHtml(
+  sections: AnalyticsSection[],
+  overview: AnalyticsOverview,
+  titleOf: (kind: string) => string,
+  t: Translate,
+): string {
   let out = "";
-  for (const section of sections.filter((s) => s.rows.length > 0).slice(0, 3)) {
+  const valueShareIsCompatible = compatibleCurrencyTotal(overview) !== null;
+  for (const section of sections.filter((item) => item.rows.length > 0).slice(0, 3)) {
     out += `<h3>${escapeHtml(titleOf(section.kind))}</h3>`;
-    out += `<table><thead><tr><th>Name</th><th>Value USD</th><th>Net kg</th><th>Rows</th><th>Share</th></tr></thead><tbody>`;
+    out += `<table><thead><tr><th>${escapeHtml(t("col_name"))}</th><th>${escapeHtml(
+      t("analytics_value_by_currency"),
+    )}</th><th>${escapeHtml(t("analytics_net_weight"))}</th><th>${escapeHtml(
+      t("common_rows"),
+    )}</th><th>${escapeHtml(t("analytics_rows_share"))}</th></tr></thead><tbody>`;
     for (const row of section.rows.slice(0, 10)) {
-      out += `<tr><td>${escapeHtml(row.label || "—")}</td><td>${formatMoney(
-        row.total_value_usd,
-      )}</td><td>${formatInt(row.total_net_kg)}</td><td>${formatInt(
+      out += `<tr><td>${escapeHtml(row.label || "-")}</td><td>${escapeHtml(
+        currencyText(row, t),
+      )}</td><td>${escapeHtml(weightText(row, t))}</td><td>${formatInt(
         row.rows,
-      )}</td><td>${formatPercent(row.share_percent)}</td></tr>`;
+      )}</td><td>${formatPercent(
+        safeRowShare(row, overview.row_count, valueShareIsCompatible),
+      )}</td></tr>`;
     }
-    out += `</tbody></table>`;
+    out += "</tbody></table>";
   }
   return out;
 }
@@ -61,61 +130,85 @@ const REPORT_CSS = `
   @media print { body { margin: 18mm; } h2 { break-after: avoid; } table { break-inside: avoid; } }
 `;
 
-/** A full standalone HTML document ready to print or save as PDF. */
 export function buildReportHtml(
   analytics: Analytics,
   query: Query,
   titleOf: (kind: string) => string,
+  t: Translate,
 ): string {
-  const o = analytics.overview;
+  const overview = analytics.overview;
   const kpis: [string, string][] = [
-    ["Rows", formatInt(o.row_count)],
-    ["Documents", formatInt(o.declaration_count)],
-    ["Value USD", formatMoney(o.total_value_usd)],
-    ["Net kg", formatInt(o.total_net_kg)],
-    ["Value / kg", formatMoney(o.avg_value_per_net_kg)],
-    ["Companies", formatInt(o.distinct_edrpou)],
+    [t("common_rows"), formatInt(overview.row_count)],
+    [t("common_declarations"), formatInt(overview.declaration_count)],
+    [t("analytics_value_by_currency"), currencyText(overview, t)],
+    [t("analytics_net_weight"), weightText(overview, t)],
+    [t("analytics_value_per_weight"), ratioText(overview)],
+    [t("analytics_companies"), formatInt(overview.distinct_edrpou)],
   ];
-  let body = `<h1>Base Search Report</h1><p class="query">${escapeHtml(queryLabel(query))}</p>`;
-  body += `<section class="kpis">`;
+  let body = `<h1>${escapeHtml(t("report_title"))}</h1><p class="query">${escapeHtml(
+    queryLabel(query, t),
+  )}</p><section class="kpis">`;
   for (const [label, value] of kpis) {
     body += `<article><span>${escapeHtml(label)}</span><strong>${escapeHtml(value)}</strong></article>`;
   }
-  body += `</section>`;
-  body += `<section><h2>Companies</h2>${sectionRowsHtml(analytics.company_sections, titleOf)}</section>`;
-  body += `<section><h2>Goods</h2>${sectionRowsHtml(analytics.product_sections, titleOf)}</section>`;
-  body += `<section><h2>Countries</h2>${sectionRowsHtml(analytics.country_sections, titleOf)}</section>`;
-  return `<!doctype html><html><head><meta charset="utf-8"><title>Base Search Report</title><style>${REPORT_CSS}</style></head><body>${body}</body></html>`;
+  body += "</section>";
+  body += `<section><h2>${escapeHtml(t("analytics_companies"))}</h2>${sectionRowsHtml(
+    analytics.company_sections,
+    overview,
+    titleOf,
+    t,
+  )}</section>`;
+  body += `<section><h2>${escapeHtml(t("analytics_products"))}</h2>${sectionRowsHtml(
+    analytics.product_sections,
+    overview,
+    titleOf,
+    t,
+  )}</section>`;
+  body += `<section><h2>${escapeHtml(t("analytics_countries"))}</h2>${sectionRowsHtml(
+    analytics.country_sections,
+    overview,
+    titleOf,
+    t,
+  )}</section>`;
+  return `<!doctype html><html><head><meta charset="utf-8"><title>${escapeHtml(
+    t("report_title"),
+  )}</title><style>${REPORT_CSS}</style></head><body>${body}</body></html>`;
 }
 
-/** A plain-text (markdown-ish) version for copying to the clipboard. */
-export function buildReportText(analytics: Analytics, query: Query): string {
-  const o = analytics.overview;
+export function buildReportText(
+  analytics: Analytics,
+  query: Query,
+  t: Translate,
+): string {
+  const overview = analytics.overview;
   const lines: string[] = [
-    "Base Search Report",
-    `Query: ${queryLabel(query)}`,
+    t("report_title"),
+    queryLabel(query, t),
     "",
-    `Rows: ${formatInt(o.row_count)}`,
-    `Documents: ${formatInt(o.declaration_count)}`,
-    `Value USD: ${formatMoney(o.total_value_usd)}`,
-    `Net kg: ${formatInt(o.total_net_kg)}`,
-    `Value / kg: ${formatMoney(o.avg_value_per_net_kg)}`,
-    `Companies: ${formatInt(o.distinct_edrpou)}`,
+    `${t("common_rows")}: ${formatInt(overview.row_count)}`,
+    `${t("common_declarations")}: ${formatInt(overview.declaration_count)}`,
+    `${t("analytics_value_by_currency")}: ${currencyText(overview, t)}`,
+    `${t("analytics_net_weight")}: ${weightText(overview, t)}`,
+    `${t("analytics_value_per_weight")}: ${ratioText(overview)}`,
+    `${t("analytics_companies")}: ${formatInt(overview.distinct_edrpou)}`,
   ];
+  const valueShareIsCompatible = compatibleCurrencyTotal(overview) !== null;
   const appendSections = (title: string, sections: AnalyticsSection[]) => {
-    const withRows = sections.filter((s) => s.rows.length > 0).slice(0, 2);
+    const withRows = sections.filter((section) => section.rows.length > 0).slice(0, 2);
     if (withRows.length === 0) return;
     lines.push("", title);
     for (const section of withRows) {
       for (const row of section.rows.slice(0, 5)) {
         lines.push(
-          `  ${row.label || "—"} — ${formatMoney(row.total_value_usd)} (${formatPercent(row.share_percent)})`,
+          `  ${row.label || "-"}: ${currencyText(row, t)} (${formatPercent(
+            safeRowShare(row, overview.row_count, valueShareIsCompatible),
+          )})`,
         );
       }
     }
   };
-  appendSections("Companies", analytics.company_sections);
-  appendSections("Goods", analytics.product_sections);
-  appendSections("Countries", analytics.country_sections);
+  appendSections(t("analytics_companies"), analytics.company_sections);
+  appendSections(t("analytics_products"), analytics.product_sections);
+  appendSections(t("analytics_countries"), analytics.country_sections);
   return lines.join("\n");
 }

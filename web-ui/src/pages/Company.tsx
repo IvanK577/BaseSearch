@@ -2,11 +2,20 @@ import { useEffect, useState } from "react";
 
 import { api, ApiError } from "../api/client";
 import type { CompanyProfile } from "../api/types";
-import { GroupTable, MonthChart, PriceTable, StatCard } from "../components/analytics";
+import {
+  CurrencySummary,
+  GroupTable,
+  MonthChart,
+  PriceTable,
+  StatCard,
+  ValuePerWeightSummary,
+  WeightSummary,
+} from "../components/analytics";
 import { Icon } from "../components/Icon";
 import { Banner, EmptyState, Loading } from "../components/ui";
 import { useI18n } from "../lib/i18n";
-import { formatCompact, formatInt, formatMoney, formatMonth } from "../lib/format";
+import { commonCurrency, rawNetWeightIsKg, safeNetWeightKg } from "../lib/analyticsMeasures";
+import { formatInt, formatMonth } from "../lib/format";
 import { navigate, useRouteSegment } from "../lib/router";
 import { useQueryStore } from "../state/query";
 import { useStore } from "../state/store";
@@ -41,8 +50,8 @@ export function CompanyPage() {
     return (
       <EmptyState
         icon="database"
-        title="No company selected"
-        hint="Click an EDRPOU code in results or analytics to open a company dossier."
+        title={t("company_none_title")}
+        hint={t("company_none_hint")}
         action={
           <button className="btn" onClick={() => navigate("analytics")}>
             {t("nav_analytics")}
@@ -77,6 +86,16 @@ export function CompanyPage() {
 
   const o = profile.overview;
   const empty = o.row_count === 0;
+  const legacyRawKg = rawNetWeightIsKg(o.measures);
+  const monthCurrency = commonCurrency(profile.months);
+  const monthNetIsComparable =
+    profile.months.length > 0 &&
+    profile.months.every((month) => safeNetWeightKg(month, legacyRawKg) !== null);
+  const monthMetric = monthCurrency
+    ? "value"
+    : monthNetIsComparable
+      ? "net_weight"
+      : "rows";
 
   return (
     <div className="stack">
@@ -84,40 +103,51 @@ export function CompanyPage() {
         <div className="row" style={{ justifyContent: "space-between", alignItems: "flex-start" }}>
           <div>
             <div className="section-title" style={{ margin: 0 }}>
-              Company dossier · {profile.edrpou}
+              {t("company_dossier")} · {profile.edrpou}
             </div>
             <div style={{ fontSize: 20, fontWeight: 700, marginTop: 4 }}>
-              {profile.names[0] ?? "Unknown importer"}
+              {profile.names[0] ?? t("company_unknown_name")}
             </div>
             {profile.names.length > 1 ? (
               <div className="faint" style={{ marginTop: 4 }}>
-                Also seen as: {profile.names.slice(1).join(", ")}
+                {t("company_also_seen")} {profile.names.slice(1).join(", ")}
               </div>
             ) : null}
           </div>
           <button className="btn btn-primary" onClick={searchCompany}>
-            <Icon name="search" size={15} /> Search rows
+            <Icon name="search" size={15} /> {t("company_search_rows")}
           </button>
         </div>
       </div>
 
       {empty ? (
-        <EmptyState icon="search" title="No rows for this EDRPOU in the database." />
+        <EmptyState icon="search" title={t("company_no_rows")} />
       ) : (
         <>
           <div className="stat-grid">
             <StatCard label={t("common_rows")} value={formatInt(o.row_count)} />
             <StatCard label={t("common_declarations")} value={formatInt(o.declaration_count)} />
             <StatCard
-              label={`${t("common_value")} USD`}
-              value={formatCompact(o.total_value_usd)}
-              hint={formatMoney(o.total_value_usd)}
+              label={t("analytics_value_by_currency")}
+              value={<CurrencySummary measures={o.measures} legacyUsd={o.total_value_usd} />}
             />
-            <StatCard label={t("common_net_kg")} value={formatCompact(o.total_net_kg)} />
-            <StatCard label="Value / kg" value={formatMoney(o.avg_value_per_net_kg)} />
-            <StatCard label="Suppliers" value={formatInt(o.distinct_senders)} />
-            <StatCard label="Product codes" value={formatInt(o.distinct_product_codes)} />
-            <StatCard label="Origin countries" value={formatInt(o.distinct_origin_countries)} />
+            <StatCard
+              label={t("analytics_net_weight")}
+              value={<WeightSummary totals={o.measures.net_weight_totals} />}
+            />
+            <StatCard
+              label={t("analytics_value_per_weight")}
+              value={<ValuePerWeightSummary measures={o.measures} />}
+            />
+            <StatCard label={t("company_suppliers")} value={formatInt(o.distinct_senders)} />
+            <StatCard
+              label={t("company_product_codes")}
+              value={formatInt(o.distinct_product_codes)}
+            />
+            <StatCard
+              label={t("company_origin_countries")}
+              value={formatInt(o.distinct_origin_countries)}
+            />
           </div>
 
           {profile.months.length > 0 ? (
@@ -131,25 +161,36 @@ export function CompanyPage() {
                   {formatMonth(profile.months[profile.months.length - 1].month)}
                 </div>
               </div>
-              <MonthChart months={profile.months} metric="total_value_usd" />
+              <MonthChart
+                months={profile.months}
+                metric={monthMetric}
+                allowLegacyRawKg={legacyRawKg}
+              />
             </div>
           ) : null}
 
           <div className="grid-2">
             <div className="panel panel-pad">
-              <div className="section-title">Top products</div>
-              <GroupTable section={{ kind: "product_codes", rows: profile.top_products }} />
+              <div className="section-title">{t("company_top_products")}</div>
+              <GroupTable
+                section={{ kind: "product_codes", rows: profile.top_products }}
+                totalRowCount={o.row_count}
+              />
             </div>
             <div className="panel panel-pad">
-              <div className="section-title">Top suppliers</div>
-              <GroupTable section={{ kind: "senders", rows: profile.top_senders }} />
+              <div className="section-title">{t("company_top_suppliers")}</div>
+              <GroupTable
+                section={{ kind: "senders", rows: profile.top_senders }}
+                totalRowCount={o.row_count}
+              />
             </div>
           </div>
 
           <div className="panel panel-pad">
-            <div className="section-title">Origin countries</div>
+            <div className="section-title">{t("company_origin_countries")}</div>
             <GroupTable
               section={{ kind: "origin_countries", rows: profile.top_origin_countries }}
+              totalRowCount={o.row_count}
             />
           </div>
 
