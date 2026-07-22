@@ -18,38 +18,46 @@ advanced or optional parts of the product.
 
 ## Start Here
 
-### Windows release package
+Base Search is a portable folder — there is no installer and nothing to
+register. Versioned ZIP packages appear on
+[GitHub Releases](https://github.com/IvanK577/BaseSearch/releases) when a
+release tag is published. Until the first release is published there, use the
+ready-to-run Windows folder included in this repository, or build from source.
+
+### Windows quick start
+
+1. On the repository page, click the green **Code** button and choose
+   **Download ZIP** (or clone the repository with Git).
+2. Extract the whole archive to a writable folder.
+3. Open the extracted `dist\BaseSearch` folder.
+4. Double-click `BaseSearch.exe` (or `Open Base Search.cmd`).
+5. Leave **Personal workspace** selected and click **Start workspace**.
+6. Wait for **Ready**. Base Search opens the workspace in your default browser
+   at the Local URL shown by the launcher.
+
+Keep the launcher open while you work. It shows the database path, the exact
+local URL, startup progress, and any startup error. Run only one copy of
+`BaseSearch.exe` at a time: a second launcher cannot share the port of the
+first one, so close the previous window before starting again.
+
+The in-repository binaries include the SQLite + FTS5 engine; the optional
+DuckDB OLAP engine is part of packaged releases and of source builds made with
+the `release-package` feature set.
+
+### Windows release package (when published)
 
 1. Download the Windows ZIP from
    [GitHub Releases](https://github.com/IvanK577/BaseSearch/releases).
 2. Extract the entire ZIP to a writable folder.
-3. Open `Open Base Search.cmd` or `BaseSearch.exe`.
-4. Leave **Personal workspace** selected and click **Start workspace**.
-5. Wait for **Ready**. Base Search opens the workspace in your default browser.
+3. Open `Open Base Search.cmd` or `BaseSearch.exe` and continue as above.
 
-Keep the launcher open while you work. It shows the database path, local URL,
-startup progress, and any startup error. No installation is required.
+### macOS and Linux
 
-### macOS release package
-
-1. Download and extract the macOS ZIP that matches your Mac.
-2. Open `BaseSearch.app`.
-3. Leave **Personal workspace** selected and click **Start workspace**.
-4. Wait for **Ready** and use the browser window that opens.
-
-Follow the note in the package `README.txt` if macOS reports that a local build
-is unsigned. A public stable package is expected to be signed and notarized by
-the release pipeline.
-
-### Linux release package
-
-1. Download and extract the Linux `.tar.gz` archive.
-2. Open a terminal in the extracted folder.
-3. Run `./Open\ Base\ Search.sh`.
-4. Leave **Personal workspace** selected, click **Start workspace**, and wait
-   for the browser to open.
-
-A graphical desktop session and a default browser are required.
+Packaged `BaseSearch.app` and Linux `.tar.gz` builds are produced by the
+release pipeline and attached to GitHub Releases together with checksums. Until
+a release is published, build from source — see
+[Build From Source](#build-from-source). `./start.sh` checks prerequisites,
+builds everything, and launches Base Search at the end.
 
 ## Your First Search
 

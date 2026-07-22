@@ -79,6 +79,11 @@ explicit fallback.
 
 ### Fixed
 
+- Fixed the README quick start pointing only at unpublished GitHub Releases;
+  it now documents the ready-to-run `dist\BaseSearch` folder shipped in the
+  repository and warns against running two launchers at once.
+- Fixed the CI translation gate failing on the new Portuguese strings; the
+  affected label now uses sentence case, which the mojibake check accepts.
 - Fixed the company dossier "row share" column overstating shares: it now uses
   the company's full row count as the denominator instead of only the visible
   top rows.

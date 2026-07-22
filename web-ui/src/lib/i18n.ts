@@ -3105,7 +3105,7 @@ const pt: Dict = {
   adv_add_condition: "Adicionar condição",
   adv_add_group: "Adicionar grupo",
   adv_unavailable_field: "Campo indisponível:",
-  adv_not: "NÃO",
+  adv_not: "Não",
   adv_from: "de",
   adv_to: "até",
   adv_value: "valor",
