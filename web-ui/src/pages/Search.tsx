@@ -15,7 +15,8 @@ import { Icon } from "../components/Icon";
 import { RecordDrawer } from "../components/RecordDrawer";
 import { ResultsTable } from "../components/ResultsTable";
 import { Banner, EmptyState, Loading } from "../components/ui";
-import { useI18n, type MessageKey } from "../lib/i18n";
+import { useI18n } from "../lib/i18n";
+import { FILTER_FIELDS } from "../lib/filterFields";
 import { readActiveResultSort, writeActiveResultSort } from "../lib/exportContext";
 import { navigate, updateRouteQuery, useRouteQuery } from "../lib/router";
 import { formatInt } from "../lib/format";
@@ -29,19 +30,6 @@ import { useQueryStore } from "../state/query";
 import { useStore } from "../state/store";
 
 const LIMIT = 50;
-
-const FILTER_FIELDS: { key: keyof Filters; labelKey: MessageKey }[] = [
-  { key: "year", labelKey: "filter_year" },
-  { key: "product_code", labelKey: "filter_product_code" },
-  { key: "edrpou", labelKey: "filter_company_code" },
-  { key: "recipient", labelKey: "filter_recipient" },
-  { key: "sender", labelKey: "filter_sender" },
-  { key: "trademark", labelKey: "filter_trademark" },
-  { key: "description", labelKey: "filter_description" },
-  { key: "origin_country", labelKey: "filter_origin_country" },
-  { key: "dispatch_country", labelKey: "filter_dispatch_country" },
-  { key: "trade_country", labelKey: "filter_trade_country" },
-];
 
 // Result columns that map onto a structured filter, for "search this value".
 const COLUMN_TO_FILTER: Record<string, keyof Filters> = {

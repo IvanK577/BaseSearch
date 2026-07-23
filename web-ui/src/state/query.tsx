@@ -35,6 +35,8 @@ interface QueryStore {
   applyText: (text: string) => void;
   applyFilter: (key: keyof Filters, value: string) => void;
   applyAdvanced: (advanced: QueryExpr | null) => void;
+  /** Apply a fully-formed query in one step (single history entry, single run). */
+  applyQuery: (next: Query) => void;
   applyDrilldown: (condition: QueryExpr) => void;
   undo: () => void;
   canUndo: boolean;
@@ -154,6 +156,17 @@ export function QueryProvider({ children }: { children: ReactNode }) {
     [query, remember],
   );
 
+  const applyQuery = useCallback(
+    (next: Query) => {
+      if (JSON.stringify(next) === JSON.stringify(query)) return;
+      remember(query);
+      setDraftQuery(next);
+      setAppliedQuery(next);
+      persistAppliedQuery(next);
+    },
+    [query, remember],
+  );
+
   const applyDrilldown = useCallback(
     (condition: QueryExpr) => {
       const current = query.advanced;
@@ -217,6 +230,7 @@ export function QueryProvider({ children }: { children: ReactNode }) {
       applyText,
       applyFilter,
       applyAdvanced,
+      applyQuery,
       applyDrilldown,
       undo,
       canUndo: history.length > 0,
@@ -236,6 +250,7 @@ export function QueryProvider({ children }: { children: ReactNode }) {
       applyText,
       applyFilter,
       applyAdvanced,
+      applyQuery,
       applyDrilldown,
       undo,
       history.length,

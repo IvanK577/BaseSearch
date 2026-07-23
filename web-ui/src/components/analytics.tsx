@@ -17,7 +17,9 @@ import { useI18n } from "../lib/i18n";
 import {
   commonCurrency,
   compatibleCurrencyTotal,
+  currencyLabel,
   safeNetWeightKg,
+  unitLabel,
 } from "../lib/analyticsMeasures";
 import {
   formatCompact,
@@ -65,7 +67,7 @@ export function CurrencySummary({
       {totals.map((total, index) => (
         <span className="measure-item" key={`${total.currency}-${index}`}>
           <strong>{formatCompact(total.total_value)}</strong>
-          <span>{total.known ? total.currency : t("analytics_unknown_currency")}</span>
+          <span>{currencyLabel(total.currency, t("analytics_unknown_currency"))}</span>
         </span>
       ))}
     </div>
@@ -78,7 +80,7 @@ export function WeightSummary({ totals }: { totals: AnalyticsWeightTotal[] }) {
   return (
     <div className="measure-list">
       {totals.map((total, index) => {
-        const sourceUnit = total.source_unit || t("analytics_unknown_unit");
+        const sourceUnit = unitLabel(total.source_unit, t("analytics_unknown_unit"));
         const normalized =
           total.known && total.normalized_unit === "kg" && total.total_kg !== null;
         const label = normalized
@@ -106,6 +108,7 @@ export function ValuePerWeightSummary({
   measures: AnalyticsMeasures;
   legacyUsdPerKg?: number;
 }) {
+  const { t } = useI18n();
   const ratios = measures.value_per_net_weight.filter(
     (ratio) => ratio.value_per_weight !== null && Number.isFinite(ratio.value_per_weight),
   );
@@ -122,7 +125,10 @@ export function ValuePerWeightSummary({
       {ratios.map((ratio, index) => (
         <span className="measure-item" key={`${ratio.currency}-${ratio.normalized_weight_unit}-${index}`}>
           <strong>{formatMoney(ratio.value_per_weight ?? 0)}</strong>
-          <span>{ratio.currency}/{ratio.normalized_weight_unit}</span>
+          <span>
+            {currencyLabel(ratio.currency, t("analytics_unknown_currency"))}/
+            {unitLabel(ratio.normalized_weight_unit, t("analytics_unknown_unit"))}
+          </span>
         </span>
       ))}
     </div>
@@ -285,6 +291,36 @@ const PRICE_LABELS: Record<string, string> = {
   min_base_usd_kg: "Min base $/kg",
 };
 
+// A compact box-plot with robust (Tukey) scaling: the whisker spans the
+// interquartile fence so the P25–P75 box and the median line stay readable even
+// when a few extreme outliers stretch the true min–max by orders of magnitude.
+// A dot on the right edge flags that outliers extend beyond the fence.
+function PriceRangeBar({ metric }: { metric: AnalyticsPriceMetric }) {
+  const { minimum, p25, median, p75, maximum } = metric;
+  if (!(maximum > minimum)) return <span className="faint">—</span>;
+  const iqr = Math.max(0, p75 - p25);
+  const lo = iqr > 0 ? Math.max(minimum, p25 - 1.5 * iqr) : minimum;
+  const hi = iqr > 0 ? Math.min(maximum, p75 + 1.5 * iqr) : maximum;
+  const span = hi - lo || 1;
+  const pct = (value: number) => Math.min(100, Math.max(0, ((value - lo) / span) * 100));
+  const boxLeft = pct(p25);
+  const boxWidth = Math.max(2, pct(p75) - boxLeft);
+  const hasHighOutliers = maximum > hi;
+  const hasLowOutliers = minimum < lo;
+  return (
+    <div
+      className="price-range"
+      title={`min ${formatMoney(minimum)} · P25 ${formatMoney(p25)} · median ${formatMoney(median)} · P75 ${formatMoney(p75)} · max ${formatMoney(maximum)}`}
+    >
+      <div className="price-range-whisker" />
+      <div className="price-range-box" style={{ left: `${boxLeft}%`, width: `${boxWidth}%` }} />
+      <div className="price-range-median" style={{ left: `${pct(median)}%` }} />
+      {hasLowOutliers ? <div className="price-range-outlier" style={{ left: 0 }} /> : null}
+      {hasHighOutliers ? <div className="price-range-outlier" style={{ left: "100%" }} /> : null}
+    </div>
+  );
+}
+
 export function PriceTable({ metrics }: { metrics: AnalyticsPriceMetric[] }) {
   const { t } = useI18n();
   const withData = metrics.filter((m) => m.count > 0);
@@ -303,8 +339,10 @@ export function PriceTable({ metrics }: { metrics: AnalyticsPriceMetric[] }) {
             <th>{t("price_col_weighted")}</th>
             <th>P25</th>
             <th>P75</th>
+            <th>{t("price_col_iqr")}</th>
             <th>{t("price_col_min")}</th>
             <th>{t("price_col_max")}</th>
+            <th style={{ minWidth: 130 }}>{t("price_col_distribution")}</th>
           </tr>
         </thead>
         <tbody>
@@ -317,8 +355,12 @@ export function PriceTable({ metrics }: { metrics: AnalyticsPriceMetric[] }) {
               <td>{formatMoney(m.weighted_average)}</td>
               <td>{formatMoney(m.p25)}</td>
               <td>{formatMoney(m.p75)}</td>
+              <td className="faint">{formatMoney(Math.max(0, m.p75 - m.p25))}</td>
               <td>{formatMoney(m.minimum)}</td>
               <td>{formatMoney(m.maximum)}</td>
+              <td>
+                <PriceRangeBar metric={m} />
+              </td>
             </tr>
           ))}
         </tbody>

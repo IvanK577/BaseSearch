@@ -13,6 +13,30 @@ type ValueCarrier =
   | AnalyticsGroupRow
   | AnalyticsMonthRow;
 
+// The core buckets an unrecognized currency or unit under a sentinel key so it
+// is never confused with a real code. Plain "__unknown__" means the source
+// cell was empty; "__unknown__:XYZ" keeps the original, non-standard code.
+// Neither must ever reach the screen verbatim.
+const UNKNOWN_KEY = "__unknown__";
+
+export function isUnknownMeasureKey(raw: string): boolean {
+  return raw === UNKNOWN_KEY || raw.startsWith(`${UNKNOWN_KEY}:`);
+}
+
+/** Human label for a currency bucket key, given the localized "unknown" word. */
+export function currencyLabel(raw: string, unknownLabel: string): string {
+  if (raw === UNKNOWN_KEY) return unknownLabel;
+  if (raw.startsWith(`${UNKNOWN_KEY}:`)) return raw.slice(UNKNOWN_KEY.length + 1);
+  return raw;
+}
+
+/** Human label for a weight-unit bucket key, given the localized "unknown" word. */
+export function unitLabel(raw: string, unknownLabel: string): string {
+  if (!raw || raw === UNKNOWN_KEY) return unknownLabel;
+  if (raw.startsWith(`${UNKNOWN_KEY}:`)) return raw.slice(UNKNOWN_KEY.length + 1);
+  return raw;
+}
+
 export function compatibleCurrencyTotal(
   value: ValueCarrier,
 ): AnalyticsCurrencyTotal | null {

@@ -159,7 +159,8 @@ test("compare tab shows a difference table", async ({ page }) => {
   await page.goto("/#/analytics");
   await enterWholeDb(page);
   await page.locator(".tab", { hasText: "Compare" }).click();
-  await page.fill("input.input[placeholder]", "Lenovo");
+  // Target the compare panel's own input, not the in-analytics search bar.
+  await page.getByPlaceholder(/compare with/i).fill("Lenovo");
   await page.locator("button.btn-primary", { hasText: "Compare" }).click();
   await expect(page.locator(".section-title", { hasText: "Difference" })).toBeVisible();
   await expect(page.locator("table.grid tbody tr").first()).toBeVisible();
@@ -214,9 +215,17 @@ test("advanced builder filters, excludes, and matches any condition", async ({ p
   await page.getByLabel("Field 2").selectOption("source:trademark");
   await page.getByLabel("Value 2").fill("Lenovo");
   await page.locator('.segmented button[aria-label="OR"]').click();
-  await search();
-  const both = Number((await found.textContent())?.replace(/\D/g, ""));
-  expect(both).toBeGreaterThan(narrowed);
+  // The advanced builder propagates its expression through a parent state
+  // update, so a single click can race an un-applied OR condition. Re-run the
+  // search until the disjoint second condition is reflected (it widens the
+  // result) rather than depending on one perfectly-timed run.
+  await expect(page.getByLabel("Value 2")).toHaveValue("Lenovo");
+  await expect(page.locator('.segmented button[aria-label="OR"]')).toHaveClass(/active/);
+  await expect(async () => {
+    await search();
+    const both = Number((await found.textContent())?.replace(/\D/g, ""));
+    expect(both).toBeGreaterThan(narrowed);
+  }).toPass({ timeout: 15000 });
 });
 
 test("clicking a column header sorts the results", async ({ page }) => {

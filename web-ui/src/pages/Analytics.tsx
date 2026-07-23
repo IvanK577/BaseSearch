@@ -26,6 +26,7 @@ import {
 import { Icon } from "../components/Icon";
 import { Banner, EmptyState, Loading } from "../components/ui";
 import { useI18n, type MessageKey } from "../lib/i18n";
+import { FILTER_FIELDS } from "../lib/filterFields";
 import { fieldRefOf } from "../lib/advanced";
 import { copyText } from "../lib/clipboard";
 import { downloadCsv } from "../lib/csv";
@@ -33,10 +34,12 @@ import { buildReportHtml, buildReportText, queryLabel } from "../lib/report";
 import {
   commonCurrency,
   compatibleCurrencyTotal,
+  currencyLabel,
   rawNetWeightIsKg,
   safeNetWeightKg,
   safeRowShare,
   safeValuePerNetWeight,
+  unitLabel,
 } from "../lib/analyticsMeasures";
 import {
   formatCompact,
@@ -156,9 +159,25 @@ export function AnalyticsPage() {
       const id = ++reqRef.current;
       setLoading(true);
       setError(null);
+      // The server admits only a couple of heavy reads at once and answers 503
+      // under load; a transient busy reply is retried briefly before surfacing.
+      const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
       try {
-        const res = await api.analytics(query, scope, hsLevel, sectionLimit);
-        if (id !== reqRef.current) return;
+        let res: Awaited<ReturnType<typeof api.analytics>> | null = null;
+        for (let attempt = 0; attempt < 4; attempt += 1) {
+          try {
+            res = await api.analytics(query, scope, hsLevel, sectionLimit);
+            break;
+          } catch (err) {
+            if (id !== reqRef.current) return;
+            if ((err as ApiError)?.status === 503 && attempt < 3) {
+              await sleep(500 * (attempt + 1));
+              continue;
+            }
+            throw err;
+          }
+        }
+        if (id !== reqRef.current || !res) return;
         store.map.set(cacheKey, res.data);
         setAnalytics(res.data);
       } catch (err) {
@@ -211,25 +230,27 @@ export function AnalyticsPage() {
 
   if (!shouldRun) {
     return (
-      <EmptyState
-        icon="analytics"
-        title={t("analytics_need_query")}
-        action={
-          <div className="row" style={{ gap: 10 }}>
-            <button className="btn" onClick={() => navigate("search")}>
-              {t("nav_search")}
-            </button>
-            <button className="btn btn-primary" onClick={() => setForceAll(true)}>
-              {t("analytics_whole_db")}
-            </button>
-          </div>
-        }
-      />
+      <div className="stack">
+        <AnalyticsSearchBar />
+        <EmptyState
+          icon="analytics"
+          title={t("analytics_need_query")}
+          hint={t("analytics_need_query_hint")}
+          action={
+            <div className="row" style={{ gap: 10 }}>
+              <button className="btn btn-primary" onClick={() => setForceAll(true)}>
+                {t("analytics_whole_db")}
+              </button>
+            </div>
+          }
+        />
+      </div>
     );
   }
 
   return (
     <div className="stack">
+      <AnalyticsSearchBar />
       <QueryChips
         query={query}
         onClearText={() => applyText("")}
@@ -272,7 +293,15 @@ export function AnalyticsPage() {
       ) : analytics ? (
         <>
           {tab === "overview" ? (
-            <OverviewPanel analytics={analytics} onMonth={drillMonth} />
+            <OverviewPanel
+              analytics={analytics}
+              query={query}
+              hsLevel={hsLevel}
+              onMonth={drillMonth}
+              onOpenTab={setTab}
+              onRow={onAction}
+              onOpenCompany={openCompany}
+            />
           ) : null}
           {tab === "months" ? <MonthsPanel analytics={analytics} onMonth={drillMonth} /> : null}
 
@@ -328,9 +357,54 @@ export function AnalyticsPage() {
           ) : null}
 
           {tab === "prices" ? (
-            <div className="panel panel-pad">
-              <div className="section-title">{t("analytics_prices")}</div>
-              <PriceTable metrics={analytics.price_sections} />
+            <div className="stack">
+              <UnmappedCurrencyHint overview={analytics.overview} />
+              <div className="panel panel-pad">
+                <div className="row" style={{ justifyContent: "space-between", alignItems: "baseline" }}>
+                  <div className="section-title" style={{ marginBottom: 2 }}>
+                    {t("analytics_prices")}
+                  </div>
+                  <button
+                    className="btn btn-sm btn-ghost"
+                    disabled={analytics.price_sections.every((m) => m.count === 0)}
+                    onClick={() =>
+                      downloadCsv(
+                        "prices",
+                        [
+                          t("price_col_metric"),
+                          t("price_col_samples"),
+                          t("price_col_median"),
+                          t("price_col_average"),
+                          t("price_col_weighted"),
+                          "P25",
+                          "P75",
+                          t("price_col_min"),
+                          t("price_col_max"),
+                        ],
+                        analytics.price_sections
+                          .filter((m) => m.count > 0)
+                          .map((m) => [
+                            m.kind,
+                            m.count,
+                            m.median,
+                            m.average,
+                            m.weighted_average,
+                            m.p25,
+                            m.p75,
+                            m.minimum,
+                            m.maximum,
+                          ]),
+                      )
+                    }
+                  >
+                    <Icon name="download" size={14} /> {t("sec_export")}
+                  </button>
+                </div>
+                <p className="muted" style={{ margin: "0 0 10px", fontSize: 13 }}>
+                  {t("analytics_prices_intro")}
+                </p>
+                <PriceTable metrics={analytics.price_sections} />
+              </div>
             </div>
           ) : null}
         </>
@@ -339,12 +413,208 @@ export function AnalyticsPage() {
   );
 }
 
+/** True when the dataset has values but no recognized currency for any of them. */
+function currencyIsUnmapped(overview: AnalyticsOverview): boolean {
+  const totals = overview.measures.currency_totals;
+  return totals.length > 0 && totals.every((total) => !total.known);
+}
+
+function UnmappedCurrencyHint({ overview }: { overview: AnalyticsOverview }) {
+  const { t } = useI18n();
+  if (!currencyIsUnmapped(overview)) return null;
+  return (
+    <div className="panel panel-pad analytics-hint">
+      <Icon name="alert" size={18} className="analytics-hint-icon" />
+      <div className="analytics-hint-body">
+        <strong>{t("analytics_currency_unmapped")}</strong>
+        <span className="muted"> {t("analytics_currency_unmapped_hint")}</span>
+      </div>
+      <button className="btn btn-sm" onClick={() => navigate("columns")}>
+        <Icon name="columns" size={14} /> {t("analytics_map_columns")}
+      </button>
+    </div>
+  );
+}
+
+// The overview response carries only totals + months, so these top-5 previews
+// are fetched lazily after the instant stats render. Each is a single grouped
+// scan; running them sequentially keeps a large database responsive and warms
+// the per-tab cache for when the user drills in.
+const PREVIEW_DIMS: {
+  scope: AnalyticsScope;
+  tab: Tab;
+  titleKey: MessageKey;
+  pick: (a: Analytics) => AnalyticsSection | undefined;
+}[] = [
+  {
+    scope: "companies",
+    tab: "companies",
+    titleKey: "analytics_companies",
+    pick: (a) => a.company_sections[0],
+  },
+  {
+    scope: "products",
+    tab: "products",
+    titleKey: "analytics_products",
+    pick: (a) => a.product_sections[0],
+  },
+  {
+    scope: "countries",
+    tab: "countries",
+    titleKey: "analytics_countries",
+    pick: (a) => a.country_sections[0],
+  },
+];
+
+type PreviewState = { section: AnalyticsSection | null; loading: boolean; error: boolean };
+
+function OverviewPreviews({
+  query,
+  hsLevel,
+  onOpenTab,
+  onRow,
+  onOpenCompany,
+}: {
+  query: Query;
+  hsLevel: number;
+  onOpenTab: (tab: Tab) => void;
+  onRow: (action: AnalyticsFilterAction) => void;
+  onOpenCompany: (edrpou: string) => void;
+}) {
+  const { t } = useI18n();
+  const [previews, setPreviews] = useState<Record<string, PreviewState>>({});
+
+  useEffect(() => {
+    let alive = true;
+    setPreviews(
+      Object.fromEntries(
+        PREVIEW_DIMS.map((d) => [d.scope, { section: null, loading: true, error: false }]),
+      ),
+    );
+    (async () => {
+      // Sequential on purpose: three concurrent full scans would thrash a
+      // multi-gigabyte database and slow every other action. The server admits
+      // only a couple of heavy reads at once and replies 503 under load, so
+      // each preview retries briefly before giving up.
+      const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+      for (const dim of PREVIEW_DIMS) {
+        let done = false;
+        for (let attempt = 0; attempt < 4 && !done; attempt += 1) {
+          try {
+            const res = await api.analytics(query, dim.scope, hsLevel, 6);
+            if (!alive) return;
+            setPreviews((prev) => ({
+              ...prev,
+              [dim.scope]: { section: dim.pick(res.data) ?? null, loading: false, error: false },
+            }));
+            done = true;
+          } catch (err) {
+            if (!alive) return;
+            const busy = (err as ApiError)?.status === 503;
+            if (busy && attempt < 3) {
+              await sleep(500 * (attempt + 1));
+              continue;
+            }
+            setPreviews((prev) => ({
+              ...prev,
+              [dim.scope]: { section: null, loading: false, error: true },
+            }));
+            done = true;
+          }
+        }
+      }
+    })();
+    return () => {
+      alive = false;
+    };
+  }, [query, hsLevel]);
+
+  return (
+    <div className="overview-previews">
+      {PREVIEW_DIMS.map((dim) => {
+        const state = previews[dim.scope] ?? { section: null, loading: true, error: false };
+        return (
+          <div className="panel panel-pad overview-preview" key={dim.scope}>
+            <div className="row" style={{ justifyContent: "space-between", alignItems: "baseline" }}>
+              <div className="section-title" style={{ margin: 0 }}>
+                {t(dim.titleKey)}
+              </div>
+              <button className="btn btn-ghost btn-sm" onClick={() => onOpenTab(dim.tab)}>
+                {t("analytics_see_all")} →
+              </button>
+            </div>
+            <div className="faint" style={{ fontSize: 12, marginBottom: 6 }}>
+              {t("analytics_top5_rows")}
+            </div>
+            {state.loading ? (
+              <div className="overview-preview-skeleton">
+                {[0, 1, 2, 3, 4].map((i) => (
+                  <div className="skeleton-row" key={i} />
+                ))}
+              </div>
+            ) : state.error ? (
+              <div className="faint">{t("analytics_failed")}</div>
+            ) : !state.section || state.section.rows.length === 0 ? (
+              <div className="faint">{t("analytics_no_group_data")}</div>
+            ) : (
+              <div className="overview-preview-list">
+                {state.section.rows.slice(0, 5).map((row, i) => {
+                  const openable =
+                    dim.scope === "companies" && state.section?.kind === "edrpou" && row.label;
+                  return (
+                    <button
+                      className="overview-preview-row"
+                      key={`${row.label}-${i}`}
+                      onClick={() =>
+                        openable
+                          ? onOpenCompany(row.label)
+                          : row.filter_action && onRow(row.filter_action)
+                      }
+                      disabled={!openable && !row.filter_action}
+                      title={row.label}
+                    >
+                      <span className="overview-preview-label">{row.label || "—"}</span>
+                      <span className="overview-preview-metric">
+                        {formatInt(row.rows)} {t("common_rows")}
+                        {row.measures.currency_totals.length > 0 ? (
+                          <span className="faint">
+                            {" · "}
+                            {formatCompact(row.measures.currency_totals[0].total_value)}{" "}
+                            {currencyLabel(
+                              row.measures.currency_totals[0].currency,
+                              t("analytics_unknown_currency"),
+                            )}
+                          </span>
+                        ) : null}
+                      </span>
+                    </button>
+                  );
+                })}
+              </div>
+            )}
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
 export function OverviewPanel({
   analytics,
+  query,
+  hsLevel,
   onMonth,
+  onOpenTab,
+  onRow,
+  onOpenCompany,
 }: {
   analytics: Analytics;
+  query: Query;
+  hsLevel: number;
   onMonth: (month: string) => void;
+  onOpenTab: (tab: Tab) => void;
+  onRow: (action: AnalyticsFilterAction) => void;
+  onOpenCompany: (edrpou: string) => void;
 }) {
   const { t } = useI18n();
   const o = analytics.overview;
@@ -358,8 +628,29 @@ export function OverviewPanel({
     : monthNetIsComparable
       ? "net_weight"
       : "rows";
+  const avgPerMonth =
+    analytics.months.length > 0 ? o.row_count / analytics.months.length : o.row_count;
+
+  const copySummary = () => {
+    const lines = [
+      `${t("common_rows")}\t${o.row_count}`,
+      `${t("common_declarations")}\t${o.declaration_count}`,
+      `${t("analytics_companies")}\t${o.distinct_edrpou}`,
+      `${t("analytics_product_codes")}\t${o.distinct_product_codes}`,
+      `${t("company_suppliers")}\t${o.distinct_senders}`,
+      `${t("analytics_origin_countries")}\t${o.distinct_origin_countries}`,
+    ];
+    copyText(lines.join("\n"));
+  };
+
   return (
     <div className="stack">
+      <UnmappedCurrencyHint overview={o} />
+      <div className="row" style={{ justifyContent: "flex-end" }}>
+        <button className="btn btn-sm btn-ghost" onClick={copySummary}>
+          {t("analytics_copy_summary")}
+        </button>
+      </div>
       <div className="stat-grid">
         <StatCard label={t("common_rows")} value={formatInt(o.row_count)} />
         {/* Datasets without document numbers get no permanent "0" card. */}
@@ -382,11 +673,24 @@ export function OverviewPanel({
           value={<ValuePerWeightSummary measures={o.measures} />}
         />
         <StatCard label={t("analytics_companies")} value={formatInt(o.distinct_edrpou)} />
+        {o.distinct_senders > 0 ? (
+          <StatCard label={t("company_suppliers")} value={formatInt(o.distinct_senders)} />
+        ) : null}
         <StatCard label={t("analytics_product_codes")} value={formatInt(o.distinct_product_codes)} />
+        {o.distinct_trademarks > 0 ? (
+          <StatCard label={t("sec_trademarks")} value={formatInt(o.distinct_trademarks)} />
+        ) : null}
         <StatCard
           label={t("analytics_origin_countries")}
           value={formatInt(o.distinct_origin_countries)}
         />
+        {analytics.months.length > 1 ? (
+          <StatCard
+            label={t("analytics_avg_per_month")}
+            value={formatInt(avgPerMonth)}
+            hint={`${formatInt(analytics.months.length)} ${t("common_months").toLowerCase()}`}
+          />
+        ) : null}
       </div>
 
       {analytics.months.length > 0 ? (
@@ -408,13 +712,37 @@ export function OverviewPanel({
           />
         </div>
       ) : null}
+
+      <OverviewPreviews
+        query={query}
+        hsLevel={hsLevel}
+        onOpenTab={onOpenTab}
+        onRow={onRow}
+        onOpenCompany={onOpenCompany}
+      />
     </div>
   );
 }
 
 type MonthMetric = "value" | "net_weight" | "rows";
 
-type MonthSortField = "month" | "value" | "net_kg" | "rows" | "docs" | "mom";
+type MonthSortField = "month" | "value" | "net_kg" | "rows" | "docs" | "mom" | "yoy" | "cumulative";
+
+function priorYearMonth(month: string): string {
+  const [year, rest] = month.split("-");
+  const y = Number(year);
+  return Number.isFinite(y) ? `${y - 1}-${rest}` : month;
+}
+
+function growthCell(value: number | null): ReactNode {
+  if (value === null) return <span style={{ color: "var(--text-faint)" }}>—</span>;
+  return (
+    <span style={{ color: value >= 0 ? "var(--flame-amber)" : "var(--flame-red)" }}>
+      {value >= 0 ? "+" : ""}
+      {formatPercent(value, 0)}
+    </span>
+  );
+}
 
 function MonthsPanel({
   analytics,
@@ -424,12 +752,12 @@ function MonthsPanel({
   onMonth: (month: string) => void;
 }) {
   const { t } = useI18n();
-  const months = analytics.months;
+  const allMonths = analytics.months;
   const legacyRawKg = rawNetWeightIsKg(analytics.overview.measures);
-  const valueCurrency = commonCurrency(months);
+  const valueCurrency = commonCurrency(allMonths);
   const netIsComparable =
-    months.length > 0 &&
-    months.every((month) => safeNetWeightKg(month, legacyRawKg) !== null);
+    allMonths.length > 0 &&
+    allMonths.every((month) => safeNetWeightKg(month, legacyRawKg) !== null);
   const defaultMetric: MonthMetric = valueCurrency
     ? "value"
     : netIsComparable
@@ -438,6 +766,8 @@ function MonthsPanel({
   const [metric, setMetric] = useState<MonthMetric>(defaultMetric);
   const [sortField, setSortField] = useState<MonthSortField>("month");
   const [dir, setDir] = useState<"asc" | "desc">("asc");
+  // Range selector so long histories stay readable; null means "all".
+  const [range, setRange] = useState<number | null>(null);
 
   useEffect(() => {
     if (
@@ -448,31 +778,56 @@ function MonthsPanel({
     }
   }, [defaultMetric, metric, netIsComparable, valueCurrency]);
 
-  // Month-over-month is always computed against the chronological previous
-  // month, so it stays correct no matter how the table is sorted.
-  const enriched = useMemo(
-    () =>
-      months.map((m, i) => {
-        const value = valueCurrency
-          ? compatibleCurrencyTotal(m)?.total_value ?? null
-          : null;
-        const previous =
-          i > 0 && valueCurrency
-            ? compatibleCurrencyTotal(months[i - 1])?.total_value ?? null
-            : null;
-        const mom =
-          value !== null && previous !== null && previous > 0
-            ? ((value - previous) / previous) * 100
-            : null;
-        return {
-          ...m,
-          compatibleValue: value,
-          compatibleNetKg: safeNetWeightKg(m, legacyRawKg),
-          mom,
-        };
-      }),
-    [legacyRawKg, months, valueCurrency],
+  const months = useMemo(
+    () => (range && allMonths.length > range ? allMonths.slice(-range) : allMonths),
+    [allMonths, range],
   );
+
+  // The primary metric feeds trend math (MoM/YoY/cumulative/peak) so every
+  // derived number reflects the same, currency-honest measure.
+  const primaryOf = useCallback(
+    (m: (typeof allMonths)[number]): number | null => {
+      if (valueCurrency) return compatibleCurrencyTotal(m)?.total_value ?? null;
+      if (netIsComparable) return safeNetWeightKg(m, legacyRawKg);
+      return m.rows;
+    },
+    [valueCurrency, netIsComparable, legacyRawKg],
+  );
+
+  // Year-over-year needs the same calendar month a year earlier, matched by key
+  // across the full history (not just the visible range).
+  const primaryByMonth = useMemo(() => {
+    const map = new Map<string, number | null>();
+    for (const m of allMonths) map.set(m.month, primaryOf(m));
+    return map;
+  }, [allMonths, primaryOf]);
+
+  const enriched = useMemo(() => {
+    let running = 0;
+    return months.map((m, i) => {
+      const value = primaryOf(m);
+      const previous = i > 0 ? primaryOf(months[i - 1]) : null;
+      const mom =
+        value !== null && previous !== null && previous > 0
+          ? ((value - previous) / previous) * 100
+          : null;
+      const yearAgo = primaryByMonth.get(priorYearMonth(m.month)) ?? null;
+      const yoy =
+        value !== null && yearAgo !== null && yearAgo > 0
+          ? ((value - yearAgo) / yearAgo) * 100
+          : null;
+      running += value ?? 0;
+      return {
+        ...m,
+        compatibleValue: valueCurrency ? compatibleCurrencyTotal(m)?.total_value ?? null : null,
+        compatibleNetKg: safeNetWeightKg(m, legacyRawKg),
+        primary: value,
+        mom,
+        yoy,
+        cumulative: value !== null ? running : null,
+      };
+    });
+  }, [months, primaryOf, primaryByMonth, valueCurrency, legacyRawKg]);
 
   const sorted = useMemo(() => {
     const key = (r: (typeof enriched)[number]): number | string => {
@@ -480,7 +835,7 @@ function MonthsPanel({
         case "month":
           return r.month;
         case "value":
-          return r.compatibleValue ?? r.rows;
+          return r.primary ?? -Infinity;
         case "net_kg":
           return r.compatibleNetKg ?? r.rows;
         case "rows":
@@ -489,6 +844,10 @@ function MonthsPanel({
           return r.declarations;
         case "mom":
           return r.mom ?? -Infinity;
+        case "yoy":
+          return r.yoy ?? -Infinity;
+        case "cumulative":
+          return r.cumulative ?? -Infinity;
       }
     };
     return [...enriched].sort((a, b) => {
@@ -500,7 +859,7 @@ function MonthsPanel({
     });
   }, [enriched, sortField, dir]);
 
-  if (months.length === 0) {
+  if (allMonths.length === 0) {
     return <EmptyState icon="analytics" title={t("analytics_no_group_data")} />;
   }
 
@@ -510,25 +869,24 @@ function MonthsPanel({
   const totalNet = netIsComparable
     ? enriched.reduce((sum, month) => sum + (month.compatibleNetKg ?? 0), 0)
     : null;
-  const peak = enriched.reduce((a, b) => {
-    const aValue = valueCurrency ? (a.compatibleValue ?? a.rows) : a.rows;
-    const bValue = valueCurrency ? (b.compatibleValue ?? b.rows) : b.rows;
-    return bValue > aValue ? b : a;
-  });
-  const first = enriched[0].compatibleValue;
-  const last = enriched[enriched.length - 1].compatibleValue;
+  const totalRows = enriched.reduce((sum, month) => sum + month.rows, 0);
+  const totalDocs = enriched.reduce((sum, month) => sum + month.declarations, 0);
+  const peak = enriched.reduce((a, b) => ((b.primary ?? 0) > (a.primary ?? 0) ? b : a));
+  const first = enriched[0]?.primary ?? null;
+  const last = enriched[enriched.length - 1]?.primary ?? null;
   const overall =
-    first !== null && last !== null && first > 0
-      ? ((last - first) / first) * 100
-      : null;
+    first !== null && last !== null && first > 0 ? ((last - first) / first) * 100 : null;
+  const avgPrimary =
+    enriched.length > 0
+      ? enriched.reduce((sum, m) => sum + (m.primary ?? 0), 0) / enriched.length
+      : 0;
+  const primaryUnit = valueCurrency ?? (netIsComparable ? "kg" : t("common_rows"));
 
   const metricOptions: { id: MonthMetric; label: string }[] = [
     ...(valueCurrency
       ? [{ id: "value" as const, label: `${t("common_value")} ${valueCurrency}` }]
       : []),
-    ...(netIsComparable
-      ? [{ id: "net_weight" as const, label: t("common_net_kg") }]
-      : []),
+    ...(netIsComparable ? [{ id: "net_weight" as const, label: t("common_net_kg") }] : []),
     { id: "rows", label: t("common_rows") },
   ];
 
@@ -543,10 +901,42 @@ function MonthsPanel({
   const arrow = (field: MonthSortField) =>
     sortField === field ? (dir === "asc" ? " ▲" : " ▼") : "";
 
+  const exportCsv = () => {
+    downloadCsv(
+      "monthly_dynamics",
+      [
+        t("analytics_month"),
+        valueCurrency ? `${t("common_value")} ${valueCurrency}` : t("analytics_value_by_currency"),
+        t("analytics_net_weight"),
+        t("common_rows"),
+        t("common_declarations"),
+        `${t("analytics_mom")} %`,
+        `${t("analytics_yoy")} %`,
+        t("analytics_cumulative"),
+      ],
+      [...enriched]
+        .sort((a, b) => a.month.localeCompare(b.month))
+        .map((m) => [
+          m.month,
+          m.primary ?? "",
+          m.compatibleNetKg ?? "",
+          m.rows,
+          m.declarations,
+          m.mom !== null ? m.mom.toFixed(1) : "",
+          m.yoy !== null ? m.yoy.toFixed(1) : "",
+          m.cumulative ?? "",
+        ]),
+    );
+  };
+
+  const rangeOptions: { id: number | null; label: string }[] = [
+    { id: 12, label: "12" },
+    { id: 24, label: "24" },
+    { id: null, label: t("analytics_range_all") },
+  ];
+
   return (
     <div className="stack">
-      {/* One compact context line instead of a second wall of stat cards:
-          the chart and the table below already carry the same numbers. */}
       <div className="panel panel-pad row wrap faint" style={{ gap: 14, fontSize: 12 }}>
         <span>
           {formatInt(months.length)} {t("common_months").toLowerCase()} /{" "}
@@ -554,8 +944,10 @@ function MonthsPanel({
         </span>
         <span>
           {t("analytics_peak_month")}: <strong>{formatMonth(peak.month)}</strong> (
-          {formatCompact(valueCurrency ? (peak.compatibleValue ?? peak.rows) : peak.rows)}{" "}
-          {valueCurrency ?? t("common_rows")})
+          {formatCompact(peak.primary ?? peak.rows)} {primaryUnit})
+        </span>
+        <span>
+          {t("analytics_average")}: <strong>{formatCompact(avgPrimary)} {primaryUnit}</strong>
         </span>
         {overall !== null ? (
           <span>
@@ -580,17 +972,33 @@ function MonthsPanel({
           <div className="section-title" style={{ margin: 0 }}>
             {t("analytics_months")}
           </div>
-          <div className="row" style={{ gap: 6 }}>
-            <span className="field-label" style={{ margin: 0 }}>{t("chart_metric")}:</span>
-            {metricOptions.map((m) => (
-              <button
-                key={m.id}
-                className={`btn btn-sm ${metric === m.id ? "" : "btn-ghost"}`}
-                onClick={() => setMetric(m.id)}
-              >
-                {m.label}
-              </button>
-            ))}
+          <div className="row wrap" style={{ gap: 10 }}>
+            <div className="row" style={{ gap: 6 }}>
+              <span className="field-label" style={{ margin: 0 }}>{t("chart_metric")}:</span>
+              {metricOptions.map((m) => (
+                <button
+                  key={m.id}
+                  className={`btn btn-sm ${metric === m.id ? "" : "btn-ghost"}`}
+                  onClick={() => setMetric(m.id)}
+                >
+                  {m.label}
+                </button>
+              ))}
+            </div>
+            {allMonths.length > 12 ? (
+              <div className="row" style={{ gap: 6 }}>
+                <span className="field-label" style={{ margin: 0 }}>{t("analytics_range")}:</span>
+                {rangeOptions.map((r) => (
+                  <button
+                    key={r.label}
+                    className={`btn btn-sm ${range === r.id ? "" : "btn-ghost"}`}
+                    onClick={() => setRange(r.id)}
+                  >
+                    {r.label}
+                  </button>
+                ))}
+              </div>
+            ) : null}
           </div>
         </div>
         <MonthChart
@@ -602,7 +1010,12 @@ function MonthsPanel({
       </div>
 
       <div className="panel panel-pad">
-        <div className="section-title">{t("analytics_month_breakdown")}</div>
+        <div className="row" style={{ justifyContent: "space-between", alignItems: "baseline" }}>
+          <div className="section-title">{t("analytics_month_breakdown")}</div>
+          <button className="btn btn-sm" onClick={exportCsv}>
+            {t("sec_export")}
+          </button>
+        </div>
         <div className="table-wrap" style={{ maxHeight: "none" }}>
           <table className="grid" style={{ width: "100%" }}>
             <thead>
@@ -617,6 +1030,8 @@ function MonthsPanel({
                 <SortTh label={t("common_rows")} onClick={() => setSort("rows")} arrow={arrow("rows")} />
                 <SortTh label={t("common_declarations")} onClick={() => setSort("docs")} arrow={arrow("docs")} />
                 <SortTh label={t("analytics_mom")} onClick={() => setSort("mom")} arrow={arrow("mom")} />
+                <SortTh label={t("analytics_yoy")} onClick={() => setSort("yoy")} arrow={arrow("yoy")} />
+                <SortTh label={t("analytics_cumulative")} onClick={() => setSort("cumulative")} arrow={arrow("cumulative")} />
               </tr>
             </thead>
             <tbody>
@@ -635,21 +1050,44 @@ function MonthsPanel({
                   </td>
                   <td>{formatInt(m.rows)}</td>
                   <td>{formatInt(m.declarations)}</td>
-                  <td
-                    style={{
-                      color:
-                        m.mom === null
-                          ? "var(--text-faint)"
-                          : m.mom >= 0
-                            ? "var(--flame-amber)"
-                            : "var(--flame-red)",
-                    }}
-                  >
-                    {m.mom === null ? "—" : `${m.mom >= 0 ? "+" : ""}${formatPercent(m.mom, 0)}`}
+                  <td>{growthCell(m.mom)}</td>
+                  <td>{growthCell(m.yoy)}</td>
+                  <td>
+                    {m.cumulative !== null ? (
+                      <span className="faint">
+                        {formatCompact(m.cumulative)} {primaryUnit}
+                      </span>
+                    ) : (
+                      "—"
+                    )}
                   </td>
                 </tr>
               ))}
             </tbody>
+            <tfoot>
+              <tr className="month-total-row">
+                <td>
+                  <strong>{t("analytics_total")}</strong>
+                </td>
+                <td>
+                  <strong>
+                    {totalValue !== null && valueCurrency
+                      ? `${formatCompact(totalValue)} ${valueCurrency}`
+                      : "—"}
+                  </strong>
+                </td>
+                <td>
+                  <strong>{totalNet !== null ? `${formatCompact(totalNet)} kg` : "—"}</strong>
+                </td>
+                <td>
+                  <strong>{formatInt(totalRows)}</strong>
+                </td>
+                <td>
+                  <strong>{formatInt(totalDocs)}</strong>
+                </td>
+                <td colSpan={3} />
+              </tr>
+            </tfoot>
           </table>
         </div>
       </div>
@@ -720,7 +1158,7 @@ function SectionGroupPanel({
   );
 }
 
-type SortField = "name" | "share" | "rows" | "value" | "net_kg" | "vpk";
+type SortField = "name" | "share" | "rows" | "docs" | "value" | "net_kg" | "vpk";
 
 // A full, sortable, filterable, exportable ranking table — the "see all"
 // replacement for the old top-N teaser. Sort/filter run client-side over the
@@ -748,12 +1186,19 @@ export function SectionTable({
   const [sortField, setSortField] = useState<SortField>("rows");
   const [dir, setDir] = useState<"asc" | "desc">("desc");
   const [filter, setFilter] = useState("");
+  // Minimum row-share threshold (%) to focus on the material groups.
+  const [minShare, setMinShare] = useState(0);
 
   const rows = useMemo(() => {
     const needle = filter.trim().toLowerCase();
-    const list = needle
+    let list = needle
       ? section.rows.filter((r) => r.label.toLowerCase().includes(needle))
       : section.rows.slice();
+    if (minShare > 0) {
+      list = list.filter(
+        (r) => safeRowShare(r, overview.row_count, valueCurrency !== null) >= minShare,
+      );
+    }
     const key = (r: AnalyticsGroupRow): number | string => {
       switch (sortField) {
         case "name":
@@ -762,6 +1207,8 @@ export function SectionTable({
           return safeRowShare(r, overview.row_count, valueCurrency !== null);
         case "rows":
           return r.rows;
+        case "docs":
+          return r.declarations;
         case "value": {
           const total = compatibleCurrencyTotal(r);
           return valueCurrency && total?.currency === valueCurrency
@@ -818,13 +1265,14 @@ export function SectionTable({
             ? [compatibleCurrencyTotal(r)!]
             : [];
       const value = currencyTotals
-        .map((total) =>
-          `${total.total_value} ${total.known ? total.currency : t("analytics_unknown_currency")}`,
+        .map(
+          (total) =>
+            `${total.total_value} ${currencyLabel(total.currency, t("analytics_unknown_currency"))}`,
         )
         .join(" | ");
       const weight = r.measures.net_weight_totals
         .map((total) => {
-          const sourceUnit = total.source_unit || t("analytics_unknown_unit");
+          const sourceUnit = unitLabel(total.source_unit, t("analytics_unknown_unit"));
           return total.known && total.normalized_unit === "kg" && total.total_kg !== null
             ? `${total.total_source_weight} ${sourceUnit} -> ${total.total_kg} kg`
             : `${total.total_source_weight} ${sourceUnit}`;
@@ -834,7 +1282,7 @@ export function SectionTable({
         .filter((ratio) => ratio.value_per_weight !== null)
         .map(
           (ratio) =>
-            `${ratio.value_per_weight} ${ratio.currency}/${ratio.normalized_weight_unit}`,
+            `${ratio.value_per_weight} ${currencyLabel(ratio.currency, t("analytics_unknown_currency"))}/${unitLabel(ratio.normalized_weight_unit, t("analytics_unknown_unit"))}`,
         )
         .join(" | ");
       return [
@@ -851,18 +1299,76 @@ export function SectionTable({
 
   const capped = section.rows.length >= limit;
 
+  // Cumulative share (Pareto): running share of the whole dataset as you read
+  // down the ranked rows, so "top N = X%" concentration is obvious at a glance.
+  const maxShare = Math.max(
+    ...rows.map((r) => safeRowShare(r, overview.row_count, valueCurrency !== null)),
+    1,
+  );
+  let runningRows = 0;
+  const cumulativeByIndex = rows.map((r) => {
+    runningRows += r.rows;
+    return overview.row_count > 0 ? (runningRows / overview.row_count) * 100 : 0;
+  });
+  const visibleRows = rows.reduce((sum, r) => sum + r.rows, 0);
+  const visibleDocs = rows.reduce((sum, r) => sum + r.declarations, 0);
+  const visibleShare =
+    overview.row_count > 0 ? (visibleRows / overview.row_count) * 100 : 0;
+
+  const copyTable = () => {
+    const header = [
+      "#",
+      t("col_name"),
+      `${t("analytics_rows_share")} %`,
+      t("common_rows"),
+      t("common_declarations"),
+    ].join("\t");
+    const body = rows.map((r, i) =>
+      [
+        i + 1,
+        r.label,
+        safeRowShare(r, overview.row_count, valueCurrency !== null).toFixed(2),
+        r.rows,
+        r.declarations,
+      ].join("\t"),
+    );
+    copyText([header, ...body].join("\n"));
+  };
+
   return (
     <div className="panel panel-pad">
       <div className="row wrap" style={{ justifyContent: "space-between", gap: 10 }}>
         <div className="section-title" style={{ margin: 0 }}>{title}</div>
-        <div className="row" style={{ gap: 8 }}>
+        <div className="row wrap" style={{ gap: 8 }}>
           <input
             className="input"
-            style={{ width: 180, padding: "6px 10px" }}
+            style={{ width: 160, padding: "6px 10px" }}
             placeholder={t("sec_filter")}
             value={filter}
             onChange={(e) => setFilter(e.target.value)}
           />
+          <label className="row" style={{ gap: 4, alignItems: "center" }}>
+            <span className="field-label" style={{ margin: 0 }}>{t("sec_min_share")}</span>
+            <input
+              className="input"
+              type="number"
+              min={0}
+              max={100}
+              step={1}
+              style={{ width: 62, padding: "6px 8px" }}
+              value={minShare || ""}
+              onChange={(e) => setMinShare(Math.max(0, Number(e.target.value) || 0))}
+            />
+            <span className="faint">%</span>
+          </label>
+          <button
+            className="btn btn-sm btn-ghost"
+            onClick={copyTable}
+            disabled={rows.length === 0}
+            title={t("report_copy")}
+          >
+            {t("report_copy")}
+          </button>
           <button className="btn btn-sm btn-ghost" onClick={exportCsv} disabled={rows.length === 0}>
             <Icon name="download" size={14} /> {t("sec_export")}
           </button>
@@ -885,51 +1391,92 @@ export function SectionTable({
             <table className="grid" style={{ width: "100%" }}>
               <thead>
                 <tr>
+                  <th style={{ width: 34, textAlign: "right" }}>#</th>
                   <SortTh label={t("col_name")} onClick={() => setSort("name")} arrow={arrow("name")} />
                   <SortTh label={t("analytics_rows_share")} onClick={() => setSort("share")} arrow={arrow("share")} />
                   <SortTh label={t("common_rows")} onClick={() => setSort("rows")} arrow={arrow("rows")} />
+                  <SortTh label={t("common_declarations")} onClick={() => setSort("docs")} arrow={arrow("docs")} />
+                  <th style={{ width: 96 }}>{t("analytics_cumulative_share")}</th>
                   <SortTh label={t("analytics_value_by_currency")} onClick={() => setSort("value")} arrow={arrow("value")} />
                   <SortTh label={t("analytics_net_weight")} onClick={() => setSort("net_kg")} arrow={arrow("net_kg")} />
                   <SortTh label={t("analytics_value_per_weight")} onClick={() => setSort("vpk")} arrow={arrow("vpk")} />
                 </tr>
               </thead>
               <tbody>
-                {rows.map((row, i) => (
-                  <tr
-                    key={`${row.label}-${i}`}
-                    onClick={() => row.filter_action && onRow?.(row.filter_action)}
-                    style={{ cursor: row.filter_action && onRow ? "pointer" : "default" }}
-                  >
-                    <td title={row.label} style={{ maxWidth: 320 }}>{row.label || "—"}</td>
-                    <td>
-                      {formatPercent(
-                        safeRowShare(row, overview.row_count, valueCurrency !== null),
-                      )}
-                    </td>
-                    <td>{formatInt(row.rows)}</td>
-                    <td>
-                      <CurrencySummary measures={row.measures} legacyUsd={row.total_value_usd} />
-                    </td>
-                    <td>
-                      {safeNetWeightKg(row, legacyRawKg) !== null ? (
-                        `${formatInt(safeNetWeightKg(row, legacyRawKg) ?? 0)} kg`
-                      ) : (
-                        <WeightSummary totals={row.measures.net_weight_totals} />
-                      )}
-                    </td>
-                    <td>
-                      <ValuePerWeightSummary
-                        measures={row.measures}
-                        legacyUsdPerKg={legacyRawKg ? row.avg_value_per_net_kg : undefined}
-                      />
-                    </td>
-                  </tr>
-                ))}
+                {rows.map((row, i) => {
+                  const share = safeRowShare(row, overview.row_count, valueCurrency !== null);
+                  return (
+                    <tr
+                      key={`${row.label}-${i}`}
+                      onClick={() => row.filter_action && onRow?.(row.filter_action)}
+                      style={{ cursor: row.filter_action && onRow ? "pointer" : "default" }}
+                    >
+                      <td style={{ textAlign: "right", color: "var(--text-faint)" }}>{i + 1}</td>
+                      <td title={row.label} style={{ maxWidth: 320 }}>{row.label || "—"}</td>
+                      <td>
+                        <div className="row" style={{ gap: 8, alignItems: "center" }}>
+                          <div className="bar-track" style={{ width: 66 }}>
+                            <div
+                              className="bar-fill"
+                              style={{ width: `${(share / maxShare) * 100}%` }}
+                            />
+                          </div>
+                          <span className="faint">{formatPercent(share)}</span>
+                        </div>
+                      </td>
+                      <td>{formatInt(row.rows)}</td>
+                      <td>{formatInt(row.declarations)}</td>
+                      <td className="faint">{formatPercent(cumulativeByIndex[i], 0)}</td>
+                      <td>
+                        <CurrencySummary measures={row.measures} legacyUsd={row.total_value_usd} />
+                      </td>
+                      <td>
+                        {safeNetWeightKg(row, legacyRawKg) !== null ? (
+                          `${formatInt(safeNetWeightKg(row, legacyRawKg) ?? 0)} kg`
+                        ) : (
+                          <WeightSummary totals={row.measures.net_weight_totals} />
+                        )}
+                      </td>
+                      <td>
+                        <ValuePerWeightSummary
+                          measures={row.measures}
+                          legacyUsdPerKg={legacyRawKg ? row.avg_value_per_net_kg : undefined}
+                        />
+                      </td>
+                    </tr>
+                  );
+                })}
               </tbody>
+              <tfoot>
+                <tr className="month-total-row">
+                  <td />
+                  <td>
+                    <strong>{t("analytics_total")}</strong>
+                    <span className="faint" style={{ marginLeft: 6 }}>
+                      {formatInt(rows.length)}
+                    </span>
+                  </td>
+                  <td>
+                    <strong>{formatPercent(visibleShare, 0)}</strong>
+                  </td>
+                  <td>
+                    <strong>{formatInt(visibleRows)}</strong>
+                  </td>
+                  <td>
+                    <strong>{formatInt(visibleDocs)}</strong>
+                  </td>
+                  <td colSpan={4} />
+                </tr>
+              </tfoot>
             </table>
           </div>
           <div className="faint" style={{ fontSize: 12, marginTop: 8 }}>
             {t("sec_shown")}: {formatInt(rows.length)}
+            {" · "}
+            {t("sec_concentration", {
+              n: formatInt(rows.length),
+              pct: formatPercent(visibleShare, 0),
+            })}
             {capped ? ` · ${t("sec_capped")}` : ""}
           </div>
         </>
@@ -973,6 +1520,74 @@ function SectionLimitBar({ value, onChange }: { value: number; onChange: (n: num
 
 // The constraints currently narrowing the analytics, as removable chips — so a
 // month/company drill is always visible and reversible.
+// In-page query editor so the user never has to leave Analytics to change what
+// is being analyzed: a full-text box plus the same direct filters as Search,
+// applied in one step to the shared applied-query.
+function AnalyticsSearchBar() {
+  const { t } = useI18n();
+  const { query, applyQuery } = useQueryStore();
+  const [text, setText] = useState(query.text);
+  const [filters, setFilters] = useState<Filters>(query.filters);
+  const [showFilters, setShowFilters] = useState(false);
+
+  // Reflect changes made elsewhere (chip removal, month drill, undo, clear-all).
+  useEffect(() => {
+    setText(query.text);
+    setFilters(query.filters);
+  }, [query]);
+
+  const activeCount = FILTER_FIELDS.filter((f) => query.filters[f.key].trim()).length;
+  const run = () => applyQuery({ ...query, text: text.trim(), filters });
+
+  return (
+    <div className="panel panel-pad analytics-searchbar">
+      <div className="row" style={{ gap: 8 }}>
+        <input
+          className="input grow"
+          value={text}
+          placeholder={t("analytics_search_placeholder")}
+          aria-label={t("analytics_search_placeholder")}
+          onChange={(event) => setText(event.target.value)}
+          onKeyDown={(event) => event.key === "Enter" && run()}
+        />
+        <button className="btn btn-primary" onClick={run}>
+          <Icon name="analytics" size={15} /> {t("analytics_analyze")}
+        </button>
+        <button
+          className={`btn ${showFilters ? "" : "btn-ghost"}`}
+          onClick={() => setShowFilters((value) => !value)}
+          aria-expanded={showFilters}
+        >
+          <Icon name="filter" size={15} /> {t("search_filters")}
+          {activeCount > 0 ? ` (${activeCount})` : ""}
+        </button>
+      </div>
+      {showFilters ? (
+        <div className="filters-grid" style={{ marginTop: 10 }}>
+          {FILTER_FIELDS.map((field) => (
+            <div key={field.key}>
+              <label className="field-label">{t(field.labelKey)}</label>
+              <input
+                className="input"
+                value={filters[field.key]}
+                onChange={(event) =>
+                  setFilters((prev) => ({ ...prev, [field.key]: event.target.value }))
+                }
+                onKeyDown={(event) => event.key === "Enter" && run()}
+              />
+            </div>
+          ))}
+          <div className="row" style={{ alignItems: "flex-end" }}>
+            <button className="btn btn-primary btn-sm" onClick={run}>
+              {t("common_apply")}
+            </button>
+          </div>
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
 function QueryChips({
   query,
   onClearText,
@@ -1410,6 +2025,7 @@ function ComparePanel() {
   const [right, setRight] = useState<Analytics | null>(null);
   const [leftQuery, setLeftQuery] = useState<Query | null>(null);
   const [rightQuery, setRightQuery] = useState<Query | null>(null);
+  const [swapped, setSwapped] = useState(false);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -1425,6 +2041,7 @@ function ComparePanel() {
       setRight(null);
       setLeftQuery(null);
       setRightQuery(null);
+      setSwapped(false);
     }
   }, [queryKey, leftQuery]);
 
@@ -1454,6 +2071,7 @@ function ComparePanel() {
       setRight(r.data);
       setLeftQuery(query);
       setRightQuery(other);
+      setSwapped(false);
     } catch (err) {
       setError((err as ApiError)?.message ?? t("compare_failed"));
     } finally {
@@ -1493,35 +2111,55 @@ function ComparePanel() {
       {error ? <Banner>{error}</Banner> : null}
       {loading ? <Loading /> : null}
 
-      {left && right && leftQuery && rightQuery ? (
-        <>
-          <div className="grid-2">
-            <CompareCard title={t("compare_current")} label={queryLabel(leftQuery, t)} data={left} />
-            <CompareCard title={t("compare_other")} label={queryLabel(rightQuery, t)} data={right} />
-          </div>
-          <div className="panel panel-pad">
-            <div className="section-title">{t("compare_difference")}</div>
-            <div className="table-wrap" style={{ maxHeight: "none" }}>
-              <table className="grid" style={{ width: "100%" }}>
-                <thead>
-                  <tr>
-                    <th>{t("analytics_metric")}</th>
-                    <th>{t("compare_current")}</th>
-                    <th>{t("compare_other")}</th>
-                    <th>Δ</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  <CompareRow label={t("common_rows")} a={left.overview.row_count} b={right.overview.row_count} kind="int" />
-                  <CompareRow label={t("common_declarations")} a={left.overview.declaration_count} b={right.overview.declaration_count} kind="int" />
-                  <MeasureCompareRows left={left.overview} right={right.overview} />
-                  <CompareRow label={t("analytics_companies")} a={left.overview.distinct_edrpou} b={right.overview.distinct_edrpou} kind="int" />
-                </tbody>
-              </table>
-            </div>
-          </div>
-        </>
-      ) : null}
+      {left && right && leftQuery && rightQuery
+        ? (() => {
+            // `swapped` flips only the display order so the stored left query
+            // stays identified with the live query (the snapshot guard depends
+            // on it); the diff sign follows the displayed sides.
+            const dL = swapped
+              ? { data: right, q: rightQuery }
+              : { data: left, q: leftQuery };
+            const dR = swapped
+              ? { data: left, q: leftQuery }
+              : { data: right, q: rightQuery };
+            return (
+              <>
+                <div className="row" style={{ justifyContent: "flex-end" }}>
+                  <button className="btn btn-sm btn-ghost" onClick={() => setSwapped((s) => !s)}>
+                    <Icon name="refresh" size={14} /> {t("compare_swap")}
+                  </button>
+                </div>
+                <div className="grid-2">
+                  <CompareCard title={t("compare_current")} label={queryLabel(dL.q, t)} data={dL.data} />
+                  <CompareCard title={t("compare_other")} label={queryLabel(dR.q, t)} data={dR.data} />
+                </div>
+                <div className="panel panel-pad">
+                  <div className="section-title">{t("compare_difference")}</div>
+                  <div className="table-wrap" style={{ maxHeight: "none" }}>
+                    <table className="grid" style={{ width: "100%" }}>
+                      <thead>
+                        <tr>
+                          <th>{t("analytics_metric")}</th>
+                          <th>{t("compare_current")}</th>
+                          <th>{t("compare_other")}</th>
+                          <th>Δ</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        <CompareRow label={t("common_rows")} a={dL.data.overview.row_count} b={dR.data.overview.row_count} kind="int" />
+                        <CompareRow label={t("common_declarations")} a={dL.data.overview.declaration_count} b={dR.data.overview.declaration_count} kind="int" />
+                        <MeasureCompareRows left={dL.data.overview} right={dR.data.overview} />
+                        <CompareRow label={t("analytics_companies")} a={dL.data.overview.distinct_edrpou} b={dR.data.overview.distinct_edrpou} kind="int" />
+                        <CompareRow label={t("analytics_product_codes")} a={dL.data.overview.distinct_product_codes} b={dR.data.overview.distinct_product_codes} kind="int" />
+                        <CompareRow label={t("analytics_origin_countries")} a={dL.data.overview.distinct_origin_countries} b={dR.data.overview.distinct_origin_countries} kind="int" />
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+              </>
+            );
+          })()
+        : null}
     </div>
   );
 }

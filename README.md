@@ -1,4 +1,4 @@
-# Base Search 2.0.1
+# Base Search 2.0.2
 
 [![CI](https://github.com/IvanK577/BaseSearch/actions/workflows/ci.yml/badge.svg)](https://github.com/IvanK577/BaseSearch/actions/workflows/ci.yml)
 
@@ -123,16 +123,38 @@ sizes.
 
 ## Analytics
 
-Analytics always use the same query and filters as Search. Available views
-include an overview, time trends, companies, products, countries, prices,
-pivots, comparisons, printable reports, company dossiers, and possible
-undervaluation signals.
+Analytics always use the same query and filters as Search, and the query can be
+changed in place from a search box and filters at the top of the page — no need
+to return to Search. Available views include an overview, monthly dynamics,
+companies, products, countries, prices, pivots, comparisons, printable reports,
+company dossiers, and possible undervaluation signals.
+
+Each view is a working tool, not just a table:
+
+- **Overview** shows headline metrics, a monthly chart, and top-5 previews of
+  companies, goods, and countries that open the full tab.
+- **Monthly dynamics** offers a metric and range selector, month-over-month and
+  year-over-year change, a cumulative total, a totals row, and CSV export.
+- **Companies, Goods, and Countries** are sortable, filterable, exportable
+  ranking tables with a rank column, a row-share bar, a cumulative-share
+  (Pareto) column and "top N = X%" callout, a minimum-share filter, copy to
+  clipboard, and an adjustable result size.
+- **Prices** reports median, average, weighted, percentiles, and the
+  interquartile range with a compact distribution box-plot per metric.
+- **Compare** puts the current query beside another product, company, or year
+  and shows a signed difference table, with a control to swap the two sides.
+
+Complex selections are supported directly: the advanced query builder matches
+several products at once with the "is any of" operator and nested all/any (OR)
+groups.
 
 Base Search does not invent missing business meaning. A view is available only
 when the dataset has suitable mapped columns. Currency totals are kept in
 separate currency groups, and incompatible currencies are not presented as one
-USD total. Weight units are normalized only when the unit is known. Price-risk
-results are signals for review, not legal, accounting, or valuation advice.
+USD total; an unrecognized currency is labeled plainly rather than shown as an
+internal placeholder. Weight units are normalized only when the unit is known.
+Price-risk results are signals for review, not legal, accounting, or valuation
+advice.
 
 Production packages include two local engines:
 

@@ -2,6 +2,56 @@
 
 All notable changes to Base Search are documented in this file.
 
+## 2.0.2 - 2026-07-24
+
+A large analytics quality release: every Analyze tab gained genuinely useful,
+well-integrated tools, the workspace never leaks internal placeholders, and the
+whole surface stays responsive on multi-gigabyte databases.
+
+### Added
+
+- Added an in-page query bar to Analytics: a full-text box plus the same direct
+  filters as Search, applied in one step. Analytics is now a self-contained
+  analytical search tool — the query can be changed without leaving the page,
+  and it is offered even on the whole-database consent screen.
+- Enriched the Overview: lazy top-5 previews of companies, goods, and countries
+  (each opens the full tab and warms its cache), additional supplier, trademark,
+  and average-per-month metrics, and a one-click "copy summary".
+- Reworked Monthly dynamics: a 12/24/all range selector, month-over-month and
+  year-over-year change columns, a cumulative running total, a totals row, CSV
+  export, and a peak/average/first-to-last context line.
+- Enriched the company, goods, and country ranking tables: a rank column, a
+  visual row-share bar, a cumulative-share (Pareto) column with a
+  "top N = X% of rows" concentration callout, a sortable declarations column, a
+  minimum-share filter, a totals row, and copy-to-clipboard alongside the
+  existing sort, search, CSV export, and adjustable limit.
+- Enriched Prices: a compact box-plot of each metric's distribution (robust
+  Tukey scaling with an outlier marker), an interquartile-range column, CSV
+  export, and a plain-language explanation of the price basis.
+- Enriched Compare: a swap-sides control and additional difference rows for
+  distinct products and origin countries.
+
+### Changed
+
+- Reworked the interface polish around a calm, minimalist fire palette: a subtle
+  gradient on primary actions, a soft lift on stat cards, and small transitions
+  on tabs, buttons, and rows.
+
+### Fixed
+
+- Fixed an internal `__unknown__` placeholder leaking into the interface for
+  unmapped currencies and units; unknown values now read as a friendly label
+  (and keep any original code) across analytics cards, tables, reports, and CSV
+  export.
+- Fixed the company dossier and analytics staying blank instead of guiding the
+  user when the dataset has no recognized currency: a hint now links straight to
+  the column mapping.
+- Fixed enriched analytics failing with "server is busy" on large databases when
+  several heavy reads collided: the analytics loader and the overview previews
+  now retry a transient overload reply with a short backoff.
+- Fixed the translation quality gate and kept all eleven interface languages
+  complete for the new tools.
+
 ## 2.0.1 - 2026-07-22
 
 ### Fixed
