@@ -6,7 +6,11 @@ use sha2::{Digest, Sha256};
 use crate::db::{FtsRepairError, FtsRepairIssue, FtsRepairReport};
 use crate::storage::{effective_rows, meta, search_text};
 
-pub(crate) const SCHEMA_VERSION: &str = "7";
+/// Bumped to 8 when `SEARCH_COLUMNS` gained the identifying columns (EDRPOU,
+/// contract, delivery place, customs office, ZED purpose). An existing database
+/// rebuilds its index once on the next open so those columns become
+/// searchable; the rebuild reports progress and resumes if it is interrupted.
+pub(crate) const SCHEMA_VERSION: &str = "8";
 
 const INDEX_TABLE: &str = "records_fts";
 const REBUILD_TABLE: &str = "records_fts_rebuild";

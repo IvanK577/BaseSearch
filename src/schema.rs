@@ -195,8 +195,19 @@ pub const REQUIRED_HEADERS: [&str; 7] = [
 ];
 
 /// Columns included in the full-text search index.
+///
 /// Countries are included so country filters can be accelerated through FTS.
-pub const SEARCH_COLUMNS: [&str; 9] = [
+/// Beyond those, a column earns a place here by being something a person
+/// actually types into the search box: an identifier or a name that picks out
+/// specific rows.
+///
+/// Deliberately excluded, even though they are text: `item_number` is a
+/// per-row ordinal, and `unit`, `declaration_type`, `delivery_terms`,
+/// `movement_feature`, `field_43` and `field_43_01` hold a handful of codes
+/// repeated across every row. Each would add a posting list nearly as long as
+/// the table for values nobody searches by, inflating both the index and the
+/// time it takes to build — which is the other complaint.
+pub const SEARCH_COLUMNS: [&str; 14] = [
     "description",
     "sender",
     "recipient",
@@ -206,6 +217,11 @@ pub const SEARCH_COLUMNS: [&str; 9] = [
     "trade_country",
     "dispatch_country",
     "origin_country",
+    "edrpou",
+    "contract",
+    "delivery_place",
+    "customs_office",
+    "zed_purpose",
 ];
 
 /// Legacy compatibility-profile result columns by database name. Newer UI/export

@@ -215,6 +215,7 @@ fn opening_v1_rows_adds_nullable_identity_without_backfill() {
         .execute_batch(
             "DROP INDEX IF EXISTS idx_records_source_id;
              DROP INDEX IF EXISTS idx_records_schema_hash_owner;
+             DROP INDEX IF EXISTS idx_records_legacy_schema;
              DROP TRIGGER IF EXISTS records_canonical_schema_insert;
              DROP TRIGGER IF EXISTS records_canonical_schema_update;",
         )

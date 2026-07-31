@@ -3,7 +3,7 @@
 import { act, cleanup, fireEvent, render } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import type { CountResponse, SearchResponse } from "../api/types";
+import type { SearchResponse } from "../api/types";
 import { QueryProvider } from "../state/query";
 
 const apiMocks = vi.hoisted(() => ({
@@ -48,6 +48,8 @@ function response(value: string, id: number): SearchResponse {
     offset: 0,
     limit: 50,
     has_next: false,
+    total: 1,
+    snapshot: 99,
   };
 }
 
@@ -70,15 +72,10 @@ afterEach(cleanup);
 describe("Search request ordering", () => {
   it("keeps the newest result when requests finish out of order", async () => {
     const firstSearch = deferred<SearchResponse>();
-    const firstCount = deferred<CountResponse>();
     const secondSearch = deferred<SearchResponse>();
-    const secondCount = deferred<CountResponse>();
     apiMocks.search
       .mockReturnValueOnce(firstSearch.promise)
       .mockReturnValueOnce(secondSearch.promise);
-    apiMocks.count
-      .mockReturnValueOnce(firstCount.promise)
-      .mockReturnValueOnce(secondCount.promise);
     const { SearchPage } = await import("./Search");
     const view = render(
       <QueryProvider>
@@ -96,25 +93,24 @@ describe("Search request ordering", () => {
 
     await act(async () => {
       secondSearch.resolve(response("second result", 2));
-      secondCount.resolve({ total: 1 });
     });
     expect(await view.findByText("second result")).toBeTruthy();
 
     await act(async () => {
       firstSearch.resolve(response("stale result", 1));
-      firstCount.resolve({ total: 1 });
     });
     expect(view.queryByText("stale result")).toBeNull();
     expect(view.getByText("second result")).toBeTruthy();
     expect(apiMocks.search.mock.calls[0][0].text).toBe("first");
     expect(apiMocks.search.mock.calls[1][0].text).toBe("second");
+    // The total rides along on the search response. A separate /api/count
+    // would re-run the most expensive part of the same query for nothing.
+    expect(apiMocks.count).not.toHaveBeenCalled();
   });
 
   it("invalidates an in-flight request when Reset clears the workspace", async () => {
     const pendingSearch = deferred<SearchResponse>();
-    const pendingCount = deferred<CountResponse>();
     apiMocks.search.mockReturnValueOnce(pendingSearch.promise);
-    apiMocks.count.mockReturnValueOnce(pendingCount.promise);
     const { SearchPage } = await import("./Search");
     const view = render(
       <QueryProvider>
@@ -131,7 +127,6 @@ describe("Search request ordering", () => {
 
     await act(async () => {
       pendingSearch.resolve(response("should stay hidden", 3));
-      pendingCount.resolve({ total: 1 });
     });
     expect(view.queryByText("should stay hidden")).toBeNull();
     expect(

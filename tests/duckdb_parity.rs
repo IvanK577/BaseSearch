@@ -13,8 +13,8 @@ use std::sync::atomic::AtomicBool;
 
 use base_search::db::{
     Analytics, AnalyticsMeasures, AnalyticsPriceMetric, AnalyticsScope, AnalyticsSection,
-    AnalyticsWeightTotal, Db, Filters, ImportRecord, PriceMetricKind, Query, RecordScope,
-    canonical_record_hash,
+    AnalyticsSectionKind, AnalyticsWeightTotal, Db, Filters, ImportRecord, PriceMetricKind, Query,
+    RecordScope, canonical_record_hash,
 };
 use base_search::domain::table::{ColumnStorage, SemanticField, TableShape};
 use base_search::duckdb_olap;
@@ -477,6 +477,14 @@ fn compare_analytics(duck: &Analytics, sqlite: &Analytics, context: &str) {
             }
             _ => panic!("{context}: month USD compatibility differs"),
         }
+        // A month row's `total_value_usd` is `#[serde(skip)]`: `measures` is the
+        // only way its money and weight reach the browser, so parity that skips
+        // it cannot see a whole column going blank on one engine.
+        compare_measures(
+            &dm.measures,
+            &sm.measures,
+            &format!("{context}: month {}", sm.month),
+        );
     }
 
     compare_section_lists(&duck.company_sections, &sqlite.company_sections, context);
@@ -708,6 +716,351 @@ fn duckdb_rollups_match_sqlite_for_json_backed_semantics() {
             compare_analytics(&duck, &sqlite, &context);
         }
     }
+}
+
+/// Group and month rows publish their money, weight and value-per-kg ONLY
+/// through `measures`: `total_value_usd` is `#[serde(skip)]` on both, so a row
+/// carrying a default `AnalyticsMeasures` reaches the browser as an em dash
+/// even though every sum behind it was computed. The projection used to build
+/// exactly that row, and because every other compared field still agreed,
+/// nothing failed — the numbers simply disappeared from the tables.
+#[test]
+fn group_and_month_rows_publish_inherited_measures() {
+    let dir = tempfile::tempdir().unwrap();
+    let (db, projection) = build_generic_fixture(dir.path());
+    let query = Query::default();
+    let sqlite = db
+        .analytics_scoped(&query, 50, Some(AnalyticsScope::Companies), 10)
+        .unwrap();
+    let duck =
+        duckdb_olap::analytics_scoped(&projection, &query, 50, Some(AnalyticsScope::Companies), 10)
+            .unwrap();
+
+    assert!(
+        !sqlite.overview.measures.currency_totals.is_empty(),
+        "fixture must have a currency cohort for rows to inherit"
+    );
+    assert!(!duck.months.is_empty(), "fixture must produce months");
+    for month in &duck.months {
+        assert!(
+            !month.measures.currency_totals.is_empty(),
+            "month {} publishes no money at all",
+            month.month
+        );
+        assert!(
+            !month.measures.net_weight_totals.is_empty(),
+            "month {} publishes no weight at all",
+            month.month
+        );
+    }
+
+    let recipients = duck
+        .company_sections
+        .iter()
+        .find(|section| section.kind == AnalyticsSectionKind::Recipients)
+        .expect("the fixture maps a recipient column");
+    assert!(
+        !recipients.rows.is_empty(),
+        "fixture must produce recipient group rows"
+    );
+
+    let mut group_rows = 0_usize;
+    for section in &duck.company_sections {
+        for row in &section.rows {
+            group_rows += 1;
+            assert!(
+                !row.measures.currency_totals.is_empty(),
+                "group {} publishes no money at all",
+                row.label
+            );
+            assert!(
+                !row.measures.net_weight_totals.is_empty(),
+                "group {} publishes no weight at all",
+                row.label
+            );
+            // The wire is the contract. `total_value_usd` can only ever appear
+            // as part of the flattened `compatible_usd` object — the row's own
+            // field of that name is `#[serde(skip)]`. This fixture HAS a USD
+            // cohort, so the key is present here; on anything without one (the
+            // customs profile, mixed currencies) it disappears entirely, which
+            // is precisely why `measures` has to carry the money.
+            let wire = serde_json::to_value(row).unwrap();
+            assert_eq!(
+                wire.get("total_value_usd").is_some(),
+                row.compatible_usd.is_some(),
+                "group {} serializes money outside the compatibility object",
+                row.label
+            );
+            assert!(
+                wire["measures"]["currency_totals"]
+                    .as_array()
+                    .is_some_and(|totals| !totals.is_empty()),
+                "group {} serializes an empty currency cohort",
+                row.label
+            );
+        }
+    }
+    assert!(group_rows > 0, "fixture must produce group rows");
+
+    compare_analytics(&duck, &sqlite, "generic empty query / companies");
+}
+
+/// The Ukrainian "Відправник", "Одержувач" and "Опис" filters.
+///
+/// DuckDB folds the column with `lower()`, which is Unicode-aware, while the
+/// needle was folded with `to_ascii_lowercase`, which leaves Cyrillic exactly
+/// as it was. The two could never meet, so every one of these filters answered
+/// "no rows" on the projection while SQLite answered correctly — on a Ukrainian
+/// customs database, that is most of the app.
+#[test]
+fn cyrillic_contains_filters_match_sqlite() {
+    let dir = tempfile::tempdir().unwrap();
+    let (db, projection) = build_fixture(dir.path());
+
+    let probes: Vec<(&str, Query)> = vec![
+        (
+            "recipient as stored (uppercase Cyrillic)",
+            filters_query(|filters| filters.recipient = "ТОВ АЙФОН УКРАЇНА".into()),
+        ),
+        (
+            "recipient lowercased by the user",
+            filters_query(|filters| filters.recipient = "тов айфон україна".into()),
+        ),
+        (
+            "sender",
+            filters_query(|filters| filters.sender = "APPLE DISTRIBUTION INTERNATIONAL LTD".into()),
+        ),
+        (
+            "description",
+            filters_query(|filters| filters.description = "Вино виноградне ігристе".into()),
+        ),
+    ];
+
+    for (name, query) in &probes {
+        let sqlite = db
+            .analytics_scoped(query, 50, Some(AnalyticsScope::Companies), 10)
+            .unwrap();
+        let duck = duckdb_olap::analytics_scoped(
+            &projection,
+            query,
+            50,
+            Some(AnalyticsScope::Companies),
+            10,
+        )
+        .unwrap();
+        assert!(
+            sqlite.overview.row_count > 0,
+            "{name}: the probe must select rows, otherwise it proves nothing"
+        );
+        assert_eq!(
+            duck.overview.row_count, sqlite.overview.row_count,
+            "{name}: the projection selected a different number of rows"
+        );
+        compare_analytics(&duck, &sqlite, name);
+    }
+}
+
+/// The month series is the only source of the period caption, so a limit that
+/// quietly truncates it makes a ten-year archive describe itself as a four-year
+/// one — and makes the two engines return different series for one database.
+/// DuckDB kept its own hard limit of 48 after SQLite's became 600.
+#[test]
+fn month_series_is_not_truncated_at_four_years() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("months.db");
+    let mut db = Db::open(&db_path).unwrap();
+    let headers = [
+        "Order Date",
+        "Invoice Number",
+        "Customer",
+        "Net Weight KG",
+        "Amount USD",
+    ];
+    let shape = TableShape::from_headers(headers.iter().map(|header| (*header).to_string()));
+    db.remember_table_shape(&shape);
+    db.remember_extra_headers(headers);
+
+    const MONTHS: i64 = 60;
+    let rows: Vec<ImportRecord> = (0..MONTHS)
+        .map(|index| {
+            let year = 2020 + index / 12;
+            let date = format!("{year}-{:02}-15", 1 + index % 12);
+            let invoice = format!("INV-{index:04}");
+            generic_record(
+                year,
+                &[
+                    ("Order Date", date.as_str()),
+                    ("Invoice Number", invoice.as_str()),
+                    ("Customer", "Acme UA"),
+                    ("Net Weight KG", "10"),
+                    ("Amount USD", "100"),
+                ],
+            )
+        })
+        .collect();
+    db.begin_import_file().unwrap();
+    assert_eq!(
+        db.insert_batch("months.csv", &rows).unwrap(),
+        (MONTHS as u64, 0)
+    );
+    db.commit_import_file().unwrap();
+
+    let projection = duckdb_olap::default_projection_path(&db_path);
+    duckdb_olap::build_projection_atomic(&db_path, &projection).unwrap();
+
+    let query = Query::default();
+    let sqlite = db.analytics_scoped(&query, 50, None, 10).unwrap();
+    assert_eq!(
+        sqlite.months.len(),
+        MONTHS as usize,
+        "the fixture must span more than the old four-year window"
+    );
+    // Both DuckDB paths carry their own limit: the persisted monthly rollup and
+    // the detail scan.
+    for (name, analytics) in [
+        (
+            "rollup",
+            duckdb_olap::analytics_scoped(&projection, &query, 50, None, 10).unwrap(),
+        ),
+        (
+            "detail",
+            duckdb_olap::analytics_scoped_detail(&projection, &query, 50, None, 10).unwrap(),
+        ),
+    ] {
+        assert_eq!(
+            analytics.months.len(),
+            sqlite.months.len(),
+            "{name}: month series length"
+        );
+        compare_analytics(&analytics, &sqlite, name);
+    }
+}
+
+/// Which group rows survive the section limit, and what share each one claims.
+///
+/// SQLite ranks group rows by the plain `SUM(value)` and computes every share
+/// against that same sum, whatever currency the data is in. The projection read
+/// the USD-COMPATIBILITY total instead, which is deliberately absent for
+/// anything that is not one known USD cohort — including the customs profile
+/// this product exists for, whose value column ("ФВ вал.контр") carries no
+/// currency at all. It therefore ranked and shared by weight. Every previous
+/// parity fixture ranked the same way by value and by weight, so the difference
+/// was invisible; here the two rankings are deliberately opposite, and the
+/// section limit makes them return different companies for the same question.
+#[test]
+fn unknown_currency_sections_rank_and_share_by_value_like_sqlite() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("ranking.db");
+    let mut db = Db::open(&db_path).unwrap();
+    // No currency column and no currency word in any header: exactly the
+    // customs situation, so `compatible_usd` is None on both engines.
+    let headers = [
+        "Order Date",
+        "Invoice Number",
+        "Customer",
+        "Net Weight KG",
+        "Amount",
+    ];
+    let shape = TableShape::from_headers(headers.iter().map(|header| (*header).to_string()));
+    db.remember_table_shape(&shape);
+    db.remember_extra_headers(headers);
+
+    let rows = vec![
+        generic_record(
+            2024,
+            &[
+                ("Order Date", "2024-03-15"),
+                ("Invoice Number", "INV-001"),
+                ("Customer", "HEAVY AND CHEAP"),
+                ("Net Weight KG", "100"),
+                ("Amount", "500"),
+            ],
+        ),
+        generic_record(
+            2024,
+            &[
+                ("Order Date", "2024-03-16"),
+                ("Invoice Number", "INV-002"),
+                ("Customer", "LIGHT AND RICH"),
+                ("Net Weight KG", "1"),
+                ("Amount", "5000"),
+            ],
+        ),
+        generic_record(
+            2024,
+            &[
+                ("Order Date", "2024-03-17"),
+                ("Invoice Number", "INV-003"),
+                ("Customer", "IN THE MIDDLE"),
+                ("Net Weight KG", "50"),
+                ("Amount", "2000"),
+            ],
+        ),
+    ];
+    db.begin_import_file().unwrap();
+    assert_eq!(db.insert_batch("ranking.csv", &rows).unwrap(), (3, 0));
+    db.commit_import_file().unwrap();
+
+    let projection = duckdb_olap::default_projection_path(&db_path);
+    duckdb_olap::build_projection_atomic(&db_path, &projection).unwrap();
+
+    // A limit below the number of groups is the whole point: with every group
+    // returned, a different order is still the same set of numbers.
+    let query = Query::default();
+    let sqlite = db
+        .analytics_scoped(&query, 2, Some(AnalyticsScope::Companies), 10)
+        .unwrap();
+    let duck =
+        duckdb_olap::analytics_scoped(&projection, &query, 2, Some(AnalyticsScope::Companies), 10)
+            .unwrap();
+
+    assert!(
+        sqlite.overview.compatible_usd.is_none() && duck.overview.compatible_usd.is_none(),
+        "the fixture must have no usable currency, or it does not reproduce the customs case"
+    );
+
+    let recipients = |analytics: &Analytics| {
+        analytics
+            .company_sections
+            .iter()
+            .find(|section| section.kind == AnalyticsSectionKind::Recipients)
+            .expect("the fixture maps a recipient column")
+            .rows
+            .clone()
+    };
+    let expected = recipients(&sqlite);
+    let actual = recipients(&duck);
+    assert_eq!(expected.len(), 2, "the section limit must actually cut");
+    assert!(
+        !expected.iter().any(|row| row.label == "HEAVY AND CHEAP"),
+        "the fixture must rank differently by value than by weight"
+    );
+    assert_eq!(
+        actual.iter().map(|row| &row.label).collect::<Vec<_>>(),
+        expected.iter().map(|row| &row.label).collect::<Vec<_>>(),
+        "the projection kept a different top-N than SQLite"
+    );
+
+    // The share column reads off the same basis, and nothing else in this file
+    // compares it when there is no USD cohort — which is the only case where it
+    // could ever differ.
+    assert!(
+        expected[0].share_percent > 50.0,
+        "shares must be computed from value, not weight, for this comparison to bite"
+    );
+    for expected_row in &expected {
+        let actual_row = actual
+            .iter()
+            .find(|row| row.label == expected_row.label)
+            .unwrap_or_else(|| panic!("missing group {}", expected_row.label));
+        assert_close(
+            actual_row.share_percent,
+            expected_row.share_percent,
+            &format!("share of {}", expected_row.label),
+        );
+    }
+
+    compare_analytics(&duck, &sqlite, "unknown currency / limited sections");
 }
 
 #[test]

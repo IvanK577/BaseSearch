@@ -4,7 +4,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Barrier};
 use std::time::Instant;
 
-use base_search::db::{Analytics, AnalyticsScope, Db, ImportRecord, Query, canonical_record_hash};
+use base_search::db::{
+    Analytics, AnalyticsMeasures, AnalyticsScope, Db, ImportRecord, Query, canonical_record_hash,
+};
 use base_search::domain::table::{SemanticField, TableShape};
 use base_search::duckdb_olap::{self, DuckAnalyticsSource};
 use base_search::engines::{AnalyticsEngine, DuckDbAnalyticsEngine};
@@ -140,6 +142,54 @@ fn assert_usd_compatibility_match(
     }
 }
 
+/// Money and weight as a group or month row actually publishes them.
+///
+/// Both rows keep `total_value_usd` out of the serialized form, so `measures`
+/// is the only place their figures exist on the wire. A rollup that returns the
+/// row with a default `AnalyticsMeasures` agrees with SQLite on every other
+/// field and still renders an empty table.
+fn assert_measures_match(actual: &AnalyticsMeasures, expected: &AnalyticsMeasures, label: &str) {
+    assert_eq!(
+        actual.currency_totals.len(),
+        expected.currency_totals.len(),
+        "{label}: currency cohorts"
+    );
+    for expected_total in &expected.currency_totals {
+        let actual_total = actual
+            .currency_totals
+            .iter()
+            .find(|total| total.currency == expected_total.currency)
+            .unwrap_or_else(|| panic!("{label}: missing currency {}", expected_total.currency));
+        assert_eq!(
+            actual_total.valued_rows, expected_total.valued_rows,
+            "{label}: valued rows"
+        );
+        assert_close(actual_total.total_value, expected_total.total_value, label);
+    }
+    assert_eq!(
+        actual.net_weight_totals.len(),
+        expected.net_weight_totals.len(),
+        "{label}: net weight cohorts"
+    );
+    for expected_total in &expected.net_weight_totals {
+        let actual_total = actual
+            .net_weight_totals
+            .iter()
+            .find(|total| total.source_unit == expected_total.source_unit)
+            .unwrap_or_else(|| panic!("{label}: missing unit {}", expected_total.source_unit));
+        assert_eq!(
+            actual_total.weighted_rows, expected_total.weighted_rows,
+            "{label}: weighted rows"
+        );
+        assert_close(
+            actual_total.total_source_weight,
+            expected_total.total_source_weight,
+            label,
+        );
+        assert_optional_close(actual_total.total_kg, expected_total.total_kg, label);
+    }
+}
+
 fn assert_analytics_match(actual: &Analytics, expected: &Analytics) {
     let (actual_overview, expected_overview) = (&actual.overview, &expected.overview);
     assert_eq!(actual_overview.row_count, expected_overview.row_count);
@@ -202,6 +252,11 @@ fn assert_analytics_match(actual: &Analytics, expected: &Analytics) {
             expected.compatible_usd.as_ref(),
             "month",
         );
+        assert_measures_match(
+            &actual.measures,
+            &expected.measures,
+            &format!("month {}", expected.month),
+        );
     }
     for (actual_sections, expected_sections) in [
         (&actual.company_sections, &expected.company_sections),
@@ -234,6 +289,11 @@ fn assert_analytics_match(actual: &Analytics, expected: &Analytics) {
                 if actual.compatible_usd.is_some() {
                     assert_close(actual.share_percent, expected.share_percent, "group share");
                 }
+                assert_measures_match(
+                    &actual.measures,
+                    &expected.measures,
+                    &format!("group {}", expected.label),
+                );
             }
         }
     }

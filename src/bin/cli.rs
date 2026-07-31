@@ -52,6 +52,7 @@ Usage:
   base-search-cli olap-benchmark <projection.duckdb> [query...] [--year Y]
                        [--origin C] [--repeat N] [--warmups N] [--json]
   base-search-cli export <db> <out.csv|out.xlsx> [query...]
+  base-search-cli version
 
 Import formats: .xlsx, .xlsb, .xls, .xlsm, .ods, .csv, .tsv
 Account roles: owner, admin, editor, viewer";
@@ -76,6 +77,7 @@ fn main() -> ExitCode {
         Some("user-list") if args.len() == 2 => cmd_user_list(Path::new(&args[1])),
         Some("user-remove") if args.len() == 3 => cmd_user_remove(Path::new(&args[1]), &args[2]),
         Some("sql") if args.len() == 3 => cmd_sql(Path::new(&args[1]), &args[2]),
+        Some("version") if args.len() == 1 => cmd_version(),
         _ => {
             eprintln!("{USAGE}");
             return ExitCode::from(2);
@@ -88,6 +90,13 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// Reports the version and the optional features this binary was compiled
+/// with, so a packaged artifact can be checked instead of assumed.
+fn cmd_version() -> Result<(), String> {
+    println!("{}", base_search::build_info::summary());
+    Ok(())
 }
 
 fn cmd_stats(db_path: &Path) -> Result<(), String> {

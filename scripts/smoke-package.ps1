@@ -33,6 +33,18 @@ if ($manifest.signing.windows_authenticode -eq 'signed') {
     }
 }
 
+# A plain `cargo build --release` binary is indistinguishable on disk from one
+# built with the documented release-package feature set, but it ships without
+# the DuckDB analytics engine. Ask the binary itself rather than assume.
+$buildSummary = & (Join-Path $packagePath 'base-search-cli.exe') version
+if ($LASTEXITCODE -ne 0) {
+    throw 'Could not read the packaged binary build summary.'
+}
+Write-Host $buildSummary
+if ($buildSummary -notmatch 'release-package: yes') {
+    throw "Packaged binary was not built with the release-package feature set: $buildSummary"
+}
+
 $listener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, 0)
 $listener.Start()
 $port = ([System.Net.IPEndPoint]$listener.LocalEndpoint).Port

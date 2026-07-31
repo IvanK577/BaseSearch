@@ -184,6 +184,11 @@ pub(super) fn drain_messages(app: &mut App, ctx: &egui::Context) {
                 };
             }
             Msg::Fatal(message) => {
+                // A worker that died still has to release the UI. Without this
+                // the operation stayed "in progress" forever: `busy` gates the
+                // whole toolbar, and Cancel only flips a flag nobody reads any
+                // more, so the window was stuck until the app was restarted.
+                app.op = None;
                 app.status = StatusLine {
                     text: format!("{}: {message}", app.t().error),
                     is_error: true,

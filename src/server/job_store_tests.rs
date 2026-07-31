@@ -10,6 +10,36 @@ use super::jobs::{
     spawn_job_for_with_input,
 };
 
+/// Waits for the status the job store actually holds on disk.
+///
+/// The registry updates its in-memory snapshot and writes it to the store
+/// afterwards, so a test that observes the snapshot and immediately reopens the
+/// database can catch the row still marked running — which reopening then
+/// recovers as failed. Waiting on the stored value removes the race.
+fn wait_for_persisted_status(db_path: &std::path::Path, id: u64, expected: &str) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let actual = rusqlite::Connection::open(job_store_path(db_path))
+            .ok()
+            .and_then(|connection| {
+                connection
+                    .query_row(
+                        "SELECT status FROM jobs WHERE id = ?1",
+                        [i64::try_from(id).unwrap()],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .ok()
+            });
+        if actual.as_deref() == Some(expected) {
+            return;
+        }
+        if Instant::now() >= deadline {
+            panic!("job {id} was persisted as {actual:?}, expected {expected:?}");
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
 fn wait_for_status(registry: &JobRegistry, id: u64, expected: JobStatus) {
     let deadline = Instant::now() + Duration::from_secs(3);
     while Instant::now() < deadline {
@@ -147,6 +177,7 @@ fn restart_preserves_the_bounded_import_request_payload() {
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
     assert_eq!(registry.snapshot(id).unwrap().input, Some(input.clone()));
+    wait_for_persisted_status(&db_path, id, "succeeded");
     drop(registry);
 
     let reopened = JobRegistry::open(&db_path).unwrap();

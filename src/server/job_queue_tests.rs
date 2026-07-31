@@ -33,6 +33,24 @@ fn wait_for_status(registry: &JobRegistry, id: u64, expected: JobStatus) {
     );
 }
 
+/// Waits for the status the job store holds on disk. The registry mutates its
+/// in-memory snapshot first and persists afterwards, so asserting on the stored
+/// value straight after `wait_for_status` raced whenever the suite ran under
+/// load.
+fn wait_for_persisted_status(db_path: &std::path::Path, id: u64, expected: &str) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let actual = persisted_status(db_path, id);
+        if actual == expected {
+            return;
+        }
+        if Instant::now() >= deadline {
+            panic!("job {id} was persisted as {actual:?}, expected {expected:?}");
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
 fn persisted_status(db_path: &std::path::Path, id: u64) -> String {
     Connection::open(job_store_path(db_path))
         .unwrap()
@@ -88,8 +106,8 @@ fn second_import_is_persisted_queued_then_starts_after_the_first() {
     );
     wait_for_status(&registry, first.id, JobStatus::Succeeded);
     wait_for_status(&registry, second.id, JobStatus::Succeeded);
-    assert_eq!(persisted_status(&db_path, first.id), "succeeded");
-    assert_eq!(persisted_status(&db_path, second.id), "succeeded");
+    wait_for_persisted_status(&db_path, first.id, "succeeded");
+    wait_for_persisted_status(&db_path, second.id, "succeeded");
 }
 
 #[test]

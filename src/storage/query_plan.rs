@@ -113,11 +113,23 @@ pub(crate) fn build_filter_plan(
         }
     }
     if let Some(code) = text_code_prefix {
-        let expr = columns
+        let product = columns
             .text(SemanticField::ProductCode)
             .unwrap_or_else(|| format!("{payload_alias}.product_code"));
-        clauses.push(format!("{expr} GLOB ?"));
+        // An all-digit query is usually an HS code, but an EDRPOU is eight
+        // digits too and almost always opens with a valid chapter, so routing
+        // every such query to the code-only fast path made companies
+        // unfindable by their code in the main search box. Both sides stay
+        // index-backed: the product code through its GLOB prefix, the company
+        // code through the same `text_key()` expression its own filter uses.
+        let company = columns
+            .text(SemanticField::CompanyCode)
+            .unwrap_or_else(|| format!("{payload_alias}.edrpou"));
+        clauses.push(format!(
+            "({product} GLOB ? OR text_key({company}) = text_key(?))"
+        ));
         params.push(format!("{}*", glob_escape(code)).into());
+        params.push(code.to_string().into());
     }
     let code = f.product_code.trim();
     if !code.is_empty() {
@@ -264,8 +276,15 @@ mod tests {
         )
         .unwrap();
         assert!(plan.joins.is_empty());
+        // The point of the fast path: a digits-only query still avoids the
+        // full-text index entirely.
+        assert!(!plan.where_sql.contains("records_fts MATCH"));
         assert!(plan.where_sql.contains("r.product_code GLOB ?"));
-        assert_eq!(plan.params.len(), 1);
+        // An eight-digit EDRPOU looks exactly like an HS code, so the company
+        // code is offered as an indexed alternative rather than being
+        // unreachable from the search box.
+        assert!(plan.where_sql.contains("text_key(r.edrpou) = text_key(?)"));
+        assert_eq!(plan.params.len(), 2);
     }
 
     #[test]

@@ -183,6 +183,11 @@ export function AnalyticsPage() {
       } catch (err) {
         if (id !== reqRef.current) return;
         setError((err as ApiError)?.message ?? t("analytics_failed"));
+        // Drop the previous result too. The error banner and the panels render
+        // independently, and the query chips above them already show the new
+        // query, so keeping the old numbers presented them as the answer to a
+        // question they were never computed for.
+        setAnalytics(null);
       } finally {
         if (id === reqRef.current) setLoading(false);
       }
@@ -492,35 +497,41 @@ function OverviewPreviews({
       ),
     );
     (async () => {
-      // Sequential on purpose: three concurrent full scans would thrash a
-      // multi-gigabyte database and slow every other action. The server admits
-      // only a couple of heavy reads at once and replies 503 under load, so
-      // each preview retries briefly before giving up.
+      // One request for all three cards. As three scoped requests the server
+      // recomputed the shared currency and weight buckets for each one and
+      // discarded most of the sections it produced; it also occupied three of
+      // its few heavy-read slots in a row. It still replies 503 under load, so
+      // the request retries briefly before giving up.
       const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
-      for (const dim of PREVIEW_DIMS) {
-        let done = false;
-        for (let attempt = 0; attempt < 4 && !done; attempt += 1) {
-          try {
-            const res = await api.analytics(query, dim.scope, hsLevel, 6);
-            if (!alive) return;
-            setPreviews((prev) => ({
-              ...prev,
-              [dim.scope]: { section: dim.pick(res.data) ?? null, loading: false, error: false },
-            }));
-            done = true;
-          } catch (err) {
-            if (!alive) return;
-            const busy = (err as ApiError)?.status === 503;
-            if (busy && attempt < 3) {
-              await sleep(500 * (attempt + 1));
-              continue;
-            }
-            setPreviews((prev) => ({
-              ...prev,
-              [dim.scope]: { section: null, loading: false, error: true },
-            }));
-            done = true;
+      for (let attempt = 0; attempt < 4; attempt += 1) {
+        try {
+          const res = await api.analyticsPreviews(query, hsLevel, 6);
+          if (!alive) return;
+          setPreviews(
+            Object.fromEntries(
+              PREVIEW_DIMS.map((dim) => [
+                dim.scope,
+                { section: dim.pick(res.data) ?? null, loading: false, error: false },
+              ]),
+            ),
+          );
+          return;
+        } catch (err) {
+          if (!alive) return;
+          const busy = (err as ApiError)?.status === 503;
+          if (busy && attempt < 3) {
+            await sleep(500 * (attempt + 1));
+            continue;
           }
+          setPreviews(
+            Object.fromEntries(
+              PREVIEW_DIMS.map((dim) => [
+                dim.scope,
+                { section: null, loading: false, error: true },
+              ]),
+            ),
+          );
+          return;
         }
       }
     })();

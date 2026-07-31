@@ -1,4 +1,5 @@
 pub mod app;
+pub mod build_info;
 pub mod db;
 pub mod db_types;
 pub mod domain;

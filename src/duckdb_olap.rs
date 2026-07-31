@@ -19,6 +19,11 @@ use crate::db::{
 use crate::domain::table::{SemanticField, SourceColumn, SourceSchema, TableShape};
 use crate::olap::{OlapBenchmarkOptions, OlapBenchmarkReport, OlapScenarioReport};
 use crate::storage::analytics_columns::{AnalyticsColumns, UNKNOWN_CURRENCY_KEY, UNKNOWN_UNIT_KEY};
+// The SQLite analytics repository owns the inheritance rule for group and month
+// measures and the length of the month series. Both are imported rather than
+// re-implemented: a second copy of either rule is a second thing to keep in
+// sync, and the whole point of the projection is that it answers identically.
+use crate::storage::analytics_repo::{MONTH_SERIES_LIMIT, SubsetTotals, inherited_measures};
 use crate::storage::{
     connection as storage_connection, effective_rows, source_schemas, table_shape,
 };
@@ -43,12 +48,19 @@ fn inherited_projection_usd(
     })
 }
 
-pub const PROJECTION_SCHEMA_VERSION: &str = "7";
-pub const ROLLUP_SCHEMA_VERSION: &str = "2";
+// Bumped from 7: the projected `year` column now derives the year the way the
+// SQLite query plan does. An existing projection built under the old rule would
+// still look "current" and would quietly answer year filters differently.
+pub const PROJECTION_SCHEMA_VERSION: &str = "8";
+// Bumped from 2: `rollup_monthly` and `rollup_sections` gained the per-subset
+// counters and source-unit sums that measure inheritance needs. Reading them
+// from an older projection would fail on a missing column, so the version must
+// invalidate it instead.
+pub const ROLLUP_SCHEMA_VERSION: &str = "3";
 pub const ROLLUP_RULES_VERSION: &str = "2";
 
 const ROLLUP_CONTRACT: &str = concat!(
-    "overview:v2;monthly:v2;sections:v2;currency:v2;price_per_kg:v2;",
+    "overview:v2;monthly:v3;sections:v3;currency:v2;price_per_kg:v2;",
     "scope:canonical|occurrences;years:all|calendar;",
     "money:currency-partitioned|usd-compat-only;weight:source-partitioned|normalized-kg;",
     "schema-context:per-row;hs:2-8|10;r7-quantiles"
@@ -813,11 +825,18 @@ fn projection_select_sql(conn: &SqliteConnection) -> Result<String, String> {
         |field| schema_aware_projection_value(conn, ProjectionValue::Number(field), "NULL");
     let month =
         schema_aware_projection_value(conn, ProjectionValue::Month(SemanticField::Date), "''")?;
+    // WHY: `query_plan.rs` resolves a year filter as
+    // `year = ? OR (year IS NULL AND <year from the month key> = ?)` — the
+    // stored year wins and the date string is only the fallback. This derived
+    // the year the other way round, and consulted the stored year for legacy
+    // rows only, so any row whose date parses to a different year than the one
+    // recorded at import — and every schema-backed row with a date the month
+    // key cannot read — appeared under one year on SQLite and another (or none)
+    // on DuckDB. COALESCE in this order is exactly the SQLite predicate: a
+    // stored year wins, a NULL one falls back to the month key.
     let year = format!(
-        "COALESCE(CAST(NULLIF(SUBSTR({month}, 1, 4), '') AS INTEGER),
-                  CASE WHEN {}.schema_id IS NULL THEN {}.year END)",
-        effective_rows::PAYLOAD_ALIAS,
-        effective_rows::PAYLOAD_ALIAS
+        "COALESCE({payload}.year, CAST(NULLIF(SUBSTR({month}, 1, 4), '') AS INTEGER))",
+        payload = effective_rows::PAYLOAD_ALIAS
     );
     let declaration = label(SemanticField::DeclarationNumber)?;
     let sender_label = label(SemanticField::Sender)?;
@@ -931,7 +950,9 @@ pub fn analytics_scoped_detail(
     let conn = open_projection_read_only(projection_path)?;
     let filter = DuckFilter::from_query(query);
     let overview = projection_overview(&conn, &filter)?;
-    let months = projection_months(&conn, &filter, overview.compatible_usd.is_some())?;
+    // The month rows inherit the query-level currency and weight buckets, so
+    // they need the measures themselves, not just "is this USD".
+    let months = projection_months(&conn, &filter, &overview.measures)?;
     let mut analytics = Analytics {
         overview,
         months,
@@ -1049,6 +1070,25 @@ pub fn analytics_scoped_detail(
     Ok(analytics)
 }
 
+/// Rows the projection's own filter selects, with no analytics computed.
+///
+/// One aggregate scan, so projection verification can afford to ask the same
+/// question twice — for instance to prove that two spellings of a needle fold
+/// to the same match — without paying for a full analytics answer each time.
+pub fn projection_row_count(projection_path: &Path, query: &Query) -> Result<u64, String> {
+    if !supports_projection_query(query) {
+        return Err(
+            "DuckDB projection does not support advanced query expressions yet.".to_string(),
+        );
+    }
+    let conn = open_projection_read_only(projection_path)?;
+    let filter = DuckFilter::from_query(query);
+    query_count(
+        &conn,
+        &format!("SELECT COUNT(*) FROM records {}", filter.where_sql()),
+    )
+}
+
 pub fn analytics_section(
     projection_path: &Path,
     query: &Query,
@@ -1143,7 +1183,7 @@ fn analytics_from_rollups(
     let filter = DuckFilter::from_query(query);
     let measures = projection_measures(conn, &filter)?;
     let overview = rollup_overview(conn, selector, measures)?;
-    let months = rollup_months(conn, selector, overview.compatible_usd.is_some())?;
+    let months = rollup_months(conn, selector, &overview.measures)?;
     let mut analytics = Analytics {
         overview,
         months,
@@ -1321,16 +1361,23 @@ fn rollup_overview(
 fn rollup_months(
     conn: &DuckConnection,
     selector: RollupSelector,
-    query_is_usd: bool,
+    query_measures: &AnalyticsMeasures,
 ) -> Result<Vec<AnalyticsMonthRow>, String> {
+    let query_is_usd = query_measures.compatible_usd_total().is_some();
+    // WHY the limit is shared: the period caption is derived from the rows that
+    // come back, so a hard 48 made a ten-year archive describe itself as a
+    // four-year one — and made the two engines return different month series
+    // for the same database.
     let mut statement = conn
-        .prepare(
+        .prepare(&format!(
             "SELECT month, rows_count, declarations_count, total_value_usd, total_net_kg,
-                    paired_value, paired_net_kg
+                    paired_value, paired_net_kg, total_value, valued_rows, net_rows,
+                    net_source_total, paired_row_count, paired_source_value, paired_source_net
              FROM rollup_monthly
              WHERE record_scope = ? AND year_key = ?
-             ORDER BY month DESC LIMIT 48",
-        )
+             ORDER BY month DESC LIMIT {month_limit}",
+            month_limit = MONTH_SERIES_LIMIT
+        ))
         .map_err(|err| err.to_string())?;
     let rows = statement
         .query_map(
@@ -1354,7 +1401,22 @@ fn rollup_months(
                         .unwrap_or(0.0),
                     total_net_kg,
                     compatible_usd,
-                    measures: AnalyticsMeasures::default(),
+                    // WHY: `total_value_usd` is `#[serde(skip)]` on this row, so
+                    // an empty `AnalyticsMeasures` is the difference between a
+                    // monthly figure and an em dash in the browser.
+                    measures: inherited_measures(
+                        query_measures,
+                        SubsetTotals {
+                            valued_rows: row.get::<_, i64>(8)?.max(0) as u64,
+                            total_value: row.get::<_, Option<f64>>(7)?.unwrap_or(0.0),
+                            net_rows: row.get::<_, i64>(9)?.max(0) as u64,
+                            total_net_source: row.get::<_, Option<f64>>(10)?.unwrap_or(0.0),
+                            gross: None,
+                            paired_rows: row.get::<_, i64>(11)?.max(0) as u64,
+                            paired_value: row.get::<_, Option<f64>>(12)?.unwrap_or(0.0),
+                            paired_net_source: row.get::<_, Option<f64>>(13)?.unwrap_or(0.0),
+                        },
+                    ),
                 })
             },
         )
@@ -1375,14 +1437,30 @@ fn rollup_section(
     overview: &AnalyticsOverview,
 ) -> Result<AnalyticsSection, String> {
     let (kind_key, stored_hs_level, filter_field) = rollup_section_contract(kind, hs_level);
+    // Same basis as the detail path, for the same reason: SQLite ranks and
+    // shares group rows by the plain `SUM(value)`, never by the USD-compatible
+    // total. Reading `total_value_usd` happens to agree here — a rollup is only
+    // consulted when the whole cohort is one USD bucket or carries no money at
+    // all, and in both of those cases the two columns hold the same number — but
+    // that is a property of the gate in `rollup_semantics_are_safe`, not of this
+    // query. Stating the rule once means a future widening of that gate cannot
+    // quietly give the two engines two different top-N lists.
+    let share_total_value: f64 = overview
+        .measures
+        .currency_totals
+        .iter()
+        .map(|total| total.total_value)
+        .sum();
     let mut statement = conn
         .prepare(
             "SELECT label, rows_count, declarations_count, companies_count,
                     total_value_usd, total_net_kg, total_gross_kg, total_quantity,
-                    paired_value, paired_net_kg
+                    paired_value, paired_net_kg, total_value, valued_rows, net_rows,
+                    gross_rows, net_source_total, gross_source_total,
+                    paired_row_count, paired_source_value, paired_source_net
              FROM rollup_sections
              WHERE record_scope = ? AND year_key = ? AND kind = ? AND hs_level = ?
-             ORDER BY total_value_usd DESC NULLS LAST, total_net_kg DESC,
+             ORDER BY total_value DESC, total_net_kg DESC,
                       rows_count DESC, label
              LIMIT ?",
         )
@@ -1403,21 +1481,22 @@ fn rollup_section(
                 let total_net_kg = row.get::<_, Option<f64>>(5)?.unwrap_or(0.0);
                 let total_gross_kg = row.get::<_, Option<f64>>(6)?.unwrap_or(0.0);
                 let total_quantity = row.get::<_, Option<f64>>(7)?.unwrap_or(0.0);
+                let total_value = row.get::<_, Option<f64>>(10)?.unwrap_or(0.0);
                 let compatible_usd = inherited_projection_usd(
                     overview.compatible_usd.is_some(),
                     total_value_usd,
                     row.get::<_, Option<f64>>(8)?.unwrap_or(0.0),
                     row.get::<_, Option<f64>>(9)?.unwrap_or(0.0),
                 );
-                let share_base = if overview.total_value_usd > 0.0 {
-                    overview.total_value_usd
+                let share_base = if share_total_value > 0.0 {
+                    share_total_value
                 } else if overview.total_net_kg > 0.0 {
                     overview.total_net_kg
                 } else {
                     overview.row_count as f64
                 };
-                let share_value = if overview.total_value_usd > 0.0 {
-                    total_value_usd
+                let share_value = if share_total_value > 0.0 {
+                    total_value
                 } else if overview.total_net_kg > 0.0 {
                     total_net_kg
                 } else {
@@ -1445,7 +1524,25 @@ fn rollup_section(
                         .and_then(|compatibility| compatibility.avg_value_per_net_kg)
                         .unwrap_or(0.0),
                     compatible_usd,
-                    measures: AnalyticsMeasures::default(),
+                    // WHY: same contract as the detail path — a group row
+                    // publishes its money and weight only through `measures`,
+                    // so a default one renders as an em dash.
+                    measures: inherited_measures(
+                        &overview.measures,
+                        SubsetTotals {
+                            valued_rows: row.get::<_, i64>(11)?.max(0) as u64,
+                            total_value,
+                            net_rows: row.get::<_, i64>(12)?.max(0) as u64,
+                            total_net_source: row.get::<_, Option<f64>>(14)?.unwrap_or(0.0),
+                            gross: Some((
+                                row.get::<_, i64>(13)?.max(0) as u64,
+                                row.get::<_, Option<f64>>(15)?.unwrap_or(0.0),
+                            )),
+                            paired_rows: row.get::<_, i64>(16)?.max(0) as u64,
+                            paired_value: row.get::<_, Option<f64>>(17)?.unwrap_or(0.0),
+                            paired_net_source: row.get::<_, Option<f64>>(18)?.unwrap_or(0.0),
+                        },
+                    ),
                 })
             },
         )
@@ -1699,6 +1796,27 @@ fn prepare_projection_schema(conn: &DuckConnection) -> Result<(), String> {
     .map_err(|err| err.to_string())
 }
 
+/// Builds the persisted rollups.
+///
+/// Besides the published totals, `rollup_monthly` and `rollup_sections` carry a
+/// second family of columns — `total_value`, `valued_rows`, `net_rows`,
+/// `gross_rows`, `*_source_total`, `paired_row_count`, `paired_source_*`. They
+/// exist because a row's `measures` inherit the query's currency and weight
+/// buckets and then relabel the subset's OWN sums onto them, which needs the
+/// plain per-subset sums in the source unit plus the row counts behind them.
+/// The published `total_value_usd` cannot stand in: it is deliberately NULL
+/// unless the whole cohort is a single known USD bucket. Neither can the `*_kg`
+/// sums: they are already converted, while the inherited bucket carries the
+/// conversion factor and applies it itself.
+///
+/// `year_key = 0` is the reserved "all years" bucket, which is why the per-year
+/// branch of `rollup_expanded` excludes a literal year 0. A row can carry one:
+/// the projected year falls back to the month key, and a date such as
+/// "01.05.0000" yields the month "0000-05" and therefore the year 0. Without the
+/// exclusion that row lands in the all-years bucket twice, `validate_rollups`
+/// sees more rollup rows than detail rows, and the whole projection build fails.
+/// Nothing is lost: `RollupSelector` already refuses a year filter of 0, so such
+/// a query is answered by the detail scan, which reads the year column directly.
 fn build_rollups(conn: &DuckConnection) -> Result<(), String> {
     conn.execute_batch(
         "CREATE VIEW rollup_records AS
@@ -1740,7 +1858,7 @@ fn build_rollups(conn: &DuckConnection) -> Result<(), String> {
             SELECT rollup_records.*, 0::BIGINT AS year_key FROM rollup_records
             UNION ALL
             SELECT rollup_records.*, year AS year_key
-            FROM rollup_records WHERE year IS NOT NULL;
+            FROM rollup_records WHERE year IS NOT NULL AND year <> 0;
 
          CREATE TABLE rollup_overview AS
             SELECT
@@ -1845,7 +1963,17 @@ fn build_rollups(conn: &DuckConnection) -> Result<(), String> {
                 COALESCE(SUM(CASE WHEN value_num IS NOT NULL AND net_weight_kg > 0
                     THEN value_num ELSE 0.0 END), 0.0) AS paired_value,
                 COALESCE(SUM(CASE WHEN value_num IS NOT NULL AND net_weight_kg > 0
-                    THEN net_weight_kg ELSE 0.0 END), 0.0) AS paired_net_kg
+                    THEN net_weight_kg ELSE 0.0 END), 0.0) AS paired_net_kg,
+                COALESCE(SUM(value_num), 0.0) AS total_value,
+                COUNT(value_num) AS valued_rows,
+                COUNT(net_kg_num) AS net_rows,
+                COALESCE(SUM(net_kg_num), 0.0) AS net_source_total,
+                COUNT(CASE WHEN value_num IS NOT NULL AND net_kg_num > 0
+                    THEN 1 END) AS paired_row_count,
+                COALESCE(SUM(CASE WHEN value_num IS NOT NULL AND net_kg_num > 0
+                    THEN value_num END), 0.0) AS paired_source_value,
+                COALESCE(SUM(CASE WHEN value_num IS NOT NULL AND net_kg_num > 0
+                    THEN net_kg_num END), 0.0) AS paired_source_net
             FROM rollup_expanded
             WHERE month IS NOT NULL AND month <> ''
             GROUP BY record_scope, year_key, month;
@@ -1875,7 +2003,16 @@ fn build_rollups(conn: &DuckConnection) -> Result<(), String> {
             total_gross_kg DOUBLE,
             total_quantity DOUBLE,
             paired_value DOUBLE,
-            paired_net_kg DOUBLE
+            paired_net_kg DOUBLE,
+            total_value DOUBLE,
+            valued_rows BIGINT,
+            net_rows BIGINT,
+            gross_rows BIGINT,
+            net_source_total DOUBLE,
+            gross_source_total DOUBLE,
+            paired_row_count BIGINT,
+            paired_source_value DOUBLE,
+            paired_source_net DOUBLE
          );",
     )
     .map_err(|err| format!("Could not create DuckDB rollup foundation: {err}"))?;
@@ -1982,6 +2119,8 @@ fn insert_section_rollup(
                 value_num,
                 net_weight_kg,
                 gross_weight_kg,
+                net_kg_num,
+                gross_kg_num,
                 quantity_num,
                 currency_key
             FROM rollup_expanded
@@ -2018,7 +2157,18 @@ fn insert_section_rollup(
             COALESCE(SUM(CASE WHEN value_num IS NOT NULL AND net_weight_kg > 0
                 THEN value_num ELSE 0.0 END), 0.0),
             COALESCE(SUM(CASE WHEN value_num IS NOT NULL AND net_weight_kg > 0
-                THEN net_weight_kg ELSE 0.0 END), 0.0)
+                THEN net_weight_kg ELSE 0.0 END), 0.0),
+            COALESCE(SUM(value_num), 0.0),
+            COUNT(value_num),
+            COUNT(net_kg_num),
+            COUNT(gross_kg_num),
+            COALESCE(SUM(net_kg_num), 0.0),
+            COALESCE(SUM(gross_kg_num), 0.0),
+            COUNT(CASE WHEN value_num IS NOT NULL AND net_kg_num > 0 THEN 1 END),
+            COALESCE(SUM(CASE WHEN value_num IS NOT NULL AND net_kg_num > 0
+                THEN value_num END), 0.0),
+            COALESCE(SUM(CASE WHEN value_num IS NOT NULL AND net_kg_num > 0
+                THEN net_kg_num END), 0.0)
          FROM labeled
          WHERE label IS NOT NULL AND label <> ''
          GROUP BY record_scope, year_key, label",
@@ -2368,6 +2518,9 @@ fn projection_overview(
                 total_quantity: row.get::<_, Option<f64>>(10)?.unwrap_or(0.0),
                 avg_value_per_net_kg: 0.0,
                 compatible_usd: None,
+                // Placeholder only: the query-level measures are the ones
+                // computed above and are assigned to the overview below. Unlike
+                // a group or month row, this one is never published empty.
                 measures: AnalyticsMeasures::default(),
                 ..Default::default()
             })
@@ -2385,9 +2538,15 @@ fn projection_overview(
 fn projection_months(
     conn: &DuckConnection,
     filter: &DuckFilter,
-    query_is_usd: bool,
+    query_measures: &AnalyticsMeasures,
 ) -> Result<Vec<AnalyticsMonthRow>, String> {
+    let query_is_usd = query_measures.compatible_usd_total().is_some();
     let net_kg = normalized_weight_sql("net_kg_num");
+    // The `*_source` columns are the weights exactly as the source stores them,
+    // NOT converted to kilograms: that is the shape `SubsetTotals` expects,
+    // because the inherited bucket carries the conversion factor and applies it
+    // itself. `paired_*` covers rows that carry both a value and a positive
+    // weight, matching how the query-level ratio is built.
     let sql = format!(
         "SELECT
             month,
@@ -2398,13 +2557,23 @@ fn projection_months(
             COALESCE(SUM(CASE WHEN value_num IS NOT NULL AND ({net_kg}) > 0
                 THEN value_num ELSE 0.0 END), 0.0) AS paired_value,
             COALESCE(SUM(CASE WHEN value_num IS NOT NULL AND ({net_kg}) > 0
-                THEN ({net_kg}) ELSE 0.0 END), 0.0) AS paired_weight
+                THEN ({net_kg}) ELSE 0.0 END), 0.0) AS paired_weight,
+            COUNT(value_num) AS valued_rows,
+            COUNT(net_kg_num) AS net_rows,
+            COALESCE(SUM(net_kg_num), 0.0) AS net_source_total,
+            COUNT(CASE WHEN value_num IS NOT NULL AND net_kg_num > 0
+                THEN 1 END) AS paired_row_count,
+            COALESCE(SUM(CASE WHEN value_num IS NOT NULL AND net_kg_num > 0
+                THEN value_num END), 0.0) AS paired_source_value,
+            COALESCE(SUM(CASE WHEN value_num IS NOT NULL AND net_kg_num > 0
+                THEN net_kg_num END), 0.0) AS paired_source_net
          FROM records
          {} month IS NOT NULL AND month <> ''
          GROUP BY month
          ORDER BY month DESC
-         LIMIT 48",
-        filter.where_extra_sql()
+         LIMIT {month_limit}",
+        filter.where_extra_sql(),
+        month_limit = MONTH_SERIES_LIMIT
     );
     let mut stmt = conn.prepare(&sql).map_err(|err| err.to_string())?;
     let rows = stmt
@@ -2427,7 +2596,26 @@ fn projection_months(
                     .unwrap_or(0.0),
                 total_net_kg,
                 compatible_usd,
-                measures: AnalyticsMeasures::default(),
+                // WHY: an empty `AnalyticsMeasures` serializes as no money and
+                // no weight at all — `total_value_usd` is `#[serde(skip)]` on
+                // this row, so `measures` is the ONLY way a monthly figure
+                // reaches the browser, and every such cell rendered as an em
+                // dash on DuckDB while SQLite showed the number.
+                measures: inherited_measures(
+                    query_measures,
+                    SubsetTotals {
+                        valued_rows: row.get::<_, i64>(7)?.max(0) as u64,
+                        total_value,
+                        net_rows: row.get::<_, i64>(8)?.max(0) as u64,
+                        total_net_source: row.get::<_, Option<f64>>(9)?.unwrap_or(0.0),
+                        // A monthly row selects no gross-weight column, so it
+                        // must not report a gross bucket, not even an empty one.
+                        gross: None,
+                        paired_rows: row.get::<_, i64>(10)?.max(0) as u64,
+                        paired_value: row.get::<_, Option<f64>>(11)?.unwrap_or(0.0),
+                        paired_net_source: row.get::<_, Option<f64>>(12)?.unwrap_or(0.0),
+                    },
+                ),
             })
         })
         .map_err(|err| err.to_string())?;
@@ -2456,11 +2644,24 @@ fn projection_section(
     let net_kg = normalized_weight_sql("net_kg_num");
     let gross_kg = normalized_weight_sql("gross_kg_num");
     let query_is_usd = overview.compatible_usd.is_some();
-    let order_metric = if query_is_usd {
-        "total_value DESC"
-    } else {
-        "total_net_kg DESC"
-    };
+    // WHY the PLAIN value sum ranks and shares these rows, not the USD-compatible
+    // one: `analytics_repo::section` orders by `COALESCE(SUM(value), 0.0)` and
+    // computes every share against that same sum, for compatible and
+    // incompatible queries alike. Reading the compatibility total here instead
+    // made DuckDB rank by weight whenever the set was not one known USD cohort —
+    // which is always on the customs profile, because it has no currency column
+    // at all, so `compatible_usd` is None even though every row carries a value.
+    // A different ranking is a different top-N as soon as `LIMIT` bites, so the
+    // two engines returned different group rows for the same question, and the
+    // share column was computed from money on SQLite and from weight here.
+    // Ordering and shares are rankings, not published money, so using the
+    // cross-currency sum for them says nothing the wire has to defend.
+    let share_total_value: f64 = overview
+        .measures
+        .currency_totals
+        .iter()
+        .map(|total| total.total_value)
+        .sum();
     let sql = format!(
         "SELECT
             {label_sql} AS label,
@@ -2474,11 +2675,22 @@ fn projection_section(
             COALESCE(SUM(CASE WHEN value_num IS NOT NULL AND ({net_kg}) > 0
                 THEN value_num ELSE 0.0 END), 0.0) AS paired_value,
             COALESCE(SUM(CASE WHEN value_num IS NOT NULL AND ({net_kg}) > 0
-                THEN ({net_kg}) ELSE 0.0 END), 0.0) AS paired_weight
+                THEN ({net_kg}) ELSE 0.0 END), 0.0) AS paired_weight,
+            COUNT(value_num) AS valued_rows,
+            COUNT(net_kg_num) AS net_rows,
+            COUNT(gross_kg_num) AS gross_rows,
+            COALESCE(SUM(net_kg_num), 0.0) AS net_source_total,
+            COALESCE(SUM(gross_kg_num), 0.0) AS gross_source_total,
+            COUNT(CASE WHEN value_num IS NOT NULL AND net_kg_num > 0
+                THEN 1 END) AS paired_row_count,
+            COALESCE(SUM(CASE WHEN value_num IS NOT NULL AND net_kg_num > 0
+                THEN value_num END), 0.0) AS paired_source_value,
+            COALESCE(SUM(CASE WHEN value_num IS NOT NULL AND net_kg_num > 0
+                THEN net_kg_num END), 0.0) AS paired_source_net
          FROM records
          {} {label_sql} IS NOT NULL AND {label_sql} <> ''
          GROUP BY {label_sql}
-         ORDER BY {order_metric}, total_net_kg DESC, rows_count DESC, label
+         ORDER BY total_value DESC, total_net_kg DESC, rows_count DESC, label
          LIMIT {}",
         filter.where_extra_sql(),
         limit.clamp(1, 20_000)
@@ -2498,18 +2710,15 @@ fn projection_section(
                 row.get::<_, Option<f64>>(8)?.unwrap_or(0.0),
                 row.get::<_, Option<f64>>(9)?.unwrap_or(0.0),
             );
-            let share_base = if overview.total_value_usd > 0.0 {
-                overview.total_value_usd
+            let share_base = if share_total_value > 0.0 {
+                share_total_value
             } else if overview.total_net_kg > 0.0 {
                 overview.total_net_kg
             } else {
                 overview.row_count as f64
             };
-            let share_value = if overview.total_value_usd > 0.0 {
-                compatible_usd
-                    .as_ref()
-                    .map(|compatibility| compatibility.total_value_usd)
-                    .unwrap_or(0.0)
+            let share_value = if share_total_value > 0.0 {
+                total_value
             } else if overview.total_net_kg > 0.0 {
                 total_net_kg
             } else {
@@ -2537,7 +2746,26 @@ fn projection_section(
                     .and_then(|compatibility| compatibility.avg_value_per_net_kg)
                     .unwrap_or(0.0),
                 compatible_usd,
-                measures: AnalyticsMeasures::default(),
+                // WHY: `total_value_usd` is `#[serde(skip)]` on a group row, so
+                // an empty `AnalyticsMeasures` means the section table shows an
+                // em dash for money, weight and value/kg even though every sum
+                // was already computed by this same scan.
+                measures: inherited_measures(
+                    &overview.measures,
+                    SubsetTotals {
+                        valued_rows: row.get::<_, i64>(10)?.max(0) as u64,
+                        total_value,
+                        net_rows: row.get::<_, i64>(11)?.max(0) as u64,
+                        total_net_source: row.get::<_, Option<f64>>(13)?.unwrap_or(0.0),
+                        gross: Some((
+                            row.get::<_, i64>(12)?.max(0) as u64,
+                            row.get::<_, Option<f64>>(14)?.unwrap_or(0.0),
+                        )),
+                        paired_rows: row.get::<_, i64>(15)?.max(0) as u64,
+                        paired_value: row.get::<_, Option<f64>>(16)?.unwrap_or(0.0),
+                        paired_net_source: row.get::<_, Option<f64>>(17)?.unwrap_or(0.0),
+                    },
+                ),
             })
         })
         .map_err(|err| err.to_string())?;
@@ -2897,7 +3125,13 @@ impl DuckFilter {
         }
         let text = query.text.trim();
         if !text.is_empty() {
-            let needle = sql_string(&text.to_ascii_lowercase());
+            // WHY `to_lowercase` and not `to_ascii_lowercase`: the column side is
+            // folded by DuckDB's `lower()`, which is Unicode-aware. ASCII-only
+            // folding leaves "Відправник" untouched, so an upper- or mixed-case
+            // Cyrillic needle could never equal the folded column and the query
+            // matched nothing at all. SQLite folds the needle with the same
+            // Unicode-aware `to_lowercase` before handing it to `cyr_contains`.
+            let needle = sql_string(&text.to_lowercase());
             conditions.push(format!(
                 "contains(lower(coalesce(description, '') || ' ' || coalesce(sender_label, '') ||
                  ' ' || coalesce(recipient_label, '') || ' ' || coalesce(product_code, '') || ' '
@@ -2905,7 +3139,7 @@ impl DuckFilter {
             ));
         }
         let filters = &query.filters;
-        push_eq_i64(&mut conditions, "year", &filters.year);
+        push_year_eq(&mut conditions, &filters.year);
         push_prefix(&mut conditions, "product_code_text", &filters.product_code);
         // Trademark matches the SQLite semantics: exact, case-insensitive,
         // whitespace-collapsed comparison — not a substring search.
@@ -2946,13 +3180,17 @@ impl DuckFilter {
     }
 }
 
-fn push_eq_i64(conditions: &mut Vec<String>, field: &str, value: &str) {
-    let value = value.trim();
-    if value.is_empty() {
-        return;
-    }
-    if let Ok(parsed) = value.parse::<i64>() {
-        conditions.push(format!("{field} = {parsed}"));
+/// The year filter, read exactly the way `query_plan.rs` reads it.
+///
+/// WHY `parse_year` and not `parse::<i64>()`: SQLite accepts any value holding
+/// four digits ("2024 р.", "2024-"), because that is what a user types and what
+/// `search_sql` already resolves. A plain integer parse rejects those, and this
+/// helper's failure mode is to push NO condition at all — so the same filter
+/// narrowed the result on SQLite and returned the WHOLE database here. A filter
+/// that is silently ignored is worse than one that finds nothing.
+fn push_year_eq(conditions: &mut Vec<String>, value: &str) {
+    if let Some(year) = crate::storage::normalize::parse_year(value) {
+        conditions.push(format!("year = {year}"));
     }
 }
 
@@ -2985,12 +3223,22 @@ fn push_prefix(conditions: &mut Vec<String>, field: &str, value: &str) {
     }
 }
 
+/// Case-insensitive substring match, the DuckDB twin of SQLite's
+/// `cyr_contains(column, lowercased_needle)`.
+///
+/// WHY `to_lowercase`: `lower()` inside DuckDB folds the column with full
+/// Unicode rules, so the needle has to be folded the same way. With
+/// `to_ascii_lowercase` every Cyrillic letter stayed uppercase in the needle
+/// while the column arrived lowercase, and the "Відправник", "Одержувач" and
+/// "Опис" filters therefore returned zero rows for any Ukrainian company name —
+/// the one thing those filters exist for. `query_plan.rs` folds the same needle
+/// with Rust's Unicode-aware `to_lowercase`.
 fn push_contains(conditions: &mut Vec<String>, field: &str, value: &str) {
     let value = value.trim();
     if !value.is_empty() {
         conditions.push(format!(
             "contains(lower(coalesce({field}, '')), {})",
-            sql_string(&value.to_ascii_lowercase())
+            sql_string(&value.to_lowercase())
         ));
     }
 }

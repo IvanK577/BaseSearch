@@ -3823,3 +3823,496 @@ fn clear_all_removes_source_history_without_losing_workspace_settings() {
     assert_eq!(headers, vec!["Asset Tag", "Current Location", "Condition"]);
     assert!(!headers.iter().any(|header| header.starts_with("Legacy")));
 }
+
+/// The browser renders money, weight, and value-per-kg in the group and month
+/// tables from `measures`, because the scalar `total_value_usd` on those rows
+/// is `#[serde(skip)]` and never reaches the wire. A customs file with no
+/// currency column at all — the ordinary case — still forms exactly one
+/// currency bucket, so every subset row must carry that bucket with its own
+/// sums. When the rows shipped an empty `AnalyticsMeasures` the sums were
+/// computed and then dropped during serialization, and the whole analytics
+/// surface rendered em dashes.
+#[test]
+fn group_and_month_rows_inherit_the_single_currency_bucket() {
+    let dir = tempfile::tempdir().unwrap();
+    let xlsx = dir.path().join("no-currency-column.xlsx");
+    let db_path = dir.path().join("data").join("no-currency-column.db");
+    write_test_xlsx(
+        &xlsx,
+        &[
+            vec![
+                ("declaration_number", "24UA100110000201U1"),
+                ("declaration_date", "15.03.2024"),
+                ("recipient", "ТОВ «АЛЬФА»"),
+                ("edrpou", "33333333"),
+                ("product_code", "8517130000"),
+                ("net_kg", "10"),
+                ("gross_kg", "12"),
+                ("currency_control_value", "1000"),
+            ],
+            vec![
+                ("declaration_number", "24UA100110000202U2"),
+                ("declaration_date", "16.03.2024"),
+                ("recipient", "ТОВ «БЕТА»"),
+                ("edrpou", "44444444"),
+                ("product_code", "8517130000"),
+                ("net_kg", "5"),
+                ("gross_kg", "6"),
+                ("currency_control_value", "500"),
+            ],
+        ],
+    );
+    let mut db = Db::open(&db_path).unwrap();
+    let cancel = AtomicBool::new(false);
+    let summary = import::import_file(&mut db, &xlsx, &cancel, &mut |_, _, _| {});
+    assert_eq!(summary.error, None);
+    assert_eq!(summary.imported, 2);
+
+    let analytics = db.analytics(&Query::default(), 10).unwrap();
+
+    // The query as a whole sits in one bucket, and that bucket is unlabelled
+    // because the source has no currency column.
+    let query_totals = &analytics.overview.measures.currency_totals;
+    assert_eq!(query_totals.len(), 1, "expected a single currency bucket");
+    assert!(
+        !query_totals[0].known,
+        "a source without a currency column must not claim a known currency"
+    );
+    assert_close(query_totals[0].total_value, 1500.0);
+
+    // Every month row carries that same bucket with its own sum.
+    assert_eq!(analytics.months.len(), 1);
+    let month_totals = &analytics.months[0].measures.currency_totals;
+    assert_eq!(
+        month_totals.len(),
+        1,
+        "month rows must carry the inherited currency bucket, not an empty measure set"
+    );
+    assert_eq!(month_totals[0].currency, query_totals[0].currency);
+    assert_close(month_totals[0].total_value, 1500.0);
+
+    // Group rows likewise, each with its own subset sum rather than the
+    // query-wide total.
+    let top = &analytics.top_recipients;
+    assert_eq!(top[0].label, "ТОВ «АЛЬФА»");
+    let group_totals = &top[0].measures.currency_totals;
+    assert_eq!(
+        group_totals.len(),
+        1,
+        "group rows must carry the inherited currency bucket"
+    );
+    assert_eq!(group_totals[0].currency, query_totals[0].currency);
+    assert_close(group_totals[0].total_value, 1000.0);
+    assert_close(top[1].measures.currency_totals[0].total_value, 500.0);
+
+    // Weight buckets ride along on the same scan, so the weight column stops
+    // rendering as an em dash too.
+    assert_eq!(top[0].measures.net_weight_totals.len(), 1);
+    assert_close(
+        top[0].measures.net_weight_totals[0].total_source_weight,
+        10.0,
+    );
+
+    // An unlabelled currency is still not a *compatible* USD cohort: the
+    // USD-only wire fields must stay absent so no caller reads the number as
+    // dollars.
+    assert!(analytics.overview.compatible_usd.is_none());
+    assert!(top[0].compatible_usd.is_none());
+}
+
+/// Two recipient synonyms must not cancel each other out.
+///
+/// A registry that heads its importer column "Отримувач" and also carries
+/// "Покупець" gives the detector two columns aliasing to the same participant,
+/// and neither header equals the canonical "Одержувач", so the direct
+/// canonical pass cannot rescue it. Dropping the semantic on that ambiguity
+/// left the importer unmapped: the "Recipients / importers" section came back
+/// empty and the company dossier had no name, while the EDRPOU section kept
+/// working — the user sees only the code where the importer should be.
+#[test]
+fn two_recipient_synonyms_keep_the_importer_column() {
+    let dir = tempfile::tempdir().unwrap();
+    let csv = dir.path().join("synonyms.csv");
+    std::fs::write(
+        &csv,
+        "Отримувач,Покупець,ЕДРПОУ,Вартість\n\
+         ТОВ «АЛЬФА ІМПОРТ»,ТОВ «АЛЬФА»,33333333,1000\n\
+         ТОВ «БЕТА ТРЕЙД»,ТОВ «БЕТА»,44444444,500\n",
+    )
+    .unwrap();
+    let mut db = Db::open(&dir.path().join("synonyms.db")).unwrap();
+    let cancel = AtomicBool::new(false);
+
+    let summary = import::import_file(&mut db, &csv, &cancel, &mut |_, _, _| {});
+    assert_eq!(summary.error, None);
+    assert_eq!(summary.imported, 2);
+
+    let analytics = db.analytics(&Query::default(), 10).unwrap();
+    let labels: Vec<&str> = analytics
+        .top_recipients
+        .iter()
+        .map(|row| row.label.as_str())
+        .collect();
+    assert!(
+        !labels.is_empty(),
+        "the importer section must not be empty when the file names its recipients"
+    );
+    assert!(
+        labels.contains(&"ТОВ «АЛЬФА ІМПОРТ»"),
+        "the leftmost recipient synonym must stay mapped, got {labels:?}"
+    );
+    // The code column keeps its own identity rather than standing in for the name.
+    assert_eq!(analytics.overview.distinct_edrpou, 2);
+}
+
+/// The Overview preview cards are served by one request built on a single
+/// shared basis, and the company card leads with recipient names rather than
+/// registration codes — "ТОВ «АЛЬФА»" identifies an importer to a reader,
+/// "33333333" does not.
+#[test]
+fn overview_previews_lead_with_company_names_and_carry_measures() {
+    let dir = tempfile::tempdir().unwrap();
+    let xlsx = dir.path().join("previews.xlsx");
+    write_test_xlsx(
+        &xlsx,
+        &[
+            vec![
+                ("declaration_number", "24UA100110000301U1"),
+                ("declaration_date", "15.03.2024"),
+                ("recipient", "ТОВ «АЛЬФА»"),
+                ("edrpou", "33333333"),
+                ("product_code", "8517130000"),
+                ("origin_country", "CN"),
+                ("net_kg", "10"),
+                ("currency_control_value", "1000"),
+            ],
+            vec![
+                ("declaration_number", "24UA100110000302U2"),
+                ("declaration_date", "16.03.2024"),
+                ("recipient", "ТОВ «БЕТА»"),
+                ("edrpou", "44444444"),
+                ("product_code", "8471300000"),
+                ("origin_country", "DE"),
+                ("net_kg", "5"),
+                ("currency_control_value", "500"),
+            ],
+        ],
+    );
+    let mut db = Db::open(&dir.path().join("data").join("previews.db")).unwrap();
+    let cancel = AtomicBool::new(false);
+    assert_eq!(
+        import::import_file(&mut db, &xlsx, &cancel, &mut |_, _, _| {}).error,
+        None
+    );
+
+    let previews = db.analytics_previews(&Query::default(), 6, 10).unwrap();
+
+    assert_eq!(previews.company_sections.len(), 1);
+    assert_eq!(previews.product_sections.len(), 1);
+    assert_eq!(previews.country_sections.len(), 1);
+    assert_eq!(
+        previews.company_sections[0].kind,
+        AnalyticsSectionKind::Recipients,
+        "the company preview must identify importers by name"
+    );
+    let company_labels: Vec<&str> = previews.company_sections[0]
+        .rows
+        .iter()
+        .map(|row| row.label.as_str())
+        .collect();
+    assert!(
+        company_labels.contains(&"ТОВ «АЛЬФА»"),
+        "{company_labels:?}"
+    );
+    assert!(
+        !company_labels.contains(&"33333333"),
+        "a registration code must not stand in for the importer name"
+    );
+
+    // The shared basis still carries the buckets each row inherits, so money
+    // does not fall back to an em dash in the preview tables.
+    assert_eq!(
+        previews.company_sections[0].rows[0]
+            .measures
+            .currency_totals
+            .len(),
+        1
+    );
+    // The cheap basis skips the distinct counters on purpose; the totals the
+    // section shares are computed against must still be right.
+    assert_eq!(previews.overview.row_count, 2);
+    assert_close(previews.overview.total_value_usd, 1500.0);
+    assert_eq!(previews.months.len(), 0, "previews do not compute months");
+}
+
+/// The import must be able to say how far along it is.
+///
+/// The whole-file hash reads the file end to end before any parsing starts and
+/// used to report nothing at all, and delimited files left the row hint at
+/// zero, so the bar could never become determinate. Between them a large
+/// import looked frozen rather than merely slow, which is a real part of the
+/// "import is very slow" complaint.
+#[test]
+fn import_reports_determinate_progress_for_delimited_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let csv = dir.path().join("progress.csv");
+    let mut contents = String::from("Одержувач,ЕДРПОУ,Вартість\n");
+    for index in 0..200 {
+        contents.push_str(&format!("ТОВ «КОМПАНІЯ {index}»,1000000{index},{index}\n"));
+    }
+    std::fs::write(&csv, &contents).unwrap();
+    let mut db = Db::open(&dir.path().join("progress.db")).unwrap();
+    let cancel = AtomicBool::new(false);
+
+    let mut events: Vec<(ImportPhase, u64, u64)> = Vec::new();
+    let summary = import::import_file(&mut db, &csv, &cancel, &mut |phase, done, total| {
+        events.push((phase, done, total));
+    });
+    assert_eq!(summary.error, None);
+    assert_eq!(summary.imported, 200);
+
+    // The hashing pass reports bytes against the real file size.
+    let file_bytes = std::fs::metadata(&csv).unwrap().len();
+    let hashed = events
+        .iter()
+        .find(|(phase, _, total)| *phase == ImportPhase::Reading && *total > 0)
+        .unwrap_or_else(|| panic!("hashing must report progress: {events:?}"));
+    assert_eq!(hashed.1, file_bytes, "hashing must report every byte");
+    assert_eq!(hashed.2, file_bytes);
+
+    // The row phase knows how many rows are coming, header excluded.
+    let inserting = events
+        .iter()
+        .find(|(phase, _, _)| *phase == ImportPhase::Inserting)
+        .unwrap_or_else(|| panic!("insert phase must report progress: {events:?}"));
+    assert_eq!(
+        inserting.2, 200,
+        "a delimited import must know its row count instead of reporting an unknown total"
+    );
+}
+
+/// Exported measures must reach Excel as numbers, and negative numbers must
+/// survive a round trip through CSV.
+///
+/// Every XLSX cell used to be written as a string, so `SUM()` over a value
+/// column returned 0 and sorting was lexicographic. The CSV formula guard
+/// quoted anything starting with `-`, including ordinary negative figures,
+/// which then failed to parse when the file was imported back.
+#[test]
+fn export_writes_measures_as_numbers_and_keeps_negative_values() {
+    // Codes must stay text: as a number "0851713000" loses its leading zero.
+    assert_eq!(export::csv_safe_cell("-1234.5"), "-1234.5");
+    assert_eq!(export::csv_safe_cell("-1 234,56"), "-1 234,56");
+    assert_eq!(
+        export::csv_safe_cell("=cmd|' /c calc'!A0"),
+        "'=cmd|' /c calc'!A0"
+    );
+    assert_eq!(export::csv_safe_cell("-1+1"), "'-1+1");
+    assert_eq!(export::csv_safe_cell("@SUM(A1)"), "'@SUM(A1)");
+
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("numbers.xlsx");
+    write_test_xlsx(
+        &source,
+        &[vec![
+            ("declaration_number", "24UA100110000401U1"),
+            ("declaration_date", "15.03.2024"),
+            ("product_code", "0851713000"),
+            ("net_kg", "10.5"),
+            ("currency_control_value", "1200.75"),
+        ]],
+    );
+    let mut db = Db::open(&dir.path().join("numbers.db")).unwrap();
+    let cancel = AtomicBool::new(false);
+    assert_eq!(
+        import::import_file(&mut db, &source, &cancel, &mut |_, _, _| {}).error,
+        None
+    );
+
+    let out = dir.path().join("out.xlsx");
+    export::export(&db, &Query::default(), &out, &cancel, |_, _| {}).unwrap();
+
+    let mut workbook: calamine::Xlsx<_> = calamine::open_workbook(&out).unwrap();
+    let sheet_name = workbook.sheet_names()[0].clone();
+    let range = workbook.worksheet_range(&sheet_name).unwrap();
+    let headers: Vec<String> = range
+        .rows()
+        .next()
+        .unwrap()
+        .iter()
+        .map(|cell| cell.to_string())
+        .collect();
+    let data = range.rows().nth(1).unwrap();
+    let column = |header: &str| {
+        headers
+            .iter()
+            .position(|candidate| candidate == header)
+            .unwrap_or_else(|| panic!("missing column {header} in {headers:?}"))
+    };
+
+    let value = &data[column("ФВ вал.контр")];
+    assert!(
+        matches!(value, calamine::Data::Float(number) if (*number - 1200.75).abs() < 1e-9),
+        "a value column must export as a number, got {value:?}"
+    );
+    let weight = &data[column("Нетто, кг.")];
+    assert!(
+        matches!(weight, calamine::Data::Float(number) if (*number - 10.5).abs() < 1e-9),
+        "a weight column must export as a number, got {weight:?}"
+    );
+    let code = &data[column("Код товару")];
+    assert_eq!(
+        code.to_string(),
+        "0851713000",
+        "a product code must stay text so its leading zero survives"
+    );
+}
+
+/// Column detection must call a number what the query engine calls a number.
+///
+/// Detection used its own parser, which simply replaced every comma with a dot.
+/// A value column written as "1200.75 USD" — a currency suffix is ordinary in
+/// customs registries — failed that check, so the Value semantic was refused at
+/// import even though `num_value` reads the same cell perfectly at query time.
+/// The column then carried no money into analytics at all.
+#[test]
+fn value_columns_with_a_currency_suffix_are_recognized_at_import() {
+    let dir = tempfile::tempdir().unwrap();
+    let csv = dir.path().join("suffixed.csv");
+    std::fs::write(
+        &csv,
+        "Одержувач,Вартість\n\
+         ТОВ «АЛЬФА»,1200.75 USD\n\
+         ТОВ «БЕТА»,800.25 USD\n",
+    )
+    .unwrap();
+    let mut db = Db::open(&dir.path().join("suffixed.db")).unwrap();
+    let cancel = AtomicBool::new(false);
+    assert_eq!(
+        import::import_file(&mut db, &csv, &cancel, &mut |_, _, _| {}).error,
+        None
+    );
+
+    let analytics = db.analytics(&Query::default(), 10).unwrap();
+    assert_close(analytics.overview.total_value_usd, 2001.0);
+    let totals = &analytics.overview.measures.currency_totals;
+    assert_eq!(totals.len(), 1, "one bucket for the whole query");
+    assert_close(totals[0].total_value, 2001.0);
+}
+
+/// The main search box must find a row by the identifiers printed on it.
+///
+/// The full-text index covered nine columns, so an EDRPOU code, a contract
+/// number, a delivery place or a customs office was invisible to the search
+/// box even though the value sat in the row. The inversion was the sharp part:
+/// an unrecognized column landed in `extra` and stayed searchable, so the
+/// better the import understood a file, the less of it could be found.
+#[test]
+fn search_finds_rows_by_edrpou_contract_and_place() {
+    let dir = tempfile::tempdir().unwrap();
+    let xlsx = dir.path().join("identifiers.xlsx");
+    write_test_xlsx(
+        &xlsx,
+        &[vec![
+            ("declaration_number", "24UA100110000501U1"),
+            ("declaration_date", "15.03.2024"),
+            ("recipient", "ТОВ «АЛЬФА»"),
+            ("edrpou", "37193071"),
+            ("contract", "KD-2024-0042"),
+            ("delivery_place", "Гданськ"),
+            ("customs_office", "Київська митниця"),
+            ("product_code", "8517130000"),
+        ]],
+    );
+    let mut db = Db::open(&dir.path().join("identifiers.db")).unwrap();
+    let cancel = AtomicBool::new(false);
+    assert_eq!(
+        import::import_file(&mut db, &xlsx, &cancel, &mut |_, _, _| {}).error,
+        None
+    );
+    assert_eq!(db.unindexed_rows(), 0);
+
+    for term in ["37193071", "KD-2024-0042", "Гданськ", "Київська"] {
+        let query = Query {
+            text: term.to_string(),
+            ..Default::default()
+        };
+        let (_, _, rows, _) = db.search_page_dynamic(&query, 10, 0).unwrap();
+        assert_eq!(rows.len(), 1, "search for {term:?} must find the row");
+    }
+}
+
+/// A bulk load into an empty database drops the read-side indexes and rebuilds
+/// them afterwards, and the database must be fully indexed again when it ends.
+///
+/// The importer otherwise inserts every row into every index one at a time,
+/// which is the dominant write cost of a first load. Correctness of the result
+/// is what matters here: the same rows, the same search behaviour, and every
+/// index back in place.
+#[test]
+fn bulk_load_rebuilds_every_index_it_dropped() {
+    let dir = tempfile::tempdir().unwrap();
+    let csv = dir.path().join("bulk.csv");
+    let mut contents = String::from("Одержувач,ЕДРПОУ,Код товару,Вартість\n");
+    for index in 0..300 {
+        contents.push_str(&format!(
+            "ТОВ «КОМПАНІЯ {index}»,3719{index:04},85171300{:02},{index}\n",
+            index % 100
+        ));
+    }
+    std::fs::write(&csv, contents).unwrap();
+    let db_path = dir.path().join("bulk.db");
+    let mut db = Db::open(&db_path).unwrap();
+    let cancel = AtomicBool::new(false);
+
+    let indexes_before = index_names(&db);
+    assert!(indexes_before.contains(&"idx_records_product_code".to_string()));
+
+    let summary = import::import_file(&mut db, &csv, &cancel, &mut |_, _, _| {});
+    assert_eq!(summary.error, None);
+    assert_eq!(summary.imported, 300);
+
+    let indexes_after = index_names(&db);
+    assert_eq!(
+        indexes_before, indexes_after,
+        "a bulk load must leave exactly the indexes it found"
+    );
+
+    // The data is intact and searchable through the rebuilt indexes.
+    assert_eq!(db.total_rows(), 300);
+    assert_eq!(db.unindexed_rows(), 0);
+    let query = Query {
+        text: "37190042".to_string(),
+        ..Default::default()
+    };
+    let (_, _, rows, _) = db.search_page_dynamic(&query, 10, 0).unwrap();
+    assert_eq!(rows.len(), 1, "the company code must still be findable");
+
+    // A second, incremental import keeps the indexes in place as well.
+    let more = dir.path().join("more.csv");
+    std::fs::write(
+        &more,
+        "Одержувач,ЕДРПОУ,Код товару,Вартість\nТОВ «ПІЗНІЙ»,37199999,8517130099,42\n",
+    )
+    .unwrap();
+    assert_eq!(
+        import::import_file(&mut db, &more, &cancel, &mut |_, _, _| {}).error,
+        None
+    );
+    assert_eq!(index_names(&db), indexes_before);
+}
+
+fn index_names(db: &Db) -> Vec<String> {
+    let mut names = db
+        .diagnostic_query_rows(
+            "SELECT name FROM sqlite_master
+             WHERE type = 'index' AND name LIKE 'idx_records_%'",
+            200,
+        )
+        .unwrap()
+        .into_iter()
+        .filter_map(|row| row.into_iter().next())
+        .collect::<Vec<_>>();
+    names.sort();
+    names
+}

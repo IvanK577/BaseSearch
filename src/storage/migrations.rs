@@ -23,7 +23,6 @@ pub(crate) fn ensure_schema(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch(&format!(
         "{records};
         {fts}
-        CREATE INDEX IF NOT EXISTS idx_records_year ON records(year);
         CREATE INDEX IF NOT EXISTS idx_records_product_code ON records(product_code);
         CREATE INDEX IF NOT EXISTS idx_records_edrpou ON records(edrpou);
         CREATE INDEX IF NOT EXISTS idx_records_hash ON records(row_hash);",
@@ -31,22 +30,69 @@ pub(crate) fn ensure_schema(conn: &Connection) -> rusqlite::Result<()> {
         fts = fts_index::create_table_sql("records_fts")
     ))?;
     ensure_search_indexes(conn)?;
+    drop_superseded_indexes(conn)?;
     import_log::ensure_schema(conn)?;
     source_mapping_profiles::ensure_schema(conn)?;
     source_schemas::ensure_schema(conn)?;
     Ok(())
 }
 
+/// Indexes that only serve reads, dropped for the duration of a bulk load into
+/// an empty database and rebuilt in one sorted pass afterwards.
+///
+/// Maintaining them row by row during a first import is the dominant write
+/// cost, and building each one at the end is far cheaper than inserting into
+/// it several million times. The hash indexes are NOT here: the importer's own
+/// duplicate lookup needs them while the load is running.
+///
+/// Losing them to a crash is safe — `ensure_schema` recreates every index on
+/// the next open, because they are all `CREATE INDEX IF NOT EXISTS`.
+const READ_ONLY_INDEXES: [&str; 8] = [
+    "idx_records_product_code",
+    "idx_records_edrpou",
+    "idx_records_hash",
+    "idx_records_canonical_id",
+    "idx_records_legacy_duplicates",
+    "idx_records_canonical_scope_v2",
+    "idx_records_year_scope",
+    "idx_records_legacy_schema",
+];
+
+/// Drops the read-side indexes ahead of a bulk load. Derived-column indexes go
+/// too: they are generated per derived column and equally pointless to
+/// maintain row by row while nobody is querying.
+pub(crate) fn drop_read_indexes(conn: &Connection) -> rusqlite::Result<()> {
+    let mut ddl: Vec<String> = READ_ONLY_INDEXES
+        .iter()
+        .map(|name| format!("DROP INDEX IF EXISTS {name};"))
+        .collect();
+    for column in derived::DERIVED {
+        ddl.push(format!(
+            "DROP INDEX IF EXISTS idx_records_{name}_scope;",
+            name = column.name
+        ));
+        ddl.push(format!(
+            "DROP INDEX IF EXISTS idx_records_{source}_key_scope;",
+            source = column.source
+        ));
+    }
+    conn.execute_batch(&ddl.join("\n"))
+}
+
+/// Rebuilds everything [`drop_read_indexes`] removed.
+pub(crate) fn create_read_indexes(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_records_product_code ON records(product_code);
+         CREATE INDEX IF NOT EXISTS idx_records_edrpou ON records(edrpou);
+         CREATE INDEX IF NOT EXISTS idx_records_hash ON records(row_hash);",
+    )?;
+    ensure_search_indexes(conn)
+}
+
 fn ensure_search_indexes(conn: &Connection) -> rusqlite::Result<()> {
     let mut ddl = vec![
         "CREATE INDEX IF NOT EXISTS idx_records_canonical_id
              ON records(id) WHERE dup_first_file IS NULL;"
-            .to_string(),
-        "CREATE INDEX IF NOT EXISTS idx_records_canonical_ref
-             ON records(canonical_id) WHERE canonical_id IS NOT NULL;"
-            .to_string(),
-        "CREATE INDEX IF NOT EXISTS idx_records_payload_owner
-             ON records(COALESCE(canonical_id, id));"
             .to_string(),
         "CREATE INDEX IF NOT EXISTS idx_records_hash_owner
              ON records(row_hash, id)
@@ -62,15 +108,17 @@ fn ensure_search_indexes(conn: &Connection) -> rusqlite::Result<()> {
         "CREATE INDEX IF NOT EXISTS idx_records_year_scope
              ON records(year, dup_first_file);"
             .to_string(),
-        "CREATE INDEX IF NOT EXISTS idx_records_year_scope_v2
-             ON records(year, dup_first_file, canonical_id);"
-            .to_string(),
         "CREATE INDEX IF NOT EXISTS idx_records_schema_hash_owner
              ON records(schema_id, row_hash, id)
              WHERE canonical_id IS NULL;"
             .to_string(),
-        "CREATE INDEX IF NOT EXISTS idx_records_source_id
-             ON records(source_id, id) WHERE source_id IS NOT NULL;"
+        // Answers `has_legacy_rows` from an index instead of scanning the whole
+        // table. On a database built entirely by 2.0 imports no row has a NULL
+        // schema_id, so the partial index stays empty and the check is O(1) —
+        // and that check sits on every search page, every export, and the
+        // post-import field refresh.
+        "CREATE INDEX IF NOT EXISTS idx_records_legacy_schema
+             ON records(id) WHERE schema_id IS NULL;"
             .to_string(),
     ];
     let value_source = column_for_semantic(SemanticField::Value);
@@ -102,6 +150,38 @@ fn ensure_search_indexes(conn: &Connection) -> rusqlite::Result<()> {
         }
     }
     conn.execute_batch(&ddl.join("\n"))
+}
+
+/// Drops indexes earlier versions created that no query reads.
+///
+/// Each was maintained on every inserted row, so they were pure import cost.
+/// Each was checked against the query text before removal:
+/// - `idx_records_payload_owner(COALESCE(canonical_id, id))`: the payload join
+///   resolves its owner with `p.id = COALESCE(r.canonical_id, ...)`, which is a
+///   rowid lookup on `p`. The indexed expression appears in no WHERE clause,
+///   only in the index definition itself.
+/// - `idx_records_source_id(source_id, id)`: `source_id` is written on insert
+///   and never used as a search key.
+/// - `idx_records_canonical_ref(canonical_id)`: `canonical_id` is only tested
+///   for NULL-ness or assigned in an UPDATE, never seeked by value.
+/// - `idx_records_year(year)` and
+///   `idx_records_year_scope_v2(year, dup_first_file, canonical_id)`: a year
+///   filter always pairs `year` with the canonical scope predicate
+///   `dup_first_file IS NULL` and constrains nothing else, which
+///   `idx_records_year_scope(year, dup_first_file)` serves exactly. The plain
+///   `(year)` index is a prefix of that one, and `_v2` only appends a column no
+///   query constrains, making its entries larger for no gain.
+///
+/// `DROP INDEX IF EXISTS` is a catalog no-op once the index is gone, so this
+/// costs nothing on later opens.
+fn drop_superseded_indexes(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "DROP INDEX IF EXISTS idx_records_payload_owner;
+         DROP INDEX IF EXISTS idx_records_source_id;
+         DROP INDEX IF EXISTS idx_records_canonical_ref;
+         DROP INDEX IF EXISTS idx_records_year;
+         DROP INDEX IF EXISTS idx_records_year_scope_v2;",
+    )
 }
 
 fn ensure_meta_schema(conn: &Connection) -> rusqlite::Result<()> {

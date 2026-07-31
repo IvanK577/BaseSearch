@@ -9,7 +9,13 @@ pub(super) fn pick_and_import(app: &mut App, ctx: &egui::Context) {
     let t = app.t();
     let files = rfd::FileDialog::new()
         .set_title(t.choose_files)
-        .add_filter(t.excel_files, &["xlsx", "xlsb", "xls"])
+        // Every format the importer accepts. The dialog used to offer only
+        // three, so a CSV, TSV, XLSM or ODS file could not even be selected on
+        // the desktop even though the import path handles all of them.
+        .add_filter(
+            t.excel_files,
+            &["xlsx", "xlsb", "xls", "xlsm", "ods", "csv", "tsv"],
+        )
         .pick_files();
     let Some(files) = files else { return };
     if files.is_empty() {
@@ -52,10 +58,19 @@ pub(super) fn pick_and_export(app: &mut App, ctx: &egui::Context) {
         export_progress: (0, 0),
     });
     app.status = StatusLine::default();
+    // The file should hold the columns on screen, in the order shown.
+    let field_ids: Vec<String> = app
+        .result_fields
+        .iter()
+        .zip(&app.visible_cols)
+        .filter(|(_, visible)| **visible)
+        .map(|(field, _)| field.id.clone())
+        .collect();
     workers::spawn_export(
         app.db_path.clone(),
         app.active_query.clone(),
         dest,
+        (!field_ids.is_empty()).then_some(field_ids),
         cancel,
         app.msg_tx.clone(),
         ctx.clone(),

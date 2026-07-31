@@ -64,3 +64,8 @@
 .DS_Store
 Thumbs.db
 desktop.ini
+
+# Leftovers of the one-time move of the 2.0.x tree into the repository root.
+# Only build output and node_modules remain there; they are locked by a running
+# process and can be deleted once it exits.
+/BaseSearch-master/

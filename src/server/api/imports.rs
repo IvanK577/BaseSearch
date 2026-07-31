@@ -13,7 +13,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use crate::db::{
-    Db, SourceMappingColumn, SourceMappingProfileCollection, source_mapping_signature,
+    Db, SourceMappingColumn, SourceMappingProfile, SourceMappingProfileCollection,
+    source_mapping_signature,
 };
 use crate::domain::table::{ColumnRole, ColumnStorage, SemanticField, SourceColumn, TableShape};
 use crate::import::{self, ImportPhase};
@@ -39,6 +40,94 @@ const MAX_PROFILE_OPTIONS_BYTES: usize = 64 * 1024;
 const MAX_FIXED_OPTIONS_BYTES: usize = 64 * 1024;
 const MAX_SELECTED_SHEETS: usize = 256;
 const MAX_SEMANTIC_OVERRIDES: usize = 4096;
+
+/// Shortest gap between two published import progress updates. The job history
+/// commits each one durably, so this bounds how much of the import is spent
+/// writing progress rather than rows. Phase changes bypass it.
+const PROGRESS_PUBLISH_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// Name prefix of a retained preview upload.
+const PEEK_PREFIX: &str = "peek-";
+/// How long an unclaimed preview file is kept before the next preview sweeps it
+/// away. Long enough to read a preview and decide, short enough that abandoned
+/// previews cannot fill the disk.
+const PEEK_RETENTION: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+const MAX_PEEK_TOKEN_BYTES: usize = 512;
+
+/// Resolves a preview token to the file the preview already wrote, plus the
+/// original file name to import it under.
+///
+/// The token is a server-generated file name of the form
+/// `peek-<pid>-<nanos>-<sanitized name>`. It is treated as untrusted input: it
+/// must carry no path separators and no parent-directory hop, so joining it
+/// onto the uploads directory cannot escape it.
+fn resolve_peek_token(
+    uploads_dir: &std::path::Path,
+    token: &str,
+) -> Result<(PathBuf, String), ApiError> {
+    // A distinct code so the client can tell "the retained preview is gone,
+    // send the bytes after all" apart from a genuine validation error, instead
+    // of re-uploading a multi-gigabyte file on any 400.
+    let rejected = || {
+        ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "preview_expired",
+            "That file preview is no longer available. Choose the file again to import it.",
+        )
+    };
+    if token.is_empty()
+        || token.len() > MAX_PEEK_TOKEN_BYTES
+        || token.contains('/')
+        || token.contains('\\')
+        || token.contains("..")
+        || token.contains('\0')
+    {
+        return Err(rejected());
+    }
+    let rest = token.strip_prefix(PEEK_PREFIX).ok_or_else(rejected)?;
+    let mut parts = rest.splitn(3, '-');
+    let pid = parts.next().unwrap_or_default();
+    let nanos = parts.next().unwrap_or_default();
+    let name = parts.next().unwrap_or_default();
+    if pid.is_empty()
+        || nanos.is_empty()
+        || name.is_empty()
+        || !pid.chars().all(|ch| ch.is_ascii_digit())
+        || !nanos.chars().all(|ch| ch.is_ascii_digit())
+    {
+        return Err(rejected());
+    }
+    let path = uploads_dir.join(token);
+    if !path.is_file() {
+        return Err(rejected());
+    }
+    Ok((path, sanitize_file_name(name)))
+}
+
+/// Removes preview uploads nobody claimed. Called before writing a new one, so
+/// an abandoned preview costs at most one retention window of disk.
+async fn sweep_stale_peeks(uploads_dir: &std::path::Path) {
+    let Ok(mut entries) = tokio::fs::read_dir(uploads_dir).await else {
+        return;
+    };
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if !name.starts_with(PEEK_PREFIX) {
+            continue;
+        }
+        let stale = entry
+            .metadata()
+            .await
+            .ok()
+            .and_then(|meta| meta.modified().ok())
+            .and_then(|modified| modified.elapsed().ok())
+            .is_some_and(|age| age > PEEK_RETENTION);
+        if stale {
+            let _ = tokio::fs::remove_file(entry.path()).await;
+        }
+    }
+}
 pub(super) const MAX_FILE_BODY_BYTES: u64 = MAX_FILE_BYTES + MULTIPART_OVERHEAD_BYTES;
 pub(super) const MAX_BATCH_BODY_BYTES: u64 = MAX_BATCH_BYTES + MULTIPART_OVERHEAD_BYTES;
 
@@ -77,6 +166,10 @@ struct AppliedSourceProfile {
 #[derive(Debug, Serialize)]
 pub struct WorkbookPeekResponse {
     sheets: Vec<SheetPeekResponse>,
+    /// Handle for the file this preview already received and wrote to disk.
+    /// Passing it back to the import avoids uploading the same bytes twice.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    token: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -223,12 +316,36 @@ pub async fn upload(
         None;
     let mut sheet_profiles: Option<BTreeMap<String, i64>> = None;
     let mut sheet_fixed_values: Option<BTreeMap<String, BTreeMap<SemanticField, String>>> = None;
+    let mut peek_token: Option<String> = None;
 
     while let Some(mut field) = multipart
         .next_field()
         .await
         .map_err(|err| ApiError::bad_request(format!("Upload failed: {err}")))?
     {
+        if field.file_name().is_none() && field.name() == Some("peek_token") {
+            if peek_token.is_some() {
+                cleanup(&saved);
+                return Err(ApiError::bad_request(
+                    "A preview token was provided more than once.",
+                ));
+            }
+            let bytes = saved.cleanup_on_error(
+                read_bounded_metadata(
+                    &mut field,
+                    MAX_PEEK_TOKEN_BYTES,
+                    "Read preview token",
+                    "Preview token is too large.",
+                )
+                .await,
+            )?;
+            let token = saved.cleanup_on_error(
+                String::from_utf8(bytes)
+                    .map_err(|_| ApiError::bad_request("Preview token is not valid text.")),
+            )?;
+            peek_token = Some(token.trim().to_string());
+            continue;
+        }
         if field.file_name().is_none() && field.name() == Some("selected_sheets") {
             if selected_sheets.is_some() {
                 cleanup(&saved);
@@ -473,6 +590,31 @@ pub async fn upload(
         saved.push(dest);
     }
 
+    // The preview already streamed this file to disk. Claim it by moving it
+    // into the normal per-upload layout instead of receiving the same bytes a
+    // second time — a rename inside the uploads directory, so it costs nothing
+    // even for a multi-gigabyte file.
+    if saved.is_empty()
+        && let Some(token) = peek_token.as_deref()
+    {
+        let (source, name) = resolve_peek_token(&state.uploads_dir, token)?;
+        if !is_supported(&name) {
+            return Err(ApiError::unsupported(format!(
+                "Unsupported file type: {name}. Import Excel, OpenDocument, CSV, or TSV files."
+            )));
+        }
+        let subdir = state.uploads_dir.join(format!("{stamp}-0"));
+        tokio::fs::create_dir_all(&subdir)
+            .await
+            .map_err(|err| ApiError::internal("create upload subdir", err))?;
+        let dest = subdir.join(&name);
+        if let Err(err) = tokio::fs::rename(&source, &dest).await {
+            let _ = std::fs::remove_dir_all(&subdir);
+            return Err(ApiError::internal("claim previewed upload", err));
+        }
+        saved.push(dest);
+    }
+
     if saved.is_empty() {
         return Err(ApiError::bad_request(
             "No importable files were uploaded. Choose Excel, OpenDocument, CSV, or TSV files.",
@@ -597,6 +739,17 @@ fn run_import(
     let file_count = files.len();
     let mut results: Vec<ImportFileResultDto> = Vec::with_capacity(file_count);
 
+    // A batch has no preview, so saved mappings are matched to it by column
+    // signature. Skipped entirely when nothing is saved, so a workspace that
+    // has never defined a mapping pays nothing for this.
+    let saved_profiles = if file_count > 1 {
+        db.list_source_mapping_profiles()
+            .map(|collection| collection.profiles)
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+
     for (idx, path) in files.iter().enumerate() {
         if cancel.load(Ordering::Relaxed) {
             break;
@@ -613,9 +766,27 @@ fn run_import(
                 sheet_semantics: sheet_semantics.clone(),
                 sheet_fixed_values: sheet_fixed_values.clone(),
             }
-        } else {
+        } else if saved_profiles.is_empty() {
             import::ImportOptions::default()
+        } else {
+            let (options, applied) = auto_import_options(path, &saved_profiles);
+            if !applied.is_empty() {
+                handle.set_message(format!(
+                    "File {}/{}: {file_label} — applied saved mapping {}",
+                    idx + 1,
+                    file_count,
+                    applied.join(", ")
+                ));
+            }
+            options
         };
+        // Every set_progress call is a durable write to the job history, which
+        // opens its store with synchronous=FULL. Forwarding one per row batch
+        // and per hashed chunk would put thousands of fsyncs in the middle of
+        // the import. Rate-limit them, but never swallow a phase change: that
+        // is the event the user is actually watching for.
+        let mut last_sent: Option<std::time::Instant> = None;
+        let mut last_phase = String::new();
         let summary = import::import_file_with_options(
             &mut db,
             path,
@@ -627,11 +798,15 @@ fn run_import(
                     ImportPhase::Inserting => "inserting",
                     ImportPhase::Indexing => "indexing",
                 };
-                handle.set_progress(
-                    &format!("{phase_name} ({}/{})", idx + 1, file_count),
-                    done,
-                    total,
-                );
+                let label = format!("{phase_name} ({}/{})", idx + 1, file_count);
+                let due = last_sent
+                    .map(|sent| sent.elapsed() >= PROGRESS_PUBLISH_INTERVAL)
+                    .unwrap_or(true);
+                if label != last_phase || due {
+                    last_phase.clone_from(&label);
+                    last_sent = Some(std::time::Instant::now());
+                    handle.set_progress(&label, done, total);
+                }
             },
         );
         results.push(ImportFileResultDto::from(&summary));
@@ -730,6 +905,7 @@ pub async fn peek(
     tokio::fs::create_dir_all(&state.uploads_dir)
         .await
         .map_err(|err| ApiError::internal("create uploads dir", err))?;
+    sweep_stale_peeks(&state.uploads_dir).await;
 
     let mut dest: Option<(PathBuf, String)> = None;
     while let Some(mut field) = multipart
@@ -814,8 +990,25 @@ pub async fn peek(
         workbook_peek_response(&db, peek)
     })
     .await;
-    let _ = tokio::fs::remove_file(&path).await;
-    Ok(Json(result?))
+    match result {
+        Ok(mut response) => {
+            // Keep the file: the import can claim it by token instead of
+            // making the client send the same bytes a second time. Unclaimed
+            // files are swept by the next preview.
+            response.token = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .map(str::to_string);
+            if response.token.is_none() {
+                let _ = tokio::fs::remove_file(&path).await;
+            }
+            Ok(Json(response))
+        }
+        Err(error) => {
+            let _ = tokio::fs::remove_file(&path).await;
+            Err(error)
+        }
+    }
 }
 
 fn is_delimited_name(name: &str) -> bool {
@@ -853,7 +1046,10 @@ fn workbook_peek_response(
             profile_suggestions,
         });
     }
-    Ok(WorkbookPeekResponse { sheets })
+    Ok(WorkbookPeekResponse {
+        sheets,
+        token: None,
+    })
 }
 
 fn validate_sheet_fixed_values(
@@ -895,6 +1091,52 @@ fn validate_sheet_fixed_values(
         }
     }
     Ok(validated)
+}
+
+/// Import options for one file of a batch, built by matching each detected
+/// sheet's column signature against the saved mappings.
+///
+/// A batch has no preview step, so it used to fall back to auto-detection
+/// entirely: dropping twelve monthly exports at once ignored the mapping the
+/// user had already saved for exactly that layout, and each file could end up
+/// mapped differently from the one configured by hand.
+///
+/// A signature matching exactly one saved profile is applied. An ambiguous
+/// signature — two saved profiles for the same layout — is left alone, because
+/// silently picking one of them would be worse than applying neither.
+fn auto_import_options(
+    source_path: &std::path::Path,
+    profiles: &[SourceMappingProfile],
+) -> (import::ImportOptions, Vec<String>) {
+    let mut options = import::ImportOptions::default();
+    let mut applied = Vec::new();
+    let Ok(peek) = import::peek_file(source_path, MAX_SELECTED_SHEETS) else {
+        return (options, applied);
+    };
+    for sheet in &peek.sheets {
+        let signature = sheet_signature(sheet);
+        let width = sheet.columns.len();
+        let mut matching = profiles
+            .iter()
+            .filter(|profile| profile.signature == signature && profile.mapping.len() == width);
+        let Some(profile) = matching.next() else {
+            continue;
+        };
+        if matching.next().is_some() {
+            continue;
+        }
+        options.sheet_semantics.insert(
+            sheet.name.clone(),
+            profile.mapping.iter().copied().enumerate().collect(),
+        );
+        if !profile.fixed_values.is_empty() {
+            options
+                .sheet_fixed_values
+                .insert(sheet.name.clone(), profile.fixed_values.clone());
+        }
+        applied.push(profile.name.clone());
+    }
+    (options, applied)
 }
 
 fn resolve_import_configuration(
@@ -1448,5 +1690,110 @@ mod tests {
             !uploads_dir.exists() || std::fs::read_dir(&uploads_dir).unwrap().next().is_none(),
             "rejected multipart requests must not leave streamed files"
         );
+    }
+    /// A preview token is a server-generated file name that arrives back from
+    /// the browser, so it is untrusted input: it must never be able to name a
+    /// file outside the uploads directory.
+    #[test]
+    fn preview_tokens_cannot_escape_the_uploads_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let uploads = temp.path().join("uploads");
+        std::fs::create_dir_all(&uploads).unwrap();
+        let valid = "peek-1234-5678-registry.xlsx";
+        std::fs::write(uploads.join(valid), b"payload").unwrap();
+        // A file the token must never be able to reach.
+        std::fs::write(temp.path().join("secret.db"), b"secret").unwrap();
+
+        let Ok((path, name)) = resolve_peek_token(&uploads, valid) else {
+            panic!("a token the preview itself produced must resolve");
+        };
+        assert_eq!(path, uploads.join(valid));
+        assert_eq!(name, "registry.xlsx");
+
+        for hostile in [
+            "../secret.db",
+            "peek-1-2-../../secret.db",
+            r"peek-1-2-..\secret.db",
+            "/etc/passwd",
+            "peek-1234-5678-",
+            "peek--5678-name.xlsx",
+            "peek-abc-5678-name.xlsx",
+            "registry.xlsx",
+            "",
+        ] {
+            assert!(
+                resolve_peek_token(&uploads, hostile).is_err(),
+                "token {hostile:?} must be refused"
+            );
+        }
+
+        // A well-formed token for a file that is not there is refused too.
+        assert!(resolve_peek_token(&uploads, "peek-1-2-missing.xlsx").is_err());
+    }
+    /// A batch import has no preview step, so saved mappings reach it by
+    /// matching each sheet's column signature. An unambiguous match is applied;
+    /// two saved mappings for the same layout are left alone rather than
+    /// guessed between.
+    #[test]
+    fn batch_import_applies_a_saved_mapping_by_signature() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("monthly.csv");
+        std::fs::write(
+            &source,
+            "Company,Code,Amount
+ALPHA,37193071,100
+",
+        )
+        .unwrap();
+
+        let peek = import::peek_file(&source, MAX_SELECTED_SHEETS).unwrap();
+        let sheet = &peek.sheets[0];
+        let signature = sheet_signature(sheet);
+        let width = sheet.columns.len();
+
+        let profile = |id: i64, name: &str| SourceMappingProfile {
+            id,
+            name: name.to_string(),
+            signature: signature.clone(),
+            mapping: (0..width)
+                .map(|index| (index == 0).then_some(SemanticField::Recipient))
+                .collect(),
+            fixed_values: BTreeMap::from([(SemanticField::Currency, "USD".to_string())]),
+            created_at: String::new(),
+            updated_at: String::new(),
+        };
+
+        let saved = vec![profile(1, "Monthly export")];
+        let (options, applied) = auto_import_options(&source, &saved);
+        assert_eq!(applied, vec!["Monthly export".to_string()]);
+        assert_eq!(
+            options.sheet_semantics.get(&sheet.name).unwrap().get(&0),
+            Some(&Some(SemanticField::Recipient))
+        );
+        assert_eq!(
+            options
+                .sheet_fixed_values
+                .get(&sheet.name)
+                .unwrap()
+                .get(&SemanticField::Currency),
+            Some(&"USD".to_string())
+        );
+
+        // Two saved mappings for the same layout: refuse to choose.
+        let ambiguous = vec![profile(1, "Monthly export"), profile(2, "Other export")];
+        let (options, applied) = auto_import_options(&source, &ambiguous);
+        assert!(
+            applied.is_empty(),
+            "an ambiguous signature must not be guessed"
+        );
+        assert!(options.sheet_semantics.is_empty());
+
+        // A layout nobody saved a mapping for is left to auto-detection.
+        let unrelated = vec![SourceMappingProfile {
+            signature: "something-else".to_string(),
+            ..profile(3, "Unrelated")
+        }];
+        let (_, applied) = auto_import_options(&source, &unrelated);
+        assert!(applied.is_empty());
     }
 }

@@ -9,6 +9,10 @@ use super::aliases::{AliasMatch, canonical_column, match_header, normalize_heade
 use super::{ColSrc, HEADER_SCAN_ROWS, cell_has_value, header_text, normalize_value};
 
 const SAMPLE_ROWS: usize = 8;
+/// Rows inspected when judging what a column holds. The detection buffer
+/// already contains them, so a wider window costs nothing and stops a handful
+/// of blank leading cells from deciding a column's fate.
+const VALUE_SAMPLE_ROWS: usize = DETECTION_BUFFER_ROWS;
 pub(super) const DETECTION_BUFFER_ROWS: usize = HEADER_SCAN_ROWS + SAMPLE_ROWS;
 
 pub(super) struct MappingPlan {
@@ -178,7 +182,7 @@ fn looks_like_header_label(cell: &Data) -> bool {
 fn looks_numeric_cell(cell: &Data) -> bool {
     match cell {
         Data::Float(_) | Data::Int(_) | Data::DateTime(_) => true,
-        Data::String(value) => parse_number(value).is_some(),
+        Data::String(value) => parse_bare_number(value).is_some(),
         _ => false,
     }
 }
@@ -208,7 +212,14 @@ fn samples_confirm(alias: AliasMatch, samples: &[Vec<Data>], column: usize) -> b
     let matches = values
         .iter()
         .filter(|value| match alias.semantic {
-            SemanticField::Value | SemanticField::Quantity => parse_number(value).is_some(),
+            // Must agree with the num_value SQL function the search and
+            // analytics use, or a column is rejected at import and then
+            // parses perfectly at query time. The local parser turns every
+            // comma into a dot, so "1.234,56" and "1200.75 USD" failed here
+            // while the runtime read them fine.
+            SemanticField::Value | SemanticField::Quantity => {
+                crate::storage::normalize::parse_number(value).is_some()
+            }
             SemanticField::Country => looks_like_country(value),
             _ => true,
         })
@@ -248,9 +259,31 @@ fn resolve_participant_duplicates(
         for column in &columns {
             inferred.remove(column);
         }
-        if name_candidates.len() == 1 {
-            inferred.insert(name_candidates[0], participant);
+        // Ambiguity must never cost the column outright. Dropping the
+        // participant silently empties the "Recipients / importers" section and
+        // leaves the company dossier with no name, while the EDRPOU section
+        // keeps working — which reads to the user as "the importer is gone and
+        // only its code is left". Columns are in file order, so falling back to
+        // the leftmost match keeps the primary name column, which registries
+        // place before its synonyms.
+        let chosen = match name_candidates.as_slice() {
+            // Unambiguous: exactly one column looks like a name.
+            [only] => Some(*only),
+            // Several name-like synonyms, e.g. "Отримувач" and "Покупець".
+            [first, ..] => Some(*first),
+            // None look like names: prefer any column that is not a bare code.
+            [] => columns
+                .iter()
+                .copied()
+                .find(|column| !code_candidates.contains(column))
+                .or_else(|| columns.first().copied()),
+        };
+        if let Some(chosen) = chosen {
+            inferred.insert(chosen, participant);
         }
+        // The implicit company-code inference stays strict: a code is only
+        // adopted from an unambiguous name/code pair, never from a file whose
+        // participant columns were guessed.
         if code_candidates.len() == 1 && name_candidates.len() == 1 {
             candidates.push(code_candidates[0]);
         }
@@ -375,7 +408,7 @@ fn choose_canonical_source(
 fn sample_values(samples: &[Vec<Data>], column: usize) -> Vec<String> {
     samples
         .iter()
-        .take(SAMPLE_ROWS)
+        .take(VALUE_SAMPLE_ROWS)
         .filter_map(|row| row.get(column))
         .map(normalize_value)
         .filter(|value| !value.is_empty())
@@ -437,7 +470,10 @@ fn looks_like_country(value: &str) -> bool {
         })
 }
 
-fn parse_number(value: &str) -> Option<f64> {
+/// Strict "this cell is a bare number" test, used when scoring whether a row
+/// looks like a header. Tolerating units here would make a data row look
+/// numeric in the wrong places, so it stays deliberately narrow.
+fn parse_bare_number(value: &str) -> Option<f64> {
     let compact = value
         .trim()
         .replace([' ', '\u{00a0}', '\u{202f}'], "")

@@ -116,6 +116,9 @@ pub fn spawn_export(
     db_path: PathBuf,
     q: Query,
     dest: PathBuf,
+    // Column ids the user left visible, in display order. `None` exports the
+    // whole catalog.
+    field_ids: Option<Vec<String>>,
     cancel: Arc<AtomicBool>,
     tx: Sender<Msg>,
     ctx: egui::Context,
@@ -130,14 +133,24 @@ pub fn spawn_export(
             }
         };
         let mut last_sent = Instant::now();
-        let result = export::export(&db, &q, &dest, &cancel, |done, total| {
-            if last_sent.elapsed().as_millis() >= 100 {
-                last_sent = Instant::now();
-                let _ = tx.send(Msg::ExportProgress(done, total));
-                ctx.request_repaint();
+        // Export what the user is looking at. Ignoring the column picker meant
+        // the file never matched the table on screen, even though hiding a
+        // column is honoured by the grid and by copy-to-clipboard.
+        let catalog = db.result_fields_for_query(&q).unwrap_or_default();
+        let selected = export::resolve_fields(&catalog, field_ids.as_deref());
+        let result = match selected {
+            Ok(fields) => {
+                export::export_selected(&db, &q, &dest, &fields, None, &cancel, |done, total| {
+                    if last_sent.elapsed().as_millis() >= 100 {
+                        last_sent = Instant::now();
+                        let _ = tx.send(Msg::ExportProgress(done, total));
+                        ctx.request_repaint();
+                    }
+                })
+                .map(|written| (written, dest.clone()))
             }
-        })
-        .map(|written| (written, dest.clone()));
+            Err(error) => Err(export::ExportError::Other(error.to_string())),
+        };
         let _ = tx.send(Msg::ExportDone(result));
         ctx.request_repaint();
     });

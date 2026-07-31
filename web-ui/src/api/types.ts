@@ -106,6 +106,13 @@ export interface SearchResponse {
   offset: number;
   limit: number;
   has_next: boolean;
+  /** Total matches for the query, already computed by /api/search. */
+  total: number;
+  /**
+   * Highest record id this result set was taken at. Passing it back to
+   * /api/search keeps paging on one stable snapshot.
+   */
+  snapshot: number;
 }
 
 export interface CountResponse {
@@ -616,6 +623,12 @@ export interface SheetPeek {
 
 export interface WorkbookPeek {
   sheets: SheetPeek[];
+  /**
+   * Handle for the file this preview already uploaded. Passing it back to the
+   * import avoids sending the same bytes a second time. Absent if the server
+   * could not retain the file.
+   */
+  token?: string;
 }
 
 export type FixedSemanticField = "Currency" | "WeightUnit";

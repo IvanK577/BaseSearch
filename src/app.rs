@@ -149,6 +149,9 @@ pub struct App {
     card_open: bool,
     show_settings: bool,
     show_help: bool,
+    /// Whether "help seen" has already been recorded in this session, so the
+    /// flag is written once instead of on every repaint.
+    help_seen_saved: bool,
     confirm_clear: bool,
     columns_filter: String,
     add_filter_search: String,
@@ -252,6 +255,7 @@ impl App {
             card_open: false,
             show_settings: false,
             show_help: false,
+            help_seen_saved: false,
             confirm_clear: false,
             columns_filter: String::new(),
             add_filter_search: String::new(),
@@ -723,7 +727,14 @@ impl App {
         if !self.show_help {
             return;
         }
-        self.persist("help_seen", "1");
+        // Recorded once per session, not once per repaint. As a per-frame write
+        // it hit SQLite on every frame the window was open; during an import,
+        // which holds a write transaction, each attempt waited on the busy
+        // handler for up to the 30 second timeout and froze the window.
+        if !self.help_seen_saved {
+            self.persist("help_seen", "1");
+            self.help_seen_saved = true;
+        }
         let t = self.t();
         help_window(ctx, &mut self.show_help, self.lang, t);
     }

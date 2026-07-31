@@ -18,7 +18,8 @@ use crate::storage::extra::{parse_extra, remember_extra_header};
 use crate::storage::normalize::normalize_text_key;
 use crate::storage::{
     analytics_repo, connection as storage_connection, fts_index, import_log, maintenance, meta,
-    query_plan, record_writer, result_repo, source_mapping_profiles, source_schemas, table_shape,
+    migrations, query_plan, record_writer, result_repo, source_mapping_profiles, source_schemas,
+    table_shape,
 };
 
 pub use crate::db_types::*;
@@ -671,10 +672,36 @@ impl Db {
     /// The GUI requests one scope at a time via [`Db::analytics_scoped`],
     /// which is several times cheaper on broad queries.
     pub fn analytics(&self, q: &Query, limit: u64) -> rusqlite::Result<Analytics> {
-        let mut analytics = self.analytics_scoped(q, limit, Some(AnalyticsScope::Companies), 10)?;
-        let products = self.analytics_scoped(q, limit, Some(AnalyticsScope::Products), 10)?;
-        let countries = self.analytics_scoped(q, limit, Some(AnalyticsScope::Countries), 10)?;
-        let prices = self.analytics_scoped(q, limit, Some(AnalyticsScope::Prices), 10)?;
+        // All four scopes answer the same query, so the overview and the month
+        // series are identical for each one. Computing them once instead of per
+        // scope removes eighteen redundant full scans from the report, without
+        // changing a single number: the inputs were already the same.
+        let overview = self.analytics_overview(q)?;
+        let months = self.analytics_months(q, &overview.measures)?;
+        let basis = (overview, months);
+        let mut analytics = self.analytics_scoped_with(
+            q,
+            limit,
+            Some(AnalyticsScope::Companies),
+            10,
+            Some(basis.clone()),
+        )?;
+        let products = self.analytics_scoped_with(
+            q,
+            limit,
+            Some(AnalyticsScope::Products),
+            10,
+            Some(basis.clone()),
+        )?;
+        let countries = self.analytics_scoped_with(
+            q,
+            limit,
+            Some(AnalyticsScope::Countries),
+            10,
+            Some(basis.clone()),
+        )?;
+        let prices =
+            self.analytics_scoped_with(q, limit, Some(AnalyticsScope::Prices), 10, Some(basis))?;
         analytics.product_sections = products.product_sections;
         analytics.top_trademarks = products.top_trademarks;
         analytics.top_product_codes = products.top_product_codes;
@@ -695,8 +722,27 @@ impl Db {
         scope: Option<AnalyticsScope>,
         hs_level: u8,
     ) -> rusqlite::Result<Analytics> {
-        let overview = self.analytics_overview(q)?;
-        let months = self.analytics_months(q, overview.compatible_usd.is_some())?;
+        self.analytics_scoped_with(q, limit, scope, hs_level, None)
+    }
+
+    /// `basis` supplies an already-computed overview and month series for this
+    /// exact query, so a caller filling several scopes pays for them once.
+    fn analytics_scoped_with(
+        &self,
+        q: &Query,
+        limit: u64,
+        scope: Option<AnalyticsScope>,
+        hs_level: u8,
+        basis: Option<(AnalyticsOverview, Vec<AnalyticsMonthRow>)>,
+    ) -> rusqlite::Result<Analytics> {
+        let (overview, months) = match basis {
+            Some(basis) => basis,
+            None => {
+                let overview = self.analytics_overview(q)?;
+                let months = self.analytics_months(q, &overview.measures)?;
+                (overview, months)
+            }
+        };
         let mut analytics = Analytics {
             overview,
             months,
@@ -805,6 +851,80 @@ impl Db {
         Ok(analytics)
     }
 
+    /// Sections for one scope, without the month series.
+    ///
+    /// The Overview tab's preview cards read only `*_sections`, and the month
+    /// series is a whole extra aggregate scan they discard. Callers that want
+    /// the months must use [`Db::analytics_scoped`]; this returns an empty
+    /// `months` on purpose rather than a partial one.
+    pub fn analytics_sections_only(
+        &self,
+        q: &Query,
+        limit: u64,
+        scope: AnalyticsScope,
+        hs_level: u8,
+    ) -> rusqlite::Result<Analytics> {
+        let overview = self.analytics_overview_basis(q)?;
+        self.analytics_scoped_with(
+            q,
+            limit,
+            Some(scope),
+            hs_level,
+            Some((overview, Vec::new())),
+        )
+    }
+
+    /// The Overview tab's three preview cards in one pass.
+    ///
+    /// Each card renders the first section of one scope. Fetching them as three
+    /// scoped requests made the server recompute the shared currency and weight
+    /// buckets, a full overview and a month series for every one of them, and
+    /// then discard two of the three sections each request produced.
+    ///
+    /// The company card previews recipients rather than company codes: a reader
+    /// recognises "ТОВ «АЛЬФА»", not "33333333". Swap `Recipients` for `Edrpou`
+    /// to go back to codes.
+    pub fn analytics_previews(
+        &self,
+        q: &Query,
+        limit: u64,
+        hs_level: u8,
+    ) -> rusqlite::Result<Analytics> {
+        let overview = self.analytics_overview_basis(q)?;
+        let company_sections = vec![self.analytics_section_with_overview(
+            q,
+            AnalyticsSectionKind::Recipients,
+            hs_level,
+            limit,
+            &overview,
+        )?];
+        let product_sections = vec![self.analytics_section_with_overview(
+            q,
+            AnalyticsSectionKind::ProductCodes,
+            hs_level,
+            limit,
+            &overview,
+        )?];
+        let country_sections = vec![self.analytics_section_with_overview(
+            q,
+            AnalyticsSectionKind::OriginCountries,
+            hs_level,
+            limit,
+            &overview,
+        )?];
+        Ok(Analytics {
+            overview,
+            company_sections,
+            product_sections,
+            country_sections,
+            ..Default::default()
+        })
+    }
+
+    fn analytics_overview_basis(&self, q: &Query) -> rusqlite::Result<AnalyticsOverview> {
+        analytics_repo::overview_basis(&self.conn, self.filter_plan(q)?)
+    }
+
     pub fn analytics_section(
         &self,
         q: &Query,
@@ -843,9 +963,9 @@ impl Db {
     fn analytics_months(
         &self,
         q: &Query,
-        query_is_usd: bool,
+        query_measures: &AnalyticsMeasures,
     ) -> rusqlite::Result<Vec<AnalyticsMonthRow>> {
-        analytics_repo::months(&self.conn, self.filter_plan(q)?, query_is_usd)
+        analytics_repo::months(&self.conn, self.filter_plan(q)?, query_measures)
     }
 
     /// Full dossier for one company (by EDRPOU): name variants, headline
@@ -905,6 +1025,18 @@ impl Db {
     }
 
     // ---------- statistics ----------
+
+    /// Drops the read-side indexes before a bulk load into an empty database,
+    /// so several million rows are not inserted into each one individually.
+    /// Safe to lose to a crash: every index is recreated on the next open.
+    pub(crate) fn drop_read_indexes(&self) -> rusqlite::Result<()> {
+        migrations::drop_read_indexes(&self.conn)
+    }
+
+    /// Rebuilds the read-side indexes in one sorted pass after a bulk load.
+    pub(crate) fn create_read_indexes(&self) -> rusqlite::Result<()> {
+        migrations::create_read_indexes(&self.conn)
+    }
 
     pub fn total_rows(&self) -> u64 {
         record_writer::total_rows(&self.conn)

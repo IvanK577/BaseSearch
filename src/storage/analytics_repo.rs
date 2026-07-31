@@ -57,8 +57,10 @@ fn currency_is_known(key: &str) -> bool {
 
 /// Currency- and unit-safe measures for the filtered row set: per-currency
 /// value buckets, per-unit weight buckets, value-per-kg pairs, and exclusion
-/// counters. Money is never added across currency buckets. Runs five focused
-/// aggregate scans; only the query-level overview pays this cost — group and
+/// counters. Money is never added across currency buckets. Runs four focused
+/// aggregate scans: one over the currency bucket (value totals and the
+/// value-per-kg pairs together), one per weight column, and one for the
+/// exclusion counters. Only the query-level overview pays this cost — group and
 /// month rows inherit compatibility from it instead of re-bucketing.
 fn measures_for_plan(conn: &Connection, plan: &FilterPlan) -> rusqlite::Result<AnalyticsMeasures> {
     let cols = columns_for(conn, plan.payload_alias);
@@ -67,29 +69,76 @@ fn measures_for_plan(conn: &Connection, plan: &FilterPlan) -> rusqlite::Result<A
     let value = &m.value;
     let cur = &m.currency_key;
 
-    // 1. Per-currency value totals.
-    let currency_totals: Vec<AnalyticsCurrencyTotal> = {
+    // 1. Per-currency value totals together with the value-per-kg pairs.
+    //
+    // Both group by the same currency bucket, and the paired set (rows that
+    // also carry a positive weight) is a strict subset of the valued set, so
+    // the pairing filter becomes a conditional aggregate instead of a second
+    // full pass over the table.
+    let (currency_totals, value_per_net_weight) = {
+        let net_kg = &m.net_weight_kg;
+        let unit = &m.weight_unit_key;
+        let paired = format!("({net_kg}) IS NOT NULL AND ({net_kg}) > 0");
         let filter = and_where(&plan.where_sql, &format!("{value} IS NOT NULL"));
         let sql = format!(
             "SELECT {cur} AS bucket_currency, COUNT(*) AS n,
-                    COALESCE(SUM({value}), 0.0) AS total
+                    COALESCE(SUM({value}), 0.0) AS total,
+                    COUNT(CASE WHEN {paired} THEN 1 END) AS paired_rows,
+                    COALESCE(SUM(CASE WHEN {paired} THEN {value} END), 0.0) AS paired_value,
+                    COALESCE(SUM(CASE WHEN {paired} THEN ({net_kg}) END), 0.0) AS paired_kg,
+                    GROUP_CONCAT(DISTINCT CASE WHEN {paired} THEN {unit} END) AS paired_units
              FROM records r{joins}{filter}
              GROUP BY bucket_currency ORDER BY total DESC"
         );
         let mut stmt = conn.prepare(&sql)?;
         let rows = stmt.query_map(params_from_iter(plan.params.clone()), |row| {
             let currency: String = row.get(0)?;
-            Ok(AnalyticsCurrencyTotal {
-                known: currency_is_known(&currency),
-                currency,
-                valued_rows: row.get::<_, i64>(1)? as u64,
-                total_value: row.get(2)?,
-            })
+            let paired_rows = row.get::<_, i64>(3)? as u64;
+            let paired_value: f64 = row.get(4)?;
+            let paired_weight: f64 = row.get(5)?;
+            let units: Option<String> = row.get(6)?;
+            // A currency with no weighted rows contributed no pair before this
+            // was one query, and must not start contributing an empty one.
+            let pair = (paired_rows > 0).then(|| AnalyticsValuePerWeight {
+                currency: currency.clone(),
+                normalized_weight_unit: "kg".to_string(),
+                source_weight_units: units
+                    .unwrap_or_default()
+                    .split(',')
+                    .filter(|unit| !unit.is_empty())
+                    .map(str::to_string)
+                    .collect(),
+                paired_rows,
+                total_value: paired_value,
+                total_weight: paired_weight,
+                value_per_weight: (paired_weight > 0.0).then(|| paired_value / paired_weight),
+            });
+            Ok((
+                AnalyticsCurrencyTotal {
+                    known: currency_is_known(&currency),
+                    currency,
+                    valued_rows: row.get::<_, i64>(1)? as u64,
+                    total_value: row.get(2)?,
+                },
+                pair,
+            ))
         })?;
-        rows.collect::<rusqlite::Result<Vec<_>>>()?
+        let mut totals: Vec<AnalyticsCurrencyTotal> = Vec::new();
+        let mut pairs: Vec<AnalyticsValuePerWeight> = Vec::new();
+        for row in rows {
+            let (total, pair) = row?;
+            totals.push(total);
+            if let Some(pair) = pair {
+                pairs.push(pair);
+            }
+        }
+        // As a separate query the pair list was ordered by its own paired
+        // total, not by the currency total; keep that order.
+        pairs.sort_by(|left, right| right.total_value.total_cmp(&left.total_value));
+        (totals, pairs)
     };
 
-    // 2-3. Per-unit weight totals (net, then gross).
+    // 2. Per-unit weight totals (net, then gross).
     let weight_buckets =
         |weight_expr: &str, kg_expr: &str| -> rusqlite::Result<Vec<AnalyticsWeightTotal>> {
             let unit = &m.weight_unit_key;
@@ -121,47 +170,7 @@ fn measures_for_plan(conn: &Connection, plan: &FilterPlan) -> rusqlite::Result<A
     let net_weight_totals = weight_buckets(&m.net_weight, &m.net_weight_kg)?;
     let gross_weight_totals = weight_buckets(&m.gross_weight, &m.gross_weight_kg)?;
 
-    // 4. Value-per-net-kg pairs, bucketed by currency (weights normalized to kg).
-    let value_per_net_weight: Vec<AnalyticsValuePerWeight> = {
-        let net_kg = &m.net_weight_kg;
-        let filter = and_where(
-            &plan.where_sql,
-            &format!("{value} IS NOT NULL AND ({net_kg}) IS NOT NULL AND ({net_kg}) > 0"),
-        );
-        let sql = format!(
-            "SELECT {cur} AS bucket_currency, COUNT(*) AS n,
-                    COALESCE(SUM({value}), 0.0) AS total_value,
-                    COALESCE(SUM({net_kg}), 0.0) AS total_kg,
-                    GROUP_CONCAT(DISTINCT {unit})
-             FROM records r{joins}{filter}
-             GROUP BY bucket_currency ORDER BY total_value DESC",
-            unit = m.weight_unit_key,
-        );
-        let mut stmt = conn.prepare(&sql)?;
-        let rows = stmt.query_map(params_from_iter(plan.params.clone()), |row| {
-            let currency: String = row.get(0)?;
-            let total_value: f64 = row.get(2)?;
-            let total_weight: f64 = row.get(3)?;
-            let units: Option<String> = row.get(4)?;
-            Ok(AnalyticsValuePerWeight {
-                currency,
-                normalized_weight_unit: "kg".to_string(),
-                source_weight_units: units
-                    .unwrap_or_default()
-                    .split(',')
-                    .filter(|unit| !unit.is_empty())
-                    .map(str::to_string)
-                    .collect(),
-                paired_rows: row.get::<_, i64>(1)? as u64,
-                total_value,
-                total_weight,
-                value_per_weight: (total_weight > 0.0).then(|| total_value / total_weight),
-            })
-        })?;
-        rows.collect::<rusqlite::Result<Vec<_>>>()?
-    };
-
-    // 5. Exclusion counters, one conditional scan.
+    // 3. Exclusion counters, one conditional scan.
     let exclusions = {
         let unknown_cur = format!("{cur} GLOB '{UNKNOWN_CURRENCY_KEY}*'");
         let unknown_unit = format!(
@@ -244,6 +253,134 @@ fn inherited_usd(
     })
 }
 
+/// How many months the monthly series returns, newest first.
+///
+/// This was 48, which quietly made "all" mean "the last four years": the
+/// period caption is derived from the returned rows, so a ten-year archive
+/// described itself as a four-year one. The series is a single row per month,
+/// so a bound wide enough to be no bound in practice costs nothing — the UI
+/// still offers its own 12/24/all view over what arrives.
+pub(crate) const MONTH_SERIES_LIMIT: u32 = 600;
+
+/// The one bucket of a query-level measure, or `None` when the query mixes
+/// several currencies or weight units.
+fn single_bucket<T>(buckets: &[T]) -> Option<&T> {
+    match buckets {
+        [only] => Some(only),
+        _ => None,
+    }
+}
+
+/// Sums for one month or one group row, collected by the same aggregate scan
+/// that produces the row. Weights are in the source unit, exactly as the
+/// query-level buckets record them. `paired_*` covers only rows that carry
+/// both a value and a positive weight, so the ratio matches how the
+/// query-level `value_per_net_weight` is built.
+pub(crate) struct SubsetTotals {
+    pub(crate) valued_rows: u64,
+    pub(crate) total_value: f64,
+    pub(crate) net_rows: u64,
+    pub(crate) total_net_source: f64,
+    /// `(rows, total)` in the source unit, or `None` for rows that carry no
+    /// gross-weight column at all — a monthly row must not report a 0 kg gross
+    /// bucket it never selected.
+    pub(crate) gross: Option<(u64, f64)>,
+    pub(crate) paired_rows: u64,
+    pub(crate) paired_value: f64,
+    pub(crate) paired_net_source: f64,
+}
+
+fn subset_weight(
+    bucket: &AnalyticsWeightTotal,
+    weighted_rows: u64,
+    total_source_weight: f64,
+) -> AnalyticsWeightTotal {
+    AnalyticsWeightTotal {
+        known: bucket.known,
+        normalized_unit: bucket.normalized_unit.clone(),
+        factor_to_kg: bucket.factor_to_kg,
+        source_unit: bucket.source_unit.clone(),
+        weighted_rows,
+        total_source_weight,
+        total_kg: bucket
+            .factor_to_kg
+            .map(|factor| total_source_weight * factor),
+    }
+}
+
+/// Measures for a subset (one month or one group row) of a query whose value
+/// and weight columns each resolve to a single bucket.
+///
+/// A subset of a one-bucket set is that same bucket, so the subset's own sums
+/// are already honest, correctly labelled totals: the bucket only has to be
+/// relabelled onto them, with no extra scan. When the query spans several
+/// currencies or weight units the corresponding bucket list is left empty,
+/// because only a per-row `GROUP BY` over the currency could split it
+/// truthfully and a cross-currency sum would be meaningless.
+///
+/// This is what puts money, weight, and value-per-kg into the group and month
+/// tables. Without it the rows serialize an empty `measures` and every such
+/// cell renders as an em dash, even though the sums were computed.
+///
+/// Crate-visible because the DuckDB projection has to inherit measures by
+/// exactly this rule: two engines that derive the same wire field differently
+/// are two engines that eventually disagree.
+pub(crate) fn inherited_measures(
+    query: &AnalyticsMeasures,
+    subset: SubsetTotals,
+) -> AnalyticsMeasures {
+    let currency = single_bucket(&query.currency_totals).map(|bucket| AnalyticsCurrencyTotal {
+        known: bucket.known,
+        currency: bucket.currency.clone(),
+        valued_rows: subset.valued_rows,
+        total_value: subset.total_value,
+    });
+    let net_unit = single_bucket(&query.net_weight_totals);
+    let net_weight_totals = net_unit
+        .map(|bucket| subset_weight(bucket, subset.net_rows, subset.total_net_source))
+        .into_iter()
+        .collect();
+    let gross_weight_totals = match (single_bucket(&query.gross_weight_totals), subset.gross) {
+        (Some(bucket), Some((rows, total_source))) => {
+            vec![subset_weight(bucket, rows, total_source)]
+        }
+        _ => Vec::new(),
+    };
+    // A value-per-weight ratio needs both a labelled currency and a weight unit
+    // convertible to kilograms; an unknown unit has no factor and is skipped.
+    let value_per_weight = match (currency.as_ref(), net_unit) {
+        (Some(currency), Some(unit)) => unit.factor_to_kg.map(|factor| {
+            let total_weight = subset.paired_net_source * factor;
+            AnalyticsValuePerWeight {
+                currency: currency.currency.clone(),
+                normalized_weight_unit: "kg".to_string(),
+                source_weight_units: vec![unit.source_unit.clone()],
+                paired_rows: subset.paired_rows,
+                total_value: subset.paired_value,
+                total_weight,
+                value_per_weight: (total_weight > 0.0).then(|| subset.paired_value / total_weight),
+            }
+        }),
+        _ => None,
+    };
+    let compatible_value_total = currency.clone().filter(|total| total.known);
+    let compatible_value_per_net_weight = compatible_value_total
+        .as_ref()
+        .and_then(|_| value_per_weight.clone());
+
+    AnalyticsMeasures {
+        currency_totals: currency.into_iter().collect(),
+        net_weight_totals,
+        gross_weight_totals,
+        value_per_net_weight: value_per_weight.into_iter().collect(),
+        compatible_value_total,
+        compatible_value_per_net_weight,
+        // Exclusion counters stay query-level: they answer "what did the whole
+        // result set drop", which a single row cannot restate.
+        exclusions: AnalyticsMeasureExclusions::default(),
+    }
+}
+
 pub(crate) fn overview(conn: &Connection, plan: FilterPlan) -> rusqlite::Result<AnalyticsOverview> {
     let measures = measures_for_plan(conn, &plan)?;
     let payload_alias = plan.payload_alias;
@@ -317,11 +454,56 @@ pub(crate) fn overview(conn: &Connection, plan: FilterPlan) -> rusqlite::Result<
     })
 }
 
+/// The part of the overview that [`section`] actually consumes: the totals it
+/// computes shares against, and the currency and weight buckets each group row
+/// inherits.
+///
+/// The full [`overview`] additionally answers ten `COUNT(DISTINCT ...)` in one
+/// statement, which makes SQLite hold ten ephemeral B-trees open for the whole
+/// scan and costs far more than every plain sum combined. A caller that only
+/// wants section rows never reads those counters, so this variant leaves them
+/// at zero and pays for one ordinary aggregate row instead.
+pub(crate) fn overview_basis(
+    conn: &Connection,
+    plan: FilterPlan,
+) -> rusqlite::Result<AnalyticsOverview> {
+    let measures = measures_for_plan(conn, &plan)?;
+    let cols = columns_for(conn, plan.payload_alias);
+    let number = |field| cols.number(field).unwrap_or_else(|| "NULL".to_string());
+    let value = number(SemanticField::Value);
+    let gross = number(SemanticField::GrossWeight);
+    let net = number(SemanticField::NetWeight);
+    let quantity = number(SemanticField::Quantity);
+    let sql = format!(
+        "SELECT COUNT(*), SUM({value}), SUM({gross}), SUM({net}), SUM({quantity})
+         FROM records r{joins}{where_sql}",
+        joins = plan.joins,
+        where_sql = plan.where_sql,
+    );
+    let totals = conn.query_row(&sql, params_from_iter(plan.params.clone()), |row| {
+        Ok(AnalyticsOverview {
+            row_count: row.get::<_, i64>(0)? as u64,
+            total_value_usd: row.get::<_, Option<f64>>(1)?.unwrap_or(0.0),
+            total_gross_kg: row.get::<_, Option<f64>>(2)?.unwrap_or(0.0),
+            total_net_kg: row.get::<_, Option<f64>>(3)?.unwrap_or(0.0),
+            total_quantity: row.get::<_, Option<f64>>(4)?.unwrap_or(0.0),
+            ..Default::default()
+        })
+    })?;
+    Ok(AnalyticsOverview {
+        avg_value_per_net_kg: ratio(totals.total_value_usd, totals.total_net_kg),
+        compatible_usd: usd_compatibility(&measures),
+        measures,
+        ..totals
+    })
+}
+
 pub(crate) fn months(
     conn: &Connection,
     plan: FilterPlan,
-    query_is_usd: bool,
+    query_measures: &AnalyticsMeasures,
 ) -> rusqlite::Result<Vec<AnalyticsMonthRow>> {
+    let query_is_usd = query_measures.compatible_usd_total().is_some();
     let payload_alias = plan.payload_alias;
     let joins = &plan.joins;
     let where_sql = &plan.where_sql;
@@ -351,11 +533,18 @@ pub(crate) fn months(
             COUNT(*) AS rows_count,
             COUNT(DISTINCT NULLIF({declaration}, '')) AS declarations_count,
             COALESCE(SUM({value}), 0.0) AS total_value_usd,
-            COALESCE(SUM({net}), 0.0) AS total_net_kg
+            COALESCE(SUM({net}), 0.0) AS total_net_kg,
+            COUNT({value}) AS valued_rows,
+            COUNT({net}) AS net_rows,
+            COUNT(CASE WHEN {value} IS NOT NULL AND ({net}) > 0 THEN 1 END) AS paired_rows,
+            COALESCE(SUM(CASE WHEN {value} IS NOT NULL AND ({net}) > 0
+                THEN {value} END), 0.0) AS paired_value,
+            COALESCE(SUM(CASE WHEN {value} IS NOT NULL AND ({net}) > 0
+                THEN ({net}) END), 0.0) AS paired_net
          FROM records r{joins}{filter_sql}
          GROUP BY {month}
          ORDER BY {month} DESC
-         LIMIT 48"
+         LIMIT {MONTH_SERIES_LIMIT}"
     );
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map(params_from_iter(params), |row| {
@@ -368,7 +557,19 @@ pub(crate) fn months(
             total_value_usd,
             total_net_kg,
             compatible_usd: inherited_usd(query_is_usd, total_value_usd, total_net_kg),
-            measures: AnalyticsMeasures::default(),
+            measures: inherited_measures(
+                query_measures,
+                SubsetTotals {
+                    valued_rows: row.get::<_, i64>(5)? as u64,
+                    total_value: total_value_usd,
+                    net_rows: row.get::<_, i64>(6)? as u64,
+                    total_net_source: total_net_kg,
+                    gross: None,
+                    paired_rows: row.get::<_, i64>(7)? as u64,
+                    paired_value: row.get(8)?,
+                    paired_net_source: row.get(9)?,
+                },
+            ),
         })
     })?;
     let mut months: Vec<AnalyticsMonthRow> = rows.flatten().collect();
@@ -428,7 +629,15 @@ pub(crate) fn section(
             COALESCE(SUM({value}), 0.0) AS total_value_usd,
             COALESCE(SUM({net}), 0.0) AS total_net_kg,
             COALESCE(SUM({gross}), 0.0) AS total_gross_kg,
-            COALESCE(SUM({quantity}), 0.0) AS total_quantity
+            COALESCE(SUM({quantity}), 0.0) AS total_quantity,
+            COUNT({value}) AS valued_rows,
+            COUNT({net}) AS net_rows,
+            COUNT({gross}) AS gross_rows,
+            COUNT(CASE WHEN {value} IS NOT NULL AND ({net}) > 0 THEN 1 END) AS paired_rows,
+            COALESCE(SUM(CASE WHEN {value} IS NOT NULL AND ({net}) > 0
+                THEN {value} END), 0.0) AS paired_value,
+            COALESCE(SUM(CASE WHEN {value} IS NOT NULL AND ({net}) > 0
+                THEN ({net}) END), 0.0) AS paired_net
          FROM records r{joins}{filter_sql}
          GROUP BY {label_sql}
          ORDER BY total_value_usd DESC, total_net_kg DESC, rows_count DESC, label COLLATE NOCASE
@@ -476,7 +685,19 @@ pub(crate) fn section(
                 total_value_usd,
                 total_net_kg,
             ),
-            measures: AnalyticsMeasures::default(),
+            measures: inherited_measures(
+                &overview.measures,
+                SubsetTotals {
+                    valued_rows: row.get::<_, i64>(8)? as u64,
+                    total_value: total_value_usd,
+                    net_rows: row.get::<_, i64>(9)? as u64,
+                    total_net_source: total_net_kg,
+                    gross: Some((row.get::<_, i64>(10)? as u64, total_gross_kg)),
+                    paired_rows: row.get::<_, i64>(11)? as u64,
+                    paired_value: row.get(12)?,
+                    paired_net_source: row.get(13)?,
+                },
+            ),
         })
     })?;
     Ok(AnalyticsSection {
@@ -529,7 +750,7 @@ pub(crate) fn company_profile(
         payload_alias: effective_rows::OCCURRENCE_ALIAS,
     };
     let overview = overview(conn, plan.clone())?;
-    let months = months(conn, plan.clone(), overview.compatible_usd.is_some())?;
+    let months = months(conn, plan.clone(), &overview.measures)?;
     let product_sections = vec![
         section(
             conn,

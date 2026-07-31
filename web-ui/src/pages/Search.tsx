@@ -77,6 +77,8 @@ export function SearchPage() {
   const drawerId = drawerRecord && /^\d+$/.test(drawerRecord) ? Number(drawerRecord) : null;
   const inputRef = useRef<HTMLInputElement>(null);
   const requestIdRef = useRef(0);
+  // Snapshot token from the last successful search, reused while paging.
+  const snapshotRef = useRef<number | null>(null);
 
   useEffect(() => {
     api
@@ -104,24 +106,36 @@ export function SearchPage() {
   }, [schema]);
 
   const runSearch = useCallback(
-    async (nextOffset: number, useSort: ResultSort | null, q: Query) => {
+    async (
+      nextOffset: number,
+      useSort: ResultSort | null,
+      q: Query,
+      reuseSnapshot = false,
+    ) => {
       const requestId = ++requestIdRef.current;
       setLoading(true);
       setError(null);
-      const [searchRes, countRes] = await Promise.allSettled([
-        api.search(q, LIMIT, nextOffset, useSort),
-        api.count(q),
-      ]);
+      // /api/search already returns the total and the snapshot token, so a
+      // second /api/count round trip would just repeat the most expensive part
+      // of the same query. Paging reuses the token, which also stops the row
+      // set from shifting under the user while an import is running.
+      const snapshot = reuseSnapshot ? (snapshotRef.current ?? undefined) : undefined;
+      const searchRes = await api
+        .search(q, LIMIT, nextOffset, useSort, snapshot)
+        .then((value) => ({ ok: true as const, value }))
+        .catch((reason: unknown) => ({ ok: false as const, reason }));
       if (requestId !== requestIdRef.current) return;
-      if (searchRes.status === "fulfilled") {
+      if (searchRes.ok) {
+        snapshotRef.current = searchRes.value.snapshot;
         setResults(searchRes.value);
+        setTotal(searchRes.value.total);
         setOffset(nextOffset);
         recordSearch(q);
       } else {
         setError((searchRes.reason as ApiError)?.message ?? t("search_failed"));
         setResults(null);
+        setTotal(null);
       }
-      setTotal(countRes.status === "fulfilled" ? countRes.value.total : null);
       setLoading(false);
       setSearched(true);
     },
@@ -400,7 +414,7 @@ export function SearchPage() {
               <button
                 className="icon-button"
                 disabled={offset === 0 || loading}
-                onClick={() => runSearch(Math.max(0, offset - LIMIT), sort, appliedQuery)}
+                onClick={() => runSearch(Math.max(0, offset - LIMIT), sort, appliedQuery, true)}
                 aria-label={t("search_previous_page")}
                 title={t("search_previous_page")}
               >
@@ -409,7 +423,7 @@ export function SearchPage() {
               <button
                 className="icon-button"
                 disabled={!results.has_next || loading}
-                onClick={() => runSearch(offset + LIMIT, sort, appliedQuery)}
+                onClick={() => runSearch(offset + LIMIT, sort, appliedQuery, true)}
                 aria-label={t("search_next_page")}
                 title={t("search_next_page")}
               >

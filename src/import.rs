@@ -192,16 +192,44 @@ fn cell_has_value(data: &Data) -> bool {
 
 /// File content hash, streamed without loading the whole file into memory.
 pub fn file_content_hash(path: &Path) -> Result<String, String> {
+    file_content_hash_with_progress(path, &mut |_, _| {})
+}
+
+/// Reporting interval for the hashing pass. Small enough that a large file
+/// visibly moves, large enough that the job store is not flooded with progress
+/// writes.
+const HASH_PROGRESS_STEP_BYTES: u64 = 16 * 1024 * 1024;
+
+/// As [`file_content_hash`], but reports `(bytes_hashed, total_bytes)` as it
+/// goes.
+///
+/// This pass reads the file end to end before any parsing starts. On a
+/// multi-gigabyte import it was the single longest stretch with no feedback at
+/// all, which is a large part of why the import is described as frozen rather
+/// than merely slow.
+fn file_content_hash_with_progress(
+    path: &Path,
+    progress: &mut dyn FnMut(u64, u64),
+) -> Result<String, String> {
     let mut file = std::fs::File::open(path).map_err(|e| e.to_string())?;
+    let total = file.metadata().map(|meta| meta.len()).unwrap_or(0);
     let mut hasher = Xxh3::new();
     let mut buf = vec![0u8; 1 << 20];
+    let mut hashed = 0u64;
+    let mut reported = 0u64;
     loop {
         let n = file.read(&mut buf).map_err(|e| e.to_string())?;
         if n == 0 {
             break;
         }
         hasher.update(&buf[..n]);
+        hashed += n as u64;
+        if hashed - reported >= HASH_PROGRESS_STEP_BYTES {
+            reported = hashed;
+            progress(hashed, total);
+        }
     }
+    progress(hashed, total);
     Ok(format!("{:032x}", hasher.digest128()))
 }
 
@@ -648,21 +676,58 @@ pub fn import_file_with_options(
     }
 
     // Whole-file deduplication: identical content is not parsed again.
-    let file_hash = match file_content_hash(path) {
-        Ok(content_hash) => {
-            let hash = import_fingerprint(&content_hash, options);
-            if let Some(previous) = db.find_import_by_hash(&hash) {
-                summary.skipped_duplicate_of = Some(previous);
-                summary.seconds = started.elapsed().as_secs_f64();
+    // A delimited file also learns its layout from this pass, so the import
+    // does not walk it a second time just to measure it.
+    let mut delimited_shape_hint: Option<DelimitedShape> = None;
+    let content_hash = if is_delimited_path(path) {
+        let scanned = detect_delimiter(path).and_then(|delimiter| {
+            delimited_hash_and_shape(path, delimiter, &mut |done, total| {
+                progress(ImportPhase::Reading, done, total)
+            })
+        });
+        match scanned {
+            Ok((hash, shape)) => {
+                delimited_shape_hint = Some(shape);
+                hash
+            }
+            Err(error) => {
+                summary.error = Some(error);
                 return summary;
             }
-            hash
         }
-        Err(e) => {
-            summary.error = Some(e);
-            return summary;
+    } else {
+        match file_content_hash_with_progress(path, &mut |done, total| {
+            progress(ImportPhase::Reading, done, total)
+        }) {
+            Ok(hash) => hash,
+            Err(error) => {
+                summary.error = Some(error);
+                return summary;
+            }
         }
     };
+    let file_hash = {
+        let hash = import_fingerprint(&content_hash, options);
+        if let Some(previous) = db.find_import_by_hash(&hash) {
+            summary.skipped_duplicate_of = Some(previous);
+            summary.seconds = started.elapsed().as_secs_f64();
+            return summary;
+        }
+        hash
+    };
+
+    // A first load into an empty database otherwise inserts every row into
+    // every read-side index individually. Building them once at the end, from
+    // sorted data, is far cheaper. Only an empty database qualifies: for an
+    // incremental import of a few thousand rows into an existing base,
+    // rebuilding whole indexes would be slower than maintaining them.
+    //
+    // Crash safety costs nothing here — `ensure_schema` recreates every index
+    // on the next open.
+    let bulk_load = db.total_rows() == 0;
+    if bulk_load && let Err(error) = db.drop_read_indexes() {
+        eprintln!("[base-search] could not prepare the database for a bulk import: {error}");
+    }
 
     let mut committed = false;
     match db.begin_import_file() {
@@ -673,6 +738,7 @@ pub fn import_file_with_options(
                 file_name: &file_name,
                 options,
                 import_fingerprint: &file_hash,
+                delimited_shape: delimited_shape_hint,
             },
             cancel,
             progress,
@@ -703,6 +769,13 @@ pub fn import_file_with_options(
             }
         },
         Err(e) => summary.error = Some(e.to_string()),
+    }
+    if bulk_load {
+        progress(ImportPhase::Indexing, 0, 0);
+        if let Err(error) = db.create_read_indexes() {
+            // Not fatal: the next open recreates them.
+            eprintln!("[base-search] rebuilding indexes after the bulk import failed: {error}");
+        }
     }
     if committed {
         progress(ImportPhase::Indexing, 0, 0);
@@ -863,7 +936,100 @@ fn detect_delimiter(path: &Path) -> Result<u8, String> {
     }
 }
 
-fn delimited_width(path: &Path, delimiter: u8) -> Result<usize, String> {
+/// What one pass over a delimited file learns about its layout.
+#[derive(Clone, Copy, Debug)]
+struct DelimitedShape {
+    delimiter: u8,
+    width: usize,
+    records: u64,
+}
+
+/// Feeds every byte it hands on into a hash, and reports how far it has read.
+struct HashingReader<'a, R> {
+    inner: R,
+    hasher: Xxh3,
+    hashed: u64,
+    reported: u64,
+    total: u64,
+    progress: &'a mut dyn FnMut(u64, u64),
+}
+
+impl<'a, R: Read> HashingReader<'a, R> {
+    fn new(inner: R, total: u64, progress: &'a mut dyn FnMut(u64, u64)) -> Self {
+        Self {
+            inner,
+            hasher: Xxh3::new(),
+            hashed: 0,
+            reported: 0,
+            total,
+            progress,
+        }
+    }
+
+    fn finish(self) -> String {
+        (self.progress)(self.hashed, self.total);
+        format!("{:032x}", self.hasher.digest128())
+    }
+}
+
+impl<R: Read> Read for HashingReader<'_, R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let read = self.inner.read(buf)?;
+        self.hasher.update(&buf[..read]);
+        self.hashed += read as u64;
+        if self.hashed - self.reported >= HASH_PROGRESS_STEP_BYTES {
+            self.reported = self.hashed;
+            (self.progress)(self.hashed, self.total);
+        }
+        Ok(read)
+    }
+}
+
+/// Content hash and layout of a delimited file, from a single physical read.
+///
+/// These used to be two separate passes on top of the import itself: the
+/// whole-file hash for deduplication, and a width scan whose result is the only
+/// source of `source_width` — the thing that preserves a column first seen well
+/// below the header. Hashing the bytes as the CSV parser consumes them folds
+/// the two into one, taking a delimited import from three full reads to two.
+fn delimited_hash_and_shape(
+    path: &Path,
+    delimiter: u8,
+    progress: &mut dyn FnMut(u64, u64),
+) -> Result<(String, DelimitedShape), String> {
+    let file = std::fs::File::open(path).map_err(|error| error.to_string())?;
+    let total = file.metadata().map(|meta| meta.len()).unwrap_or(0);
+    let mut reader = csv::ReaderBuilder::new()
+        .delimiter(delimiter)
+        .has_headers(false)
+        .flexible(true)
+        .from_reader(HashingReader::new(file, total, progress));
+    let mut width = 0usize;
+    let mut records = 0u64;
+    for record in reader.records() {
+        width = width.max(record.map_err(|error| error.to_string())?.len());
+        records += 1;
+        validate_sheet_width(width)?;
+    }
+    let hash = reader.into_inner().finish();
+    Ok((
+        hash,
+        DelimitedShape {
+            delimiter,
+            width,
+            records,
+        },
+    ))
+}
+
+/// Widest record in a delimited file, and how many records it holds.
+///
+/// The width is the only source of `source_width` for delimited files: a
+/// column that first appears far below the header is preserved because of it.
+/// The record count comes free from the same walk and makes the import
+/// progress determinate, instead of leaving the bar spinning for the whole
+/// load because the hint stayed at zero.
+fn delimited_shape(path: &Path, delimiter: u8) -> Result<(usize, u64), String> {
     let mut reader = csv::ReaderBuilder::new()
         .delimiter(delimiter)
         .has_headers(false)
@@ -871,11 +1037,13 @@ fn delimited_width(path: &Path, delimiter: u8) -> Result<usize, String> {
         .from_path(path)
         .map_err(|error| error.to_string())?;
     let mut width = 0;
+    let mut records = 0u64;
     for record in reader.records() {
         width = width.max(record.map_err(|error| error.to_string())?.len());
+        records += 1;
         validate_sheet_width(width)?;
     }
-    Ok(width)
+    Ok((width, records))
 }
 
 fn delimited_record_widths(sample: &[u8], delimiter: u8, limit: usize) -> Vec<usize> {
@@ -947,6 +1115,7 @@ struct DelimitedImportSpec<'a> {
     path: &'a Path,
     file_name: &'a str,
     import_fingerprint: &'a str,
+    shape: Option<DelimitedShape>,
     semantic_overrides: BTreeMap<usize, Option<SemanticField>>,
     fixed_values: BTreeMap<SemanticField, String>,
 }
@@ -962,11 +1131,27 @@ fn import_delimited_file_inner(
         path,
         file_name,
         import_fingerprint,
+        shape,
         semantic_overrides,
         fixed_values,
     } = spec;
-    let delimiter = detect_delimiter(path)?;
-    let source_width = delimited_width(path, delimiter)?;
+    // Measured already while the file was hashed for deduplication.
+    let DelimitedShape {
+        delimiter,
+        width: source_width,
+        records: record_count,
+    } = match shape {
+        Some(shape) => shape,
+        None => {
+            let delimiter = detect_delimiter(path)?;
+            let (width, records) = delimited_shape(path, delimiter)?;
+            DelimitedShape {
+                delimiter,
+                width,
+                records,
+            }
+        }
+    };
     let mut reader = csv::ReaderBuilder::new()
         .delimiter(delimiter)
         .has_headers(false)
@@ -981,7 +1166,9 @@ fn import_delimited_file_inner(
         cancel,
         progress,
         summary,
-        total_rows_hint: 0,
+        // One record is the header row, matching how the spreadsheet paths
+        // derive their hint from the sheet dimensions.
+        total_rows_hint: record_count.saturating_sub(1),
         source_width,
         source_cells_seen: 0,
         mapping: None,
@@ -1014,6 +1201,8 @@ struct FileImportSpec<'a> {
     file_name: &'a str,
     options: &'a ImportOptions,
     import_fingerprint: &'a str,
+    /// Layout already measured while hashing a delimited file.
+    delimited_shape: Option<DelimitedShape>,
 }
 
 fn import_file_inner(
@@ -1028,6 +1217,7 @@ fn import_file_inner(
         file_name,
         options,
         import_fingerprint,
+        delimited_shape: delimited_shape_hint,
     } = spec;
     if is_delimited_path(path) {
         if options
@@ -1063,6 +1253,7 @@ fn import_file_inner(
                 path,
                 file_name,
                 import_fingerprint,
+                shape: delimited_shape_hint,
                 semantic_overrides: semantics,
                 fixed_values,
             },
@@ -1071,9 +1262,12 @@ fn import_file_inner(
             summary,
         );
     }
-    let workbook = open_workbook_auto(path).map_err(|e| e.to_string())?;
+    // Opened once and reused for every sheet. Re-opening per sheet made the
+    // zip container and the whole shared-string table be inflated and parsed
+    // again for each one, which on a multi-sheet workbook cost as much as the
+    // import itself.
+    let mut workbook = open_workbook_auto(path).map_err(|e| e.to_string())?;
     let sheet_names = workbook.sheet_names().to_vec();
-    drop(workbook);
     if sheet_names.is_empty() {
         return Err("The workbook contains no sheets.".to_string());
     }
@@ -1121,7 +1315,6 @@ fn import_file_inner(
             ..Default::default()
         };
         let sheet_import = SheetImportSpec {
-            path,
             sheet_name: &sheet_name,
             source_name: &source_name,
             import_fingerprint,
@@ -1136,7 +1329,14 @@ fn import_file_inner(
                 .cloned()
                 .unwrap_or_default(),
         };
-        import_single_sheet_inner(db, sheet_import, cancel, progress, &mut sheet_summary)?;
+        import_single_sheet_inner(
+            db,
+            &mut workbook,
+            sheet_import,
+            cancel,
+            progress,
+            &mut sheet_summary,
+        )?;
         if !sheet_summary.quality.layout.is_empty() {
             merge_sheet_summary(summary, &sheet_summary);
             imported_sheets.push(sheet_name);
@@ -1190,7 +1390,6 @@ fn merge_sheet_summary(target: &mut FileSummary, sheet: &FileSummary) {
 }
 
 struct SheetImportSpec<'a> {
-    path: &'a Path,
     sheet_name: &'a str,
     source_name: &'a str,
     import_fingerprint: &'a str,
@@ -1200,20 +1399,19 @@ struct SheetImportSpec<'a> {
 
 fn import_single_sheet_inner(
     db: &mut Db,
+    workbook: &mut Sheets<std::io::BufReader<std::fs::File>>,
     spec: SheetImportSpec<'_>,
     cancel: &AtomicBool,
     progress: &mut dyn FnMut(ImportPhase, u64, u64),
     summary: &mut FileSummary,
 ) -> Result<(), String> {
     let SheetImportSpec {
-        path,
         sheet_name,
         source_name,
         import_fingerprint,
         semantic_overrides,
         fixed_values,
     } = spec;
-    let mut workbook = open_workbook_auto(path).map_err(|e| e.to_string())?;
     let sheet = workbook
         .sheet_names()
         .iter()
@@ -1245,7 +1443,7 @@ fn import_single_sheet_inner(
         source_id: None,
     };
 
-    match &mut workbook {
+    match workbook {
         Sheets::Xlsx(xlsx) => {
             let mut reader = xlsx
                 .worksheet_cells_reader(&sheet)
@@ -2048,5 +2246,40 @@ mod tests {
             .unwrap();
         assert_eq!(usd_ratio.value_per_weight, Some(50.0));
         assert_eq!(eur_ratio.value_per_weight, Some(200.0));
+    }
+    /// The single-pass delimited scan must produce byte-for-byte the same
+    /// content hash as the standalone hashing pass. The hash is the whole-file
+    /// deduplication key, so a change here would make every already-imported
+    /// CSV look like a new file.
+    #[test]
+    fn delimited_single_pass_hash_matches_the_standalone_hash() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("shape.csv");
+        let mut contents = String::from(
+            "Name,Value
+",
+        );
+        for index in 0..500 {
+            contents.push_str(&format!(
+                "row-{index},{index}
+"
+            ));
+        }
+        // A later row that is wider than the header, so the width really is
+        // discovered by this pass rather than by the header alone.
+        contents.push_str(
+            "wide,1,extra
+",
+        );
+        std::fs::write(&path, &contents).unwrap();
+
+        let standalone = super::file_content_hash(&path).unwrap();
+        let (single_pass, shape) =
+            super::delimited_hash_and_shape(&path, b',', &mut |_, _| {}).unwrap();
+
+        assert_eq!(single_pass, standalone, "deduplication keys must not shift");
+        assert_eq!(shape.width, 3, "the widest record sets the source width");
+        assert_eq!(shape.records, 502, "header plus 501 data rows");
+        assert_eq!(shape.delimiter, b',');
     }
 }

@@ -139,7 +139,15 @@ export const api = {
     limit: number,
     offset: number,
     sort?: ResultSort | null,
-  ) => postJson<SearchResponse>("/api/search", { query, limit, offset, sort }),
+    snapshot?: number,
+  ) =>
+    postJson<SearchResponse>("/api/search", {
+      query,
+      limit,
+      offset,
+      sort,
+      snapshot,
+    }),
 
   count: (query: Query) => postJson<CountResponse>("/api/count", { query }),
 
@@ -196,6 +204,25 @@ export const api = {
       engine,
     });
   },
+
+  /**
+   * All three Overview preview cards in one request. The server computes the
+   * shared currency and weight buckets once instead of once per card, and skips
+   * the overview counters and month series the cards never render.
+   */
+  analyticsPreviews: (
+    query: Query,
+    hsLevel: number,
+    limit: number,
+    engine: "auto" | "duckdb" | "sqlite" = "auto",
+  ) =>
+    postJson<AnalyticsEnvelope>("/api/analytics", {
+      query,
+      hs_level: hsLevel,
+      limit,
+      engine,
+      previews: true,
+    }),
 
   compare: (
     left: CompareSideRequest,
@@ -260,6 +287,12 @@ export const api = {
       string,
       Partial<Record<FixedSemanticField, string>>
     >,
+    /**
+     * Handle returned by a preview. When set, the server claims the file the
+     * preview already wrote instead of receiving the same bytes again, and
+     * `files` is not sent at all.
+     */
+    peekToken?: string,
   ) => {
     const form = new FormData();
     if (selectedSheets) {
@@ -274,8 +307,12 @@ export const api = {
     if (sheetFixedValues && Object.keys(sheetFixedValues).length > 0) {
       form.append("sheet_fixed_values", JSON.stringify(sheetFixedValues));
     }
-    for (const file of Array.from(files)) {
-      form.append("files", file, file.name);
+    if (peekToken) {
+      form.append("peek_token", peekToken);
+    } else {
+      for (const file of Array.from(files)) {
+        form.append("files", file, file.name);
+      }
     }
     return request<Job>("/api/imports", { method: "POST", body: form });
   },

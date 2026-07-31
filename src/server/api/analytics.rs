@@ -43,11 +43,19 @@ pub struct AnalyticsRequest {
     /// when it exists, is fresh, and the query is projection-compatible.
     #[serde(default = "default_engine")]
     engine: String,
+    /// When true, return the Overview tab preview cards: the leading section of
+    /// each scope, computed from one shared basis. `scope` and `full` are ignored.
+    #[serde(default)]
+    previews: bool,
     /// When true, compute every section at once (companies, goods, countries,
     /// and prices) for the Report view. Always answered by SQLite so the numbers
     /// are the trusted source of truth; `scope` is ignored.
     #[serde(default)]
     full: bool,
+    /// When true the caller reads only `*_sections` and the month series is
+    /// skipped, saving one whole aggregate scan per request.
+    #[serde(default)]
+    sections_only: bool,
 }
 
 /// Analytics plus the engine that produced it, so the UI can show whether the
@@ -88,6 +96,9 @@ pub async fn overview(
             limit: req.limit,
             engine: req.engine,
             full: false,
+            // This endpoint returns the overview and months and nothing else.
+            sections_only: false,
+            previews: false,
         },
     )
     .await
@@ -105,6 +116,9 @@ pub struct AnalyticsSectionRequest {
     limit: u64,
     #[serde(default = "default_engine")]
     engine: String,
+    /// Set by the Overview previews, which render only the section rows.
+    #[serde(default)]
+    sections_only: bool,
 }
 
 pub async fn section(
@@ -120,6 +134,8 @@ pub async fn section(
             limit: req.limit,
             engine: req.engine,
             full: false,
+            sections_only: req.sections_only,
+            previews: false,
         },
     )
     .await
@@ -179,6 +195,9 @@ pub async fn compare(
             limit: req.limit,
             engine: req.engine.clone(),
             full: false,
+            // Compare renders the headline totals, so it needs the months.
+            sections_only: false,
+            previews: false,
         },
     )
     .await?;
@@ -191,6 +210,8 @@ pub async fn compare(
             limit: req.limit,
             engine: req.engine,
             full: false,
+            sections_only: false,
+            previews: false,
         },
     )
     .await?;
@@ -237,11 +258,25 @@ async fn run_analytics(
         limit,
         engine,
         full,
+        sections_only,
+        previews,
     } = req;
     let _ = &engine; // read under the duckdb-olap feature only
     // Sections can be pulled in bulk for the "see all" tables, not just a top-N.
     let limit = limit.clamp(1, 1000);
     let (data, used) = blocking("analytics", move || {
+        // Overview preview cards: one shared basis instead of three scoped
+        // requests that each recomputed it and discarded most of their work.
+        if previews {
+            let db = state.open_read()?;
+            let analytics = db
+                .with_statement_deadline(DB_STATEMENT_TIMEOUT, |db| {
+                    db.analytics_previews(&query, limit, hs_level)
+                        .map_err(|err| err.to_string())
+                })
+                .map_err(|err| ApiError::from_db("analytics", err))?;
+            return Ok((analytics, "sqlite"));
+        }
         // Report view: every section at once, always on SQLite (trusted totals).
         if full {
             let db = state.open_read()?;
@@ -270,8 +305,15 @@ async fn run_analytics(
         let db = state.open_read()?;
         let analytics = db
             .with_statement_deadline(DB_STATEMENT_TIMEOUT, |db| {
-                db.analytics_scoped(&query, limit, scope, hs_level)
-                    .map_err(|err| err.to_string())
+                match (sections_only, scope) {
+                    // The caller reads only the section rows, so the month
+                    // series would be a full aggregate scan it discards.
+                    (true, Some(scope)) => {
+                        db.analytics_sections_only(&query, limit, scope, hs_level)
+                    }
+                    _ => db.analytics_scoped(&query, limit, scope, hs_level),
+                }
+                .map_err(|err| err.to_string())
             })
             .map_err(|err| ApiError::from_db("analytics", err))?;
         Ok((analytics, "sqlite"))

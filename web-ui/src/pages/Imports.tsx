@@ -116,16 +116,27 @@ export function ImportsPage() {
     sheetSemantics?: Record<string, Record<number, SemanticField | null>>,
     sheetProfiles?: Record<string, number>,
     sheetFixedValues?: Record<string, FixedValueOverrides>,
+    peekToken?: string,
   ) => {
     if (!files || Array.from(files).length === 0) return;
-    try {
-      await api.uploadImport(
+    const send = (token?: string) =>
+      api.uploadImport(
         files,
         selectedSheets,
         sheetSemantics,
         sheetProfiles,
         sheetFixedValues,
+        token,
       );
+    try {
+      try {
+        await send(peekToken);
+      } catch (err) {
+        // The retained preview was swept or the server restarted: fall back to
+        // sending the bytes. Any other failure is a real error.
+        if (!peekToken || (err as ApiError)?.code !== "preview_expired") throw err;
+        await send(undefined);
+      }
       toast(t("imports_started"), "info");
       setPeek(null);
       setBatchFiles([]);
@@ -379,6 +390,9 @@ export function ImportsPage() {
       peek.semanticOverrides,
       sheetProfiles,
       sheetFixedValues,
+      // The preview already put this exact file on the server; claim it rather
+      // than uploading every byte a second time.
+      peek.data.token,
     );
   };
 

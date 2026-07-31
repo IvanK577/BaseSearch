@@ -7,8 +7,8 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::db::{Db, Query, ResultSort};
-use crate::search::FieldInfo;
+use crate::db::{Db, Query, ResultSort, parse_number};
+use crate::search::{FieldInfo, FieldKind};
 
 /// Excel worksheet row limit minus the header row.
 pub const XLSX_MAX_ROWS: u64 = 1_048_575;
@@ -281,12 +281,38 @@ fn export_csv(
     Ok(written)
 }
 
+/// True when the value is nothing but a number, sign included.
+///
+/// [`parse_number`] deliberately tolerates units, so "1 200,75 USD" is a number
+/// to it — and so is the "1" inside "@SUM(A1)". The formula guard needs the
+/// stricter question, and answers "not a number" whenever anything unexpected
+/// appears, so an odd value is quoted rather than let through.
+fn is_plain_number(value: &str) -> bool {
+    let trimmed = value.trim();
+    let body = trimmed.strip_prefix(['+', '-']).unwrap_or(trimmed);
+    if body.is_empty() {
+        return false;
+    }
+    let numeric_only = body.chars().all(|ch| {
+        ch.is_ascii_digit()
+            || matches!(
+                ch,
+                '.' | ',' | ' ' | '\u{00A0}' | '\u{202F}' | '\u{2009}' | '\'' | '\u{2019}'
+            )
+    });
+    numeric_only && parse_number(trimmed).is_some()
+}
+
 pub fn csv_safe_cell(value: &str) -> Cow<'_, str> {
     let trimmed = value.trim_start_matches([' ', '\t', '\r', '\n']);
     if trimmed
         .as_bytes()
         .first()
         .is_some_and(|byte| matches!(*byte, b'=' | b'+' | b'-' | b'@'))
+        // A plain negative number is not a formula. Quoting it made the value
+        // unreadable when the file was imported back, silently dropping every
+        // negative figure in columns such as "Вага різн." and "Різн.мін.база".
+        && !is_plain_number(trimmed)
     {
         Cow::Owned(format!("'{value}"))
     } else {
@@ -339,10 +365,25 @@ fn export_xlsx(
                 }
                 let output_row = written + 1;
                 for (col, value) in row.iter().enumerate() {
-                    if !value.is_empty()
-                        && let Err(err) =
-                            worksheet.write_string(output_row as u32, col as u16, value)
-                    {
+                    if value.is_empty() {
+                        continue;
+                    }
+                    // Measures must reach Excel as numbers, or SUM() over the
+                    // column returns zero and sorting is lexicographic. Codes
+                    // stay text on purpose: a UKTZED code written as a number
+                    // loses its leading zeros and turns into 8.51713E+09.
+                    let numeric = context
+                        .fields
+                        .get(col)
+                        .filter(|field| matches!(field.kind, FieldKind::Number | FieldKind::Year))
+                        .and_then(|_| parse_number(value));
+                    let outcome = match numeric {
+                        Some(number) => {
+                            worksheet.write_number(output_row as u32, col as u16, number)
+                        }
+                        None => worksheet.write_string(output_row as u32, col as u16, value),
+                    };
+                    if let Err(err) = outcome {
                         failure = Some(ExportError::Other(err.to_string()));
                         return false;
                     }

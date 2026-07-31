@@ -65,6 +65,9 @@ const profileCollection: SourceMappingProfileCollection = {
 };
 
 const peek: WorkbookPeek = {
+  // The preview already uploaded the file; the import claims it by token
+  // instead of sending the same bytes again.
+  token: "peek-1234-5678-registry.xlsx",
   sheets: [
     {
       name: "Data",
@@ -173,6 +176,7 @@ describe("ImportsPage source mapping profiles", () => {
       { Data: { 0: "Description" } },
       { Data: 7 },
       { Data: { Currency: "EUR", WeightUnit: "kg" } },
+      "peek-1234-5678-registry.xlsx",
     );
   });
 

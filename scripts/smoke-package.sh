@@ -47,6 +47,16 @@ if [[ "$platform" == macos ]]; then
   fi
 fi
 
+# A plain `cargo build --release` binary is indistinguishable on disk from one
+# built with the documented release-package feature set, but it ships without
+# the DuckDB analytics engine. Ask the binary itself rather than assume.
+build_summary="$("$cli" version)"
+echo "$build_summary"
+if [[ "$build_summary" != *'release-package: yes'* ]]; then
+  echo "Packaged binary was not built with the release-package feature set: $build_summary" >&2
+  exit 1
+fi
+
 port="$(node -e 'const net=require("node:net"); const s=net.createServer(); s.listen(0,"127.0.0.1",()=>{process.stdout.write(String(s.address().port)); s.close();});')"
 temp_root="$(mktemp -d "${TMPDIR:-/tmp}/base-search-package-smoke.XXXXXX")"
 database_path="$temp_root/smoke.db"
