@@ -24,8 +24,11 @@ pub fn features() -> Vec<&'static str> {
 /// package is required to ship, i.e. the `release-package` feature in
 /// `Cargo.toml`. The packaging smoke tests assert this so a binary built the
 /// wrong way cannot be shipped unnoticed.
+///
+/// `duckdb-olap` is not part of that set — see the comment on `release-package`
+/// in `Cargo.toml` — so it is reported in [`features`] but not required here.
 pub fn is_release_package_build() -> bool {
-    cfg!(feature = "browser") && cfg!(feature = "duckdb-olap")
+    cfg!(feature = "browser")
 }
 
 /// One-line summary used by `base-search-cli version` and the smoke tests.
@@ -68,10 +71,7 @@ mod tests {
     }
 
     #[test]
-    fn release_package_requires_both_browser_and_duckdb() {
-        assert_eq!(
-            is_release_package_build(),
-            features().contains(&"browser") && features().contains(&"duckdb-olap")
-        );
+    fn release_package_requires_the_browser_workspace() {
+        assert_eq!(is_release_package_build(), features().contains(&"browser"));
     }
 }

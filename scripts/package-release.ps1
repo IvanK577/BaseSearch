@@ -241,7 +241,7 @@ if (-not (Test-Path -LiteralPath (Join-Path $repoRoot 'web-ui\dist\index.html'))
     throw 'Frontend build did not create web-ui\dist\index.html.'
 }
 
-Invoke-Step 'Building locked production binaries with browser and DuckDB OLAP' {
+Invoke-Step 'Building locked production binaries with the browser workspace' {
     cargo build --locked --release --no-default-features --features release-package --bin BaseSearch --bin base-search-cli
 }
 

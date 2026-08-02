@@ -1,6 +1,6 @@
 [package]
 name = "base-search"
-version = "2.0.2"
+version = "2.1.0"
 edition = "2024"
 description = "Local search over large Excel databases"
 license = "MIT"
@@ -13,9 +13,18 @@ path = "src/lib.rs"
 default = ["browser"]
 duckdb-olap = ["dep:duckdb"]
 # Exact feature contract used by every production package. Keeping this as a
-# named feature prevents CI and platform scripts from silently shipping a
-# browser build without the DuckDB analytics engine.
-release-package = ["browser", "duckdb-olap", "eframe/wgpu"]
+# named feature stops CI and the platform scripts from quietly shipping
+# something other than the tested set.
+#
+# `duckdb-olap` is deliberately NOT part of it. The projection it maintains only
+# answers analytics queries that carry no free text, and it goes stale the
+# moment anything is imported — nothing rebuilds it except an admin action — so
+# in practice it stopped answering after the first import. Shipping a second
+# engine that has never run in front of users, and that has to agree with the
+# SQLite path on every number, is risk without a benefit anyone asked for. The
+# feature still builds and its parity tests still run; enable it again once the
+# projection is rebuilt automatically after an import.
+release-package = ["browser", "eframe/wgpu"]
 # Local browser workspace: an Axum server on 127.0.0.1 that serves the
 # embedded React UI and the /api endpoints on top of the same core.
 browser = [

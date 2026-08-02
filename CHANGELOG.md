@@ -2,6 +2,62 @@
 
 All notable changes to Base Search are documented in this file.
 
+## 2.1.0 - 2026-08-02
+
+A correctness and speed release driven by two standing reports: that importing
+is very slow, and that search and analytics do not show all the data.
+
+### Fixed
+
+- Money, weight, and value per kilogram now appear in every analytics table.
+  The totals were being computed and then dropped on the way to the browser, so
+  all nine ranking sections, the monthly table, Compare, the report preview, and
+  the company dossier showed an em dash while the overview card showed numbers.
+- The importer is no longer lost when a file names its recipients twice. Two
+  columns that both mean "recipient" used to cancel each other out, which left
+  the "Recipients / importers" section empty and the company dossier without a
+  name while the EDRPOU section kept working.
+- The Overview company card now previews importers by name instead of listing
+  registration codes.
+- Search finds a row by its EDRPOU code, contract number, delivery place,
+  customs office, or ZED purpose. Those columns were absent from the index, and
+  an eight-digit company code was additionally being read as a product code.
+- A value column written as "1200.75 USD" or "1.234,56" is recognized at import.
+  Detection judged numbers with its own parser, stricter than the one the query
+  engine uses, and refused the column outright.
+- Monthly dynamics covers the whole archive rather than the last four years.
+- Excel exports carry numbers as numbers, so SUM() works; product codes stay
+  text so leading zeros survive; negative values are no longer quoted into
+  unreadable text in CSV.
+- The desktop export writes the columns shown on screen, and its file dialog
+  offers every format the importer accepts.
+- Analytics no longer shows the previous query's numbers when a request fails.
+- The desktop window no longer freezes when the help window is open during an
+  import, and a failed background task releases the toolbar instead of leaving
+  it disabled until restart.
+
+### Changed
+
+- A first import into an empty database builds its indexes once at the end
+  instead of maintaining them row by row, and five indexes no query ever read
+  were removed.
+- A workbook is opened once per file rather than once per sheet, a delimited
+  file is hashed as it is parsed, and a previewed file is no longer uploaded a
+  second time to import it.
+- Import progress reports the file hashing phase and knows how many rows a
+  delimited file holds, so the bar is no longer stuck at an unknown total.
+- Analytics computes its overview and month series once per request instead of
+  once per scope, the Overview preview cards arrive in one request, and search
+  no longer runs a second count or scans the table on every page.
+- Saved column mappings are applied to a multi-file import by matching each
+  sheet's column signature.
+- `base-search-cli version` reports the features the binary was built with, and
+  the packaging smoke tests refuse a binary that was not built as a release.
+- The DuckDB analytics projection is no longer part of the shipped feature set.
+  It only answered queries without free text and went stale on the first import,
+  with nothing to rebuild it automatically. The feature and its parity tests
+  remain in the source.
+
 ## 2.0.2 - 2026-07-24
 
 A large analytics quality release: every Analyze tab gained genuinely useful,

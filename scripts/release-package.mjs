@@ -297,7 +297,7 @@ function writeManifest(args) {
     arch: required(args, "arch"),
     git_sha: required(args, "git-sha"),
     source_date_epoch: epoch,
-    features: ["browser", "duckdb-olap"],
+    features: ["browser"],
     launcher_default: "browser",
     legacy_desktop_fallback: true,
     data_policy: {
@@ -330,8 +330,10 @@ function verifyManifest(args) {
   }
   const manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
   if (manifest.platform !== platform) fail("Manifest platform does not match package");
-  if (!Array.isArray(manifest.features) || !manifest.features.includes("browser") || !manifest.features.includes("duckdb-olap")) {
-    fail("Manifest does not declare browser + duckdb-olap");
+  // duckdb-olap is intentionally not shipped; see the release-package comment
+  // in Cargo.toml. The browser workspace is the contract.
+  if (!Array.isArray(manifest.features) || !manifest.features.includes("browser")) {
+    fail("Manifest does not declare the browser workspace");
   }
   if (manifest.launcher_default !== "browser" || manifest.legacy_desktop_fallback !== true) {
     fail("Manifest launcher contract is invalid");
