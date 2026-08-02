@@ -1,4 +1,4 @@
-# Base Search 2.0.2
+# Base Search 2.1.0
 
 [![CI](https://github.com/IvanK577/BaseSearch/actions/workflows/ci.yml/badge.svg)](https://github.com/IvanK577/BaseSearch/actions/workflows/ci.yml)
 
@@ -13,8 +13,8 @@ default and needs no account. Trusted LAN mode is optional for a small team on
 the same trusted network.
 
 The Personal workspace is the recommended path for everyday use. Trusted LAN,
-DuckDB OLAP, the command-line tool, and the legacy desktop workspace are
-advanced or optional parts of the product.
+the command-line tool, and the legacy desktop workspace are advanced or
+optional parts of the product.
 
 ## Start Here
 
@@ -40,9 +40,9 @@ local URL, startup progress, and any startup error. Run only one copy of
 `BaseSearch.exe` at a time: a second launcher cannot share the port of the
 first one, so close the previous window before starting again.
 
-The in-repository binaries include the SQLite + FTS5 engine; the optional
-DuckDB OLAP engine is part of packaged releases and of source builds made with
-the `release-package` feature set.
+Every binary, in this repository and in packaged releases alike, runs on the
+SQLite + FTS5 engine. The optional DuckDB OLAP projection is not shipped; it is
+built only from source with the `duckdb-olap` feature.
 
 ### Windows release package (when published)
 
@@ -156,15 +156,18 @@ internal placeholder. Weight units are normalized only when the unit is known.
 Price-risk results are signals for review, not legal, accounting, or valuation
 advice.
 
-Production packages include two local engines:
+Production packages ship one local engine:
 
-- **SQLite + FTS5** is the source of truth and the text-search engine.
-- **DuckDB OLAP** is an optional analytical projection for broad grouping,
-  pivots, comparisons, and rollups. It is built only when requested. Base
-  Search uses it only while the projection is current and agrees with the
-  SQLite data; otherwise analytics safely fall back to SQLite.
+- **SQLite + FTS5** is the source of truth, the text-search engine, and the
+  engine every number you see is computed by.
 
-You do not need DuckDB to import, search, analyze, or export data.
+A second engine exists in the source: **DuckDB OLAP**, an analytical projection
+for broad grouping, pivots, comparisons, and rollups. It is not part of a
+release. It answers only queries that carry no free text, and its projection
+goes stale as soon as anything is imported, with nothing rebuilding it
+automatically — so it stopped helping almost immediately while adding a second
+engine that has to agree with SQLite on every number. Build it from source with
+the `duckdb-olap` feature if you want to experiment with it.
 
 ## Export
 
@@ -227,7 +230,8 @@ Related files and folders can include:
 
 - `base_search.db-wal` and `base_search.db-shm`: normal SQLite working files
 - `base_search.auth.db`: LAN accounts and sessions
-- `base_search.duckdb`: optional DuckDB analytical projection
+- `base_search.duckdb`: DuckDB analytical projection, only if you built one
+  from a source build with the `duckdb-olap` feature
 - `uploads/` and `exports/`: temporary job input and output
 - `base_search.db.pre-upgrade-...bak`: verified backup retained after a
   structure-changing database upgrade
@@ -288,8 +292,8 @@ the destructive step and leaves the original database unchanged.
   analysis.
 - Map date, company, product, country, value, currency, weight, and unit fields
   under **Data > Columns** where appropriate.
-- Build or refresh DuckDB from Analytics only when faster broad aggregation is
-  useful. SQLite remains a valid fallback.
+- A first import into an empty database is the fastest way to load a large
+  file: the read-side indexes are built once at the end instead of row by row.
 
 ### An update opens an empty workspace
 
@@ -338,7 +342,7 @@ base-search-cli browser <db> [--host 127.0.0.1] [--port 7833] [--no-open]
 base-search-cli user-add <db> <username> --role owner
 base-search-cli user-list <db>
 base-search-cli user-remove <db> <username>
-base-search-cli olap-build <db> [projection.duckdb]
+base-search-cli version
 base-search-cli benchmark <db> [query...] [--repeat N] [--json]
 ```
 
@@ -407,7 +411,7 @@ in `.github/workflows/ci.yml`.
 - React 19, TypeScript, and Vite browser workspace
 - SQLite as the local source of truth
 - SQLite FTS5 for full-text search
-- optional DuckDB projection for OLAP workloads
+- optional DuckDB projection for OLAP workloads, not part of released builds
 - eframe/egui launcher and explicit legacy desktop fallback
 - Calamine, the Rust CSV reader, and streaming XLSX/XLSB paths for input
 - CSV and XLSX writers for export
