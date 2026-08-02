@@ -99,12 +99,14 @@ fi
 
 curl --fail --silent --max-time 10 "http://127.0.0.1:$port/" | grep -q '<div id="root"'
 curl --fail --silent --max-time 30 "http://127.0.0.1:$port/api/v2/engines" | \
-  node -e 'let t=""; process.stdin.on("data",c=>t+=c); process.stdin.on("end",()=>{const v=JSON.parse(t); if(v.duckdb_available!==true){console.error("DuckDB capability is absent");process.exit(1);}});'
+  node -e 'let t=""; process.stdin.on("data",c=>t+=c); process.stdin.on("end",()=>{const v=JSON.parse(t); if(typeof v.db_rows!=="number"){console.error("engines endpoint did not report database status");process.exit(1);}});'
 
 kill "$server_pid"
 wait "$server_pid" || true
 server_pid=''
 
 "$cli" stats "$database_path"
-"$cli" olap-build "$database_path"
+# A released binary ships without duckdb-olap, so `olap-build` is absent by
+# design. Exercise the query path with a command every build has.
+"$cli" search "$database_path" --limit 1 --no-print-rows
 echo "Package smoke passed: $package_dir"
