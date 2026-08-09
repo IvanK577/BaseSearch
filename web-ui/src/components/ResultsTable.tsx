@@ -135,7 +135,7 @@ export function ResultsTable({
                     <span className="row" style={{ gap: 5 }}>
                       {c.field.label}
                       {active ? (
-                        <span style={{ color: "var(--flame-orange)" }}>
+                        <span style={{ color: "var(--text-dim)" }}>
                           {sort?.descending ? "▼" : "▲"}
                         </span>
                       ) : null}

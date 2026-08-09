@@ -1,45 +1,413 @@
+/* ============================================================================
+   BaseSearch design tokens — the single source of every repeated value.
+
+   RULE: a value that appears twice belongs here; a value that lives here is
+   never re-typed at a call site.
+
+   Baseline this file replaces: 40 hard-coded radius literals, 23 spacing values
+   across 242 declarations, 10 font sizes, 6 font weights, 15 gap values, 13
+   durations and exactly one easing keyword — against a token file whose
+   --radius had one consumer, whose --radius-sm had one, and whose --flame had
+   none.
+
+   Scales are named by INTENT, not by ordinal, so that choosing one is a
+   decision rather than a guess.
+   ============================================================================ */
+
 :root {
-  color-scheme: dark;
-  --flame-red: #df4b32;
-  --flame-orange: #ed6a32;
-  --flame-amber: #d99a3a;
-  --flame: #ed6a32;
-  --flame-soft: rgba(237, 106, 50, 0.1);
+  color-scheme: light;
+
+  /* ── Fire ramp ─────────────────────────────────────────────────────────────
+     The brand, rationed to three tiers. When orange means the focus ring AND
+     the active tab AND a duplicate row AND a running job, it means none of
+     them.
+
+       TIER 1  chrome, FILL or RULE only, exactly four places:
+               .btn-primary fill, .nav-item.active rail, .tab.active underline,
+               the focus ring.
+       TIER 2  data ink, THE ONE DATUM only: chart peak, rank-1 share bar,
+               price median, lead stat card. Never a field of 500 bars.
+       TIER 3  semantic — warning / danger / success keep their own hue and
+               fire is not invited.
+     -------------------------------------------------------------------- */
+  --flame-300: #f4a27a;
+  --flame-400: #f0834f;
+  --flame-500: #ed6a32;   /* THE brand mark. Fill and rule. Never body text. */
+  --flame-600: #df4b32;
+  --flame-700: #c23700;   /* dark enough to be text on white: 5.5:1          */
+  --amber-400: #e0b166;
+  --amber-500: #d99a3a;
+
+  /* ── The five-band ─────────────────────────────────────────────────────────
+     The reference's signature: a five-step yellow→red band, full saturation,
+     drawn as a 3-5px rule at the top and bottom of the sheet. It works there
+     for a reason worth stating, because it decides where else these values may
+     appear: the band is a RULE, so its area is a few hundred pixels. The same
+     #FFD400 used as a card hover fill — which the reference also does — covers
+     a hundred thousand pixels, and the reference can afford that because a
+     visitor sees it for ninety seconds. This app is read for six hours.
+
+     So the split is by AREA, not by taste: full saturation is allowed in the
+     band and in marks under ~10px; large fields keep the muted ramp above.
+     -------------------------------------------------------------------- */
+  --band-1: #ffd400;
+  --band-2: #ffaf00;
+  --band-3: #ff8205;
+  --band-4: #fa500f;
+  --band-5: #e10500;
+  --band: linear-gradient(
+    90deg,
+    var(--band-1) 0 20%, var(--band-2) 20% 40%, var(--band-3) 40% 60%,
+    var(--band-4) 60% 80%, var(--band-5) 80% 100%
+  );
+  --band-h: 3px;
+
+  /* Primary fill. The old plate measured 3.02:1 at the light end of its
+     gradient, where the label starts — a straight AA failure on the app's most
+     pressed control, and the single brightest object on a screen someone
+     watches for six hours. This plate runs 4.52:1 to 5.57:1 and still reads
+     unmistakably as fire. Hover moves ONE step lighter; press moves down. */
+  --fill-brand: linear-gradient(135deg, #c64d1c, #b73a20);
+  --fill-brand-hover: linear-gradient(135deg, #d4571f, #c54126);
+  --fill-brand-border: #a83a1a;
+  --on-accent: #fffaf7;
+
+  /* ── Semantic foregrounds ──────────────────────────────────────────────────
+     No bare hex outside this file. Eight foregrounds tuned for dark currently
+     apply unchanged in light, where the error banner text measures 2.06:1 and
+     every grid link 3.13:1. Those are correctness bugs, not taste. Every value
+     below is measured against the surface it actually lands on.
+     -------------------------------------------------------------------- */
+  --flame-text: #c23700;    /*  5.5:1 on white                               */
+  --danger: #df4b32;        /*  rails, borders, dots                         */
+  --danger-text: #b3170a;   /*  6.9:1 on white                               */
+  --warning: #d99a3a;
+  --warning-text: #8a5a0a;  /*  5.9:1 on white                               */
   --success: #55a879;
-  --danger: #df4b32;
-  --bg: #090a0c;
-  --bg-2: #0e1013;
-  --sidebar: #0c0e11;
-  --panel: #111318;
-  --panel-solid: #14171c;
-  --panel-2: #191c22;
-  --border: #252930;
-  --border-strong: #383d46;
-  --text: #eceae7;
-  --text-dim: #b5b5b2;
-  --text-faint: #7f8389;
-  --shadow: 0 12px 32px rgba(0, 0, 0, 0.28);
-  --focus: 0 0 0 2px var(--bg), 0 0 0 4px rgba(237, 106, 50, 0.82);
-  --radius: 6px;
-  --radius-sm: 5px;
+  --success-text: #1f7a52;  /*  5.3:1 on white                               */
+
+  /* Neutral data ink: the fill for every bar that is NOT the one datum.
+     3.4:1 on the --panel-2 track — clears the 3:1 floor for graphics. */
+  --data-mark: #8b8680;
+  --data-mark-hover: #6f6a64;
+
+  /* ── Surfaces — warm-neutral ───────────────────────────────────────────────
+     The reference paper is #FBFBF6 — an off-white that is very slightly GREEN,
+     not warm. Worth copying deliberately: against a yellow-to-red ramp a warm
+     paper drifts toward the brand and the two blend, while a fractionally cool
+     paper holds the fire off the ground and makes the same orange read hotter
+     without touching it. --panel-solid stays pure #ffffff so the table body,
+     popovers, the drawer and toasts keep a real elevation step above the sheet.
+     -------------------------------------------------------------------- */
+  --bg: #f4f4ef;
+  --bg-2: #eeeee8;          /* recessed: topbar, segmented track              */
+  --sidebar: #fbfbf6;
+  --panel: #fbfbf6;         /* the reference paper                           */
+  --panel-solid: #ffffff;   /* raised: table body, popover, drawer, toast     */
+  --panel-2: #f0f0ea;       /* tint: chips, .btn rest, month totals           */
+
+  /* ── Borders as alpha ──────────────────────────────────────────────────────
+     Expressed as alpha over the foreground triple, not as hex. A panel nested
+     in a panel gets a stronger hairline for free, the light theme falls out by
+     flipping one triple, and a hairline can no longer carry a colour cast of
+     its own the way the blue-dominant #252930 did.
+
+     Three levels, not two. The reference draws with exactly two weights —
+     `1px solid #101014` for a division that separates one REGION from another,
+     and `rgba(16,16,20,0.14)` for divisions inside a region — and never mixes
+     them up. That discipline is what makes its grid read as drawn rather than
+     as accidental. Adding the structural level lets a panel edge, a toolbar
+     underline and the sidebar rule be visibly heavier than the hairline between
+     two cells inside them.
+     -------------------------------------------------------------------- */
+  --tint-fg: 16, 16, 20;
+  --border: rgba(var(--tint-fg), 0.14);
+  --border-strong: rgba(var(--tint-fg), 0.28);
+  --border-structural: rgba(var(--tint-fg), 0.55);
+  --border-row: rgba(var(--tint-fg), 0.08);
+  --border-sidebar: rgba(var(--tint-fg), 0.08);
+
+  /* ── Text and icon ramps ───────────────────────────────────────────────────
+     Four text levels plus a separate icon ramp one step lighter, because a
+     glyph's strokes read heavier than letterforms at the same value.
+     -------------------------------------------------------------------- */
+  --text: #101014;          /* 18.9:1 on --panel — the reference ink         */
+  --text-dim: #3a3a42;      /* 10.5:1 on --panel                             */
+  --text-faint: #5a5a64;    /*  6.4:1 on --panel, 5.7:1 on --panel-2         */
+  --text-hint: rgba(var(--tint-fg), 0.45);
+  --icon-faint: #71717c;
+
+  /* ── Interaction state tints ───────────────────────────────────────────────
+     Arithmetic, not invented per element: hover moves one step away from the
+     surface, press moves one step past resting in the opposite direction.
+     -------------------------------------------------------------------- */
+  --state-ghost-hover: rgba(var(--tint-fg), 0.05);
+  --state-ghost-press: rgba(var(--tint-fg), 0.09);
+  --state-soft: rgba(var(--tint-fg), 0.06);
+  --state-soft-hover: rgba(var(--tint-fg), 0.09);
+  --row-open: rgba(var(--tint-fg), 0.10);
+  --flame-soft: rgba(202, 75, 31, 0.08);
+
+  /* Text selection happens on every drag in a half-million-row grid. A hot
+     orange flash on each one is exhausting; the tint is enough. */
+  --selection: rgba(var(--tint-fg), 0.14);
+
+  /* ── Elevation — tight blur, low alpha ─────────────────────────────────────
+     The old single shadow was 0 12px 32px rgba(0,0,0,0.28), applied identically
+     to a stat card lifting 1px and to a context menu floating above the whole
+     app. Both read as glow, neither as height.
+
+     The reference uses zero blur: `8px 8px 0`. A blurred shadow simulates a
+     light source, and a light source implies a soft, curved object — which is
+     the opposite of what everything else in this grammar says. A hard offset
+     says the surface is a flat sheet laid on another flat sheet, which is
+     exactly what a popover over a table is. Halved from the reference's 8px
+     because 8px of solid ink beside a 34px control is a third of its height.
+     -------------------------------------------------------------------- */
+  --shadow-ink: rgba(var(--tint-fg), 0.18);
+  --shadow-sm: 2px 2px 0 var(--shadow-ink);
+  --shadow: 3px 3px 0 var(--shadow-ink);
+  --shadow-lg: 4px 4px 0 var(--shadow-ink);
+  --shadow-drawer: -4px 0 0 var(--shadow-ink);
+  --shadow-sidebar: 4px 0 0 var(--shadow-ink);
+
+  /* The backdrop was hard-coded with no light variant, so opening the record
+     drawer in light mode dropped a 62% near-black sheet over a white page. */
+  --scrim: rgba(16, 16, 20, 0.34);
+
+  /* ── Focus ────────────────────────────────────────────────────────────────
+     outline, not box-shadow. The old ring painted its inner 2px spacer in
+     var(--bg), so every focused control sitting on --panel, --panel-solid,
+     --sidebar or --bg-2 drew a dark halo of the wrong colour around itself.
+     outline-offset leaves that gap transparent, so the ring is correct on every
+     surface without knowing what it is sitting on.
+
+     Fire is kept here deliberately: once the chrome roles above are rationed,
+     the ring becomes the only orange a keyboard user ever sees, which is
+     exactly what a "where am I" marker should be.
+     -------------------------------------------------------------------- */
+  --focus-ring: 2px;
+  --focus-offset: 2px;
+  --focus-color: rgba(202, 75, 31, 0.85);
+
+  /* ── Type ─────────────────────────────────────────────────────────────────
+     Size and line-height ship as pairs so no call site ever multiplies. The
+     FLOOR rises from 9px to 11px: nine declarations sit at 9-10px today and all
+     nine are read, not decorated. Cyrillic at 9px in --text-faint is decoded,
+     not read, and it recurs on every screen.
+
+     The grid deliberately stays at 12px. table.grid is width: max-content
+     across 42 columns; +8% glyph is +8% width on a table that already scrolls.
+     -------------------------------------------------------------------- */
+  /* Two families, and the second one carries most of the reference's character.
+     Every eyebrow, meta line, tab label, column header and numeric readout in
+     the reference is monospace, uppercase, tracked wide — against a display
+     sans used only for headings and body. That pairing is doing more work than
+     any colour in the file: it marks the difference between LABEL and CONTENT
+     without a rule, a weight change or a tint.
+
+     The reference loads Space Grotesk and IBM Plex Mono from Google Fonts. This
+     app serves itself from 127.0.0.1 with the assets baked into the binary and
+     is expected to run air-gapped, so a CDN link would simply fail to a
+     fallback on the machines that matter. These are the stacks that resolve on
+     a stock Windows install; say the word and I will vendor the real pair as
+     woff2 (~140 KB) so it matches exactly. */
+  --font-ui: "Segoe UI Variable Text", "Aptos", "Segoe UI", system-ui, sans-serif;
+  --font-display: "Segoe UI Variable Display", "Aptos Display", "Segoe UI", system-ui, sans-serif;
+  --font-mono: "Cascadia Mono", "Consolas", ui-monospace, "SFMono-Regular", monospace;
+
+  --text-2xs: 11px;  --text-2xs-lh: 15px;
+  --text-xs: 12px;   --text-xs-lh: 16px;
+  --text-sm: 13px;   --text-sm-lh: 18px;
+  --text-md: 14px;   --text-md-lh: 20px;
+  --text-lg: 16px;   --text-lg-lh: 22px;
+  --text-xl: 20px;   --text-xl-lh: 26px;
+  --text-2xl: 24px;  --text-2xl-lh: 30px;
+
+  /* Three weights, and 500 is deliberately ABSENT. Segoe UI on the target
+     machine ships 300/350/400/600/700/900 and no 500; under CSS font matching a
+     desired 500 tries 400 FIRST, so a --weight-medium token would silently
+     render Regular. */
+  --fw-regular: 400;
+  --fw-semibold: 600;
+  --fw-bold: 700;
+
+  /* Tracking. The global reset sets letter-spacing to 0 on `*`, so no component
+     can inherit tracking — which is why uppercase micro-labels sit at 10-11px
+     with none. That failure is worse in Cyrillic than Latin: П Н И Ц Ш Щ share
+     a near-identical rectangular envelope and their counters close up. */
+  --track-caps: 0.05em;
+  --track-tight: -0.01em;
+  --track-tighter: -0.02em;
+
+  --numeric: tabular-nums;
+
+  /* ── Space — 4px base ─────────────────────────────────────────────────────
+     Dense regions (grid cells, toolbars, chips, nav rows) draw from --sp-1 /
+     --sp-2. Calm regions (page and panel padding, gaps between panels) draw
+     from --sp-3 upward. Density is created by shrinking PADDING, never the gap
+     between groups. This scale is not swept across the existing declarations;
+     the drift decays as files are touched.
+     -------------------------------------------------------------------- */
+  --sp-0: 2px;
+  --sp-1: 4px;
+  --sp-2: 8px;
+  --sp-3: 12px;
+  --sp-4: 16px;
+  --sp-5: 24px;
+  --sp-6: 32px;
+
+  /* ── Radius — square, because the reference is square ─────────────────────
+     The reference has no rounded corner anywhere: not on a button, not on a
+     card, not on a status dot. That is not an omission, it is the whole
+     grammar. Its structure is drawn with RULES — every cell shares a hairline
+     with its neighbour, so the page reads as one ruled sheet rather than as
+     tiles floating on a background. A radius breaks that join: two adjacent
+     4px corners leave a lens-shaped gap where the rule should be continuous,
+     and the eye reads the gap as a seam.
+
+     Kept as tokens rather than deleted so density presets and any future
+     softening stay a one-line change.
+     -------------------------------------------------------------------- */
+  --radius-xs: 0;
+  --radius-sm: 0;
+  --radius: 0;
+  --radius-lg: 0;
+  --radius-pill: 0;
+
+  /* ── Control geometry ─────────────────────────────────────────────────────
+     Eight unrelated heights today with no relationship between them: .btn 34
+     beside .input 36 in every filter row. A 2px difference between adjacent
+     controls is below the threshold at which anyone can name what is wrong and
+     well above the threshold at which the row stops looking machined.
+     -------------------------------------------------------------------- */
+  --control-h-xs: 28px;
+  --control-h-sm: 30px;
+  --control-h: 34px;
+  --control-h-lg: 38px;
+  --control-h-icon: 32px;
+  --pad-select-chevron: 28px;
+
+  /* Row geometry lives in tokens so a density preset becomes a setting rather
+     than a rebuild. 31px is kept, NOT raised: rows-per-screen is the currency
+     of this product. */
+  --row-h: 31px;
+  --row-pad-y: 5px;
+
+  /* For icons sized in CSS. Icons sized by prop go through the ICON map in
+     Icon.tsx, because lucide forwards size to the SVG width/height XML
+     attributes, which cannot parse var(). */
+  --icon-sm: 14px;
+  --icon-md: 16px;
+  --icon-lg: 18px;
+  --icon-xl: 20px;
+
+  /* ── Motion ───────────────────────────────────────────────────────────────
+     Five durations named by event, four curves. The bare `ease` keyword used 22
+     times today is cubic-bezier(0.25,0.1,0.25,1): symmetric, so it reads
+     sluggish on entry and floaty on exit. Every curve below is asymmetric on
+     purpose. --dur-quick is anchored on the 140ms the button and the tab
+     already use, so migrating those two is a no-op.
+     -------------------------------------------------------------------- */
+  --dur-press: 90ms;      /* press, checkbox tick, row-hover exit            */
+  --dur-quick: 140ms;     /* THE DEFAULT: every hover / paint change         */
+  --dur-settle: 200ms;    /* popover, toast, tab panel, disclosure           */
+  --dur-surface: 280ms;   /* drawer, off-canvas sidebar                      */
+  --dur-poll: 1500ms;     /* MIRRORS the job poll interval in state/store.tsx
+                             so the progress bar interpolates across exactly
+                             one interval instead of lurching and sitting dead.
+                             If that interval changes, change this too.       */
+
+  --ease-standard: cubic-bezier(0.4, 0, 0.2, 1);
+  --ease-out: cubic-bezier(0, 0, 0.2, 1);
+  --ease-in: cubic-bezier(0.4, 0, 1, 1);
+  --ease-loop: cubic-bezier(0.4, 0, 0.6, 1);
+
+  /* The one shorthand every interactive element uses. Note what is absent: no
+     `all`, no `transform`, no `width`, no `height`. Paint and opacity only;
+     transform is declared per element with its own faster duration. */
+  --transition-state:
+    color var(--dur-quick) var(--ease-standard),
+    background-color var(--dur-quick) var(--ease-standard),
+    border-color var(--dur-quick) var(--ease-standard),
+    box-shadow var(--dur-quick) var(--ease-standard),
+    opacity var(--dur-quick) var(--ease-standard);
+
+  /* ── Layout ──────────────────────────────────────────────────────────────── */
   --sidebar-w: 216px;
   --topbar-h: 56px;
+  --content-max: 1120px;
+  --drawer-w: 500px;
+  --popover-w: 260px;
+  --popover-w-lg: 320px;
+  --table-max: calc(100dvh - 280px);
+
+  /* Field widths, so control geometry stops being set from inline styles. A
+     class can be overridden by a media query; an inline style cannot, which is
+     why the responsive sheet currently needs !important to reach past them. */
+  --field-w-xs: 96px;
+  --field-w-sm: 120px;
+  --field-w-md: 160px;
+  --field-w-lg: 210px;
+
+  /* ── Layer map ────────────────────────────────────────────────────────────
+     Nine z-indexes across three files with no map. The ordering happens to be
+     correct today, which is luck rather than design. */
+  --z-sticky: 2;
+  --z-popover: 20;
+  --z-backdrop: 40;
+  --z-drawer: 41;
+  --z-nav-backdrop: 45;
+  --z-sidebar: 50;
+  --z-toast: 60;
+  --z-menu: 70;
+  --z-skip: 100;
+
 }
 
-[data-theme="light"] {
-  color-scheme: light;
-  --bg: #f3f4f5;
-  --bg-2: #eceef0;
-  --sidebar: #f8f8f7;
-  --panel: #ffffff;
-  --panel-solid: #ffffff;
-  --panel-2: #f0f1f2;
-  --border: #dfe1e4;
-  --border-strong: #c7cbd0;
-  --text: #1b1d20;
-  --text-dim: #555a61;
-  --text-faint: #7a8088;
-  --shadow: 0 10px 28px rgba(22, 25, 29, 0.09);
-  --focus: 0 0 0 2px var(--bg), 0 0 0 4px rgba(202, 75, 31, 0.62);
-  --flame-soft: rgba(202, 75, 31, 0.08);
+[data-theme="dark"] {
+  color-scheme: dark;
+
+  /* The surface ladder was blue: --bg at OKLCH h=264 against a flame at h=42,
+     the widest possible split, which is why the orange read as applied to the
+     interface rather than part of it. The LUMINANCE steps of that ladder were
+     good (1.075:1 and 1.079:1) and are preserved to within 5% — only the hue
+     moves, so a warm field makes the identical orange read calmer without
+     changing one byte of the orange. */
+  --tint-fg: 236, 233, 228;
+
+  --bg: #0b0a09;
+  --bg-2: #100f0e;
+  --sidebar: #0e0d0c;
+  --panel: #141312;
+  --panel-solid: #171614;
+  --panel-2: #1c1b19;
+
+  /* Alpha borders read heavier on a dark ground than on a light one at the same
+     value, so every level steps down rather than being reused. */
+  --border: rgba(var(--tint-fg), 0.10);
+  --border-strong: rgba(var(--tint-fg), 0.20);
+  --border-structural: rgba(var(--tint-fg), 0.28);
+  --border-row: rgba(var(--tint-fg), 0.06);
+  --border-sidebar: rgba(var(--tint-fg), 0.06);
+
+  --text: #ece9e4;          /* 15.3:1 on --panel                             */
+  --text-dim: #b2ada6;      /*  8.3:1 on --panel                             */
+  --text-faint: #8b8781;    /*  5.1:1 on --panel, 4.8:1 on --panel-2         */
+  --text-hint: rgba(var(--tint-fg), 0.30);
+  --icon-faint: #7a746d;
+
+  --flame-text: #ed6a32;    /*  5.9:1 on --panel                             */
+  --danger-text: #f0806d;   /*  6.6:1 on --panel-2                           */
+  --warning-text: #e0b166;  /*  9.4:1 on --panel                             */
+  --success-text: #6cd2a7;  /* 10.1:1 on --panel                             */
+  --data-mark: #756e68;
+  --data-mark-hover: #8e867e;
+
+  --selection: rgba(var(--tint-fg), 0.16);
+  --scrim: rgba(8, 6, 4, 0.64);
+  --shadow-ink: rgba(0, 0, 0, 0.55);
+
+  --focus-color: rgba(237, 106, 50, 0.9);
+  --flame-soft: rgba(237, 106, 50, 0.10);
 }

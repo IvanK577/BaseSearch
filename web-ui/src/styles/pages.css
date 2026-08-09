@@ -30,7 +30,7 @@
 .searchbar .input {
   height: 38px;
   padding-left: 38px;
-  font-size: 14px;
+  font-size: var(--text-md);
 }
 
 .search-command > .btn {
@@ -62,10 +62,10 @@
 
 .query-dirty {
   padding: 7px 9px;
-  border-left: 2px solid var(--flame-amber);
-  background: rgba(217, 154, 58, 0.06);
+  border-left: 2px solid var(--warning);
+  background: var(--state-soft);
   color: var(--text-dim);
-  font-size: 11px;
+  font-size: var(--text-2xs);
 }
 
 .filters-grid {
@@ -102,7 +102,7 @@
   min-width: 0;
   padding: 8px;
   border: 1px solid var(--border);
-  border-radius: 4px;
+  border-radius: var(--radius-sm);
   background: var(--bg-2);
 }
 
@@ -135,7 +135,7 @@
 
 .source-profile-name {
   overflow: hidden;
-  font-weight: 600;
+  font-weight: var(--fw-semibold);
   text-overflow: ellipsis;
   white-space: nowrap;
 }
@@ -152,12 +152,12 @@
   padding: 9px 10px;
   gap: 14px;
   border: 1px solid var(--border);
-  border-radius: 4px;
+  border-radius: var(--radius-sm);
   background: var(--panel-2);
 }
 
 .source-profile-label {
-  font-weight: 600;
+  font-weight: var(--fw-semibold);
 }
 
 .source-profile-options {
@@ -193,16 +193,23 @@
   color: var(--text-dim);
   text-align: left;
   cursor: pointer;
+  transition: var(--transition-state);
 }
 
 .dropzone:hover,
 .dropzone.drag {
-  background: var(--flame-soft);
+  background: var(--state-ghost-hover);
+}
+
+/* The dropzone is full-bleed inside a container that clips, so a ring drawn
+   outside its box is cut away entirely and keyboard focus is invisible. */
+.dropzone:focus-visible {
+  outline-offset: calc(-1 * var(--focus-offset));
 }
 
 .dropzone > .empty-icon {
   flex: none;
-  color: var(--flame-orange);
+  color: var(--text-dim);
 }
 
 .dropzone-copy {
@@ -213,13 +220,13 @@
 
 .dropzone-copy strong {
   color: var(--text);
-  font-size: 14px;
-  font-weight: 620;
+  font-size: var(--text-md);
+  font-weight: var(--fw-semibold);
 }
 
 .dropzone-copy span {
   color: var(--text-faint);
-  font-size: 11px;
+  font-size: var(--text-2xs);
   overflow-wrap: anywhere;
 }
 
@@ -238,7 +245,7 @@
 
 .import-intake-actions > span {
   min-width: 0;
-  font-size: 11px;
+  font-size: var(--text-2xs);
 }
 
 .import-history-empty {
@@ -252,7 +259,7 @@
 
 .import-history-empty > svg {
   flex: none;
-  color: var(--flame-orange);
+  color: var(--icon-faint);
 }
 
 .import-history-empty > div {
@@ -266,7 +273,7 @@
 }
 
 .import-history-empty span {
-  font-size: 11px;
+  font-size: var(--text-2xs);
   overflow-wrap: anywhere;
 }
 
@@ -298,12 +305,11 @@
 .job-status-dot {
   width: 7px;
   height: 7px;
-  border-radius: 50%;
   background: var(--text-faint);
 }
 
 [data-status="running"] .job-status-dot {
-  background: var(--flame-orange);
+  background: var(--text-dim);
 }
 
 [data-status="succeeded"] .job-status-dot {
@@ -311,7 +317,7 @@
 }
 
 [data-status="failed"] .job-status-dot {
-  background: var(--flame-red);
+  background: var(--danger);
 }
 
 [data-status="cancelled"] .job-status-dot {
@@ -331,21 +337,21 @@
   min-width: 20px;
   height: 20px;
   padding: 0 6px;
-  border-radius: 10px;
+  border-radius: var(--radius-pill);
   background: var(--panel-2);
   color: var(--text-dim);
-  font-size: 10px;
-  font-weight: 700;
+  font-size: var(--text-2xs);
+  font-weight: var(--fw-bold);
   line-height: 20px;
   text-align: center;
 }
 
 .status-count.running {
-  color: var(--flame-orange);
+  color: var(--text);
 }
 
 .status-count.failed {
-  color: #ef806c;
+  color: var(--danger-text);
 }
 
 .jobs-list {
@@ -387,7 +393,7 @@
 
 .job-kind {
   color: var(--text-faint);
-  font-size: 10px;
+  font-size: var(--text-2xs);
 }
 
 .job-result-row {
@@ -419,12 +425,12 @@
 .workspace-settings strong {
   display: block;
   color: var(--text);
-  font-size: 12px;
+  font-size: var(--text-xs);
 }
 
 .workspace-settings p {
   margin: 5px 0 0;
-  font-size: 11px;
+  font-size: var(--text-2xs);
   line-height: 1.4;
 }
 
@@ -434,12 +440,12 @@
   height: 32px;
   place-items: center;
   border: 1px solid var(--border-strong);
-  border-radius: 4px;
-  color: var(--flame-orange);
+  border-radius: var(--radius-sm);
+  color: var(--text-dim);
 }
 
 .settings-mode-icon.lan {
-  color: var(--flame-amber);
+  color: var(--text-dim);
 }
 
 .settings-section {
@@ -489,9 +495,15 @@
   position: absolute;
   inset: 0;
   border: 1px solid var(--border-strong);
-  border-radius: 10px;
+  border-radius: var(--radius-pill);
   background: var(--panel-2);
   cursor: pointer;
+  transition: var(--transition-state);
+}
+
+.switch-control input:checked + span {
+  border-color: var(--text-faint);
+  background: var(--state-soft-hover);
 }
 
 .switch-control > span::after {
@@ -501,18 +513,24 @@
   left: 3px;
   width: 12px;
   height: 12px;
-  border-radius: 50%;
   background: var(--text-faint);
-  transition: transform 120ms ease, background 120ms ease;
+  transition:
+    transform var(--dur-quick) var(--ease-standard),
+    background-color var(--dur-quick) var(--ease-standard);
 }
 
+/* Not --success. Green means "that worked"; a switch that is on means "this is
+   the current state" and nothing has succeeded. Every switch in the app was
+   reporting success at rest, which is why the theme toggle read as a status
+   light. Ink says on, and stays inside the rationed fire budget. */
 .switch-control input:checked + span::after {
-  background: var(--flame-orange);
+  background: var(--text);
   transform: translateX(14px);
 }
 
 .switch-control input:focus-visible + span {
-  box-shadow: var(--focus);
+  outline: var(--focus-ring) solid var(--focus-color);
+  outline-offset: var(--focus-offset);
 }
 
 .database-settings .kv {
@@ -531,8 +549,8 @@
 
 .account-name-error {
   flex: 1 0 100%;
-  color: var(--danger);
-  font-size: 11px;
+  color: var(--danger-text);
+  font-size: var(--text-2xs);
   line-height: 1.4;
 }
 
@@ -617,13 +635,13 @@
   display: inline-block;
   padding: 2px 6px;
   border: 1px solid var(--border-strong);
-  border-radius: 3px;
-  font-size: 11px;
+  border-radius: var(--radius-xs);
+  font-size: var(--text-2xs);
   white-space: nowrap;
 }
 
 .risk-confidence-high {
-  border-color: rgba(217, 154, 58, 0.52);
+  border-color: var(--border-strong);
 }
 
 .risk-confidence-low {
@@ -672,7 +690,7 @@
   width: 36px;
   height: 36px;
   flex: 0 0 36px;
-  border-radius: 4px;
+  border-radius: var(--radius-sm);
   object-fit: cover;
 }
 
@@ -694,30 +712,33 @@
   width: min(400px, 100%);
   padding: 24px;
   border: 1px solid var(--border);
-  border-radius: 6px;
+  border-radius: var(--radius);
   background: var(--panel);
 }
 
 .login-context {
+  font-family: var(--font-mono);
   display: flex;
   align-items: center;
   gap: 7px;
   margin-bottom: 12px;
-  color: var(--flame-amber);
-  font-size: 11px;
-  font-weight: 700;
+  color: var(--text-dim);
+  font-size: var(--text-2xs);
+  font-weight: var(--fw-bold);
+  letter-spacing: var(--track-caps);
   text-transform: uppercase;
 }
 
 .login-surface h1 {
   margin: 0;
-  font-size: 22px;
+  font-size: var(--text-2xl);
+  letter-spacing: var(--track-tighter);
 }
 
 .login-surface > p {
   margin: 7px 0 20px;
   color: var(--text-dim);
-  font-size: 13px;
+  font-size: var(--text-sm);
   line-height: 1.45;
 }
 

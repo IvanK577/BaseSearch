@@ -748,7 +748,7 @@ function priorYearMonth(month: string): string {
 function growthCell(value: number | null): ReactNode {
   if (value === null) return <span style={{ color: "var(--text-faint)" }}>—</span>;
   return (
-    <span style={{ color: value >= 0 ? "var(--flame-amber)" : "var(--flame-red)" }}>
+    <span style={{ color: value >= 0 ? "var(--success-text)" : "var(--danger-text)" }}>
       {value >= 0 ? "+" : ""}
       {formatPercent(value, 0)}
     </span>
@@ -2281,7 +2281,7 @@ function CompareRow({
   const delta = b - a;
   const pct = Math.abs(a) > 1e-9 ? (delta / a) * 100 : null;
   const color =
-    delta === 0 ? "var(--text-faint)" : delta > 0 ? "var(--flame-amber)" : "var(--flame-red)";
+    delta === 0 ? "var(--text-faint)" : delta > 0 ? "var(--success-text)" : "var(--danger-text)";
   return (
     <tr style={{ cursor: "default" }}>
       <td>{label}</td>

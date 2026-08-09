@@ -1,9 +1,20 @@
 .app-shell {
   display: grid;
+  grid-template-rows: var(--band-h) minmax(0, 1fr);
   grid-template-columns: var(--sidebar-w) minmax(0, 1fr);
   min-width: 0;
   height: 100dvh;
   overflow: hidden;
+}
+
+/* Full saturation is affordable here and nowhere else in the app: the band is
+   a 3px rule, so the loud yellow-to-red ramp covers a few thousand pixels
+   instead of a field someone stares into for six hours. */
+.app-shell::before {
+  content: "";
+  grid-row: 1;
+  grid-column: 1 / -1;
+  background: var(--band);
 }
 
 .sidebar {
@@ -11,7 +22,7 @@
   min-width: 0;
   flex-direction: column;
   padding: 0 10px 10px;
-  border-right: 1px solid var(--border);
+  border-right: 1px solid var(--border-structural);
   background: var(--sidebar);
 }
 
@@ -30,7 +41,7 @@
   width: 32px;
   height: 32px;
   flex: none;
-  border-radius: 4px;
+  border-radius: var(--radius-sm);
   object-fit: cover;
 }
 
@@ -41,15 +52,15 @@
 .brand-name {
   overflow: hidden;
   color: var(--text);
-  font-size: 14px;
-  font-weight: 680;
+  font-size: var(--text-md);
+  font-weight: var(--fw-bold);
   line-height: 1.2;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
 .brand-name span {
-  color: var(--flame-orange);
+  color: var(--text-faint);
   font-variant-numeric: tabular-nums;
 }
 
@@ -57,7 +68,7 @@
   overflow: hidden;
   margin-top: 2px;
   color: var(--text-faint);
-  font-size: 10px;
+  font-size: var(--text-2xs);
   text-overflow: ellipsis;
   white-space: nowrap;
 }
@@ -80,19 +91,23 @@
   min-height: 38px;
   padding: 7px 9px;
   gap: 10px;
-  border-radius: 4px;
+  border-radius: var(--radius-sm);
   color: var(--text-dim);
-  font-weight: 560;
-  transition: background 120ms ease, color 120ms ease;
+  font-weight: var(--fw-semibold);
+  transition: var(--transition-state);
 }
 
 .nav-item:hover {
-  background: var(--panel-2);
+  background: var(--state-ghost-hover);
   color: var(--text);
 }
 
+.nav-item:active {
+  background: var(--state-ghost-press);
+}
+
 .nav-item.active {
-  background: var(--flame-soft);
+  background: var(--state-ghost-press);
   color: var(--text);
 }
 
@@ -101,11 +116,11 @@
   position: absolute;
   inset: 7px auto 7px -10px;
   width: 2px;
-  background: var(--flame-orange);
+  background: var(--flame-500);
 }
 
 .nav-item.active .nav-icon {
-  color: var(--flame-orange);
+  color: var(--text);
 }
 
 .nav-item > span {
@@ -136,9 +151,10 @@
   overflow: hidden;
   min-height: 30px;
   padding: 6px 8px;
-  border-radius: 3px;
+  border-radius: var(--radius-xs);
   color: var(--text-faint);
-  font-size: 12px;
+  transition: var(--transition-state);
+  font-size: var(--text-xs);
   text-overflow: ellipsis;
   white-space: nowrap;
 }
@@ -166,11 +182,11 @@
 }
 
 .workspace-mode.personal > svg {
-  color: var(--flame-orange);
+  color: var(--text-dim);
 }
 
 .workspace-mode.lan > svg {
-  color: var(--flame-amber);
+  color: var(--text-dim);
 }
 
 .workspace-mode-copy {
@@ -187,13 +203,13 @@
 
 .workspace-mode-copy strong {
   color: var(--text);
-  font-size: 11px;
-  font-weight: 650;
+  font-size: var(--text-2xs);
+  font-weight: var(--fw-semibold);
 }
 
 .workspace-mode-copy span {
   color: var(--text-faint);
-  font-size: 10px;
+  font-size: var(--text-2xs);
 }
 
 .main {
@@ -209,15 +225,16 @@
   min-height: var(--topbar-h);
   padding: 0 16px;
   gap: 8px;
-  border-bottom: 1px solid var(--border);
+  border-bottom: 1px solid var(--border-structural);
   background: var(--bg-2);
 }
 
 .topbar h1 {
   overflow: hidden;
   margin: 0;
-  font-size: 16px;
-  font-weight: 650;
+  font-size: var(--text-lg);
+  letter-spacing: var(--track-tight);
+  font-weight: var(--fw-semibold);
   text-overflow: ellipsis;
   white-space: nowrap;
 }
@@ -234,19 +251,21 @@
 }
 
 .mode-label {
+  font-family: var(--font-mono);
   flex: none;
   color: var(--text-faint);
-  font-size: 10px;
-  font-weight: 650;
+  font-size: var(--text-2xs);
+  font-weight: var(--fw-semibold);
+  letter-spacing: var(--track-caps);
   text-transform: uppercase;
 }
 
 .mode-label.personal {
-  color: var(--flame-orange);
+  color: var(--text-faint);
 }
 
 .mode-label.lan {
-  color: var(--flame-amber);
+  color: var(--text-faint);
 }
 
 .icon-button {
@@ -258,7 +277,8 @@
   place-items: center;
   padding: 0;
   border: 1px solid transparent;
-  border-radius: 4px;
+  transition: var(--transition-state), scale var(--dur-press) var(--ease-standard);
+  border-radius: var(--radius-sm);
   background: transparent;
   color: var(--text-dim);
 }
@@ -283,11 +303,11 @@
   height: 16px;
   padding: 0 4px;
   border: 2px solid var(--bg-2);
-  border-radius: 8px;
-  background: var(--flame-red);
-  color: #fff;
-  font-size: 9px;
-  font-weight: 700;
+  border-radius: var(--radius-pill);
+  background: var(--danger);
+  color: var(--on-accent);
+  font-size: var(--text-2xs);
+  font-weight: var(--fw-bold);
   line-height: 12px;
 }
 
@@ -297,7 +317,7 @@
   top: 8px;
   left: 8px;
   padding: 7px 10px;
-  border-radius: 4px;
+  border-radius: var(--radius-sm);
   background: var(--panel-solid);
   color: var(--text);
   transform: translateY(-160%);
@@ -311,8 +331,50 @@
   min-width: 0;
   flex: 1;
   overflow: auto;
-  padding: 16px 18px 24px;
+  padding: 0;
   scrollbar-gutter: stable;
+}
+
+/* ── The ruled sheet ────────────────────────────────────────────────────────
+   The reference has no floating cards. Every region runs edge to edge and
+   shares its rule with the next, so the page reads as one sheet that has been
+   RULED rather than as tiles arranged on a background.
+
+   Two consequences follow and both are load-bearing. The gap between sections
+   goes to zero — a gap turns one shared rule into two hairlines with a stripe
+   of ground showing between them, which is exactly the 'floating tile' reading
+   we are removing. And side borders go away — a vertical rule sitting 1px in
+   from the window edge reads as a seam, not as structure.
+
+   Scoped to TOP-LEVEL page sections only. A panel nested inside a page keeps
+   its whole box: down there the border is what says 'this is one thing', and
+   there is no neighbour for it to share an edge with.
+   ------------------------------------------------------------------------ */
+/* Excluding .content-narrow is the whole subtlety. Those pages cap themselves
+   at --content-max and centre, so a "full-bleed band" there would stop 80px
+   short of the window on both sides — which is not a rule across a sheet, it is
+   a floating card with its corners filed off. Worse, one of them becomes a
+   two-column grid above 760px, where removing the side borders leaves the left
+   cell bleeding into an empty gutter with no edge at all. Width-constrained
+   pages keep their boxes; the sheet is for the full-width data surfaces. */
+:is(.content > .stack, .content > * > .stack):not(.content-narrow) {
+  gap: 0;
+}
+
+:is(.content > .stack, .content > * > .stack):not(.content-narrow) > .panel {
+  border-inline: 0;
+  /* The rule above any section is the previous section's bottom edge; for the
+     first one it is the topbar's. */
+  border-top: 0;
+  border-bottom: 1px solid var(--border-structural);
+}
+
+/* Sections set their own padding, but it was tuned against a content box that
+   already carried 18px of inset. Without it the text would start 12px from the
+   window edge. */
+:is(.content > .stack, .content > * > .stack):not(.content-narrow) > :is(.panel, .empty-state) {
+  padding-right: max(var(--sp-4), env(safe-area-inset-right));
+  padding-left: var(--sp-4);
 }
 
 .content:focus {
@@ -332,8 +394,10 @@
 }
 
 .content-narrow {
-  width: min(100%, 1120px);
+  width: min(100%, var(--content-max));
   margin: 0 auto;
+  /* .content dropped its padding for the sheet, so these pages carry their own. */
+  padding: var(--sp-4) var(--sp-4) var(--sp-5);
 }
 
 .navigation-backdrop {

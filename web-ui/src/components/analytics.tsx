@@ -2,7 +2,7 @@
 // grouped ranking table, and the price-metrics table. All numbers arrive
 // pre-computed from the backend.
 
-import type { ReactNode } from "react";
+import type { CSSProperties, ReactNode } from "react";
 
 import type {
   AnalyticsFilterAction,
@@ -183,7 +183,9 @@ export function MonthChart({
               <div
                 key={m.month}
                 className="chart-col"
-                style={{ cursor: onSelect ? "pointer" : "default" }}
+                style={
+                  { cursor: onSelect ? "pointer" : "default", "--col-i": i } as CSSProperties
+                }
                 title={`${formatMonth(m.month)} · ${value === null ? t("analytics_not_comparable") : fmt(value)}`}
                 onClick={() => onSelect?.(m.month)}
               >

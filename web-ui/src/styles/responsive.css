@@ -66,7 +66,7 @@
   }
 
   .content {
-    padding: 14px 14px 20px;
+    padding: 0;
   }
 
   .grid-2,
@@ -103,7 +103,7 @@
   }
 
   .topbar h1 {
-    font-size: 15px;
+    font-size: var(--text-md);
   }
 
   .mode-label {
@@ -111,7 +111,7 @@
   }
 
   .content {
-    padding: 10px 10px 18px;
+    padding: 0;
     scrollbar-gutter: auto;
   }
 
@@ -286,12 +286,49 @@
 }
 
 @media (prefers-reduced-motion: reduce) {
+  /* The blanket "0.01ms on everything" is the common recipe and it is too
+     blunt: it removes colour feedback along with movement. What the setting is
+     actually about is TRAVEL and LOOPING — the things that provoke vestibular
+     symptoms — not a 140ms tint under the cursor. A control that changes colour
+     with no transition is harder to track, not easier.
+
+     So: entrances, slides and the press scale go. Paint transitions stay. */
+  html {
+    scroll-behavior: auto;
+  }
+
   *,
   *::before,
   *::after {
-    scroll-behavior: auto !important;
     animation-duration: 0.01ms !important;
+    animation-delay: 0ms !important;
     animation-iteration-count: 1 !important;
-    transition-duration: 0.01ms !important;
+    transition-property:
+      color, background-color, border-color, outline-color, box-shadow, opacity !important;
+    transition-duration: var(--dur-press) !important;
+  }
+
+  .btn:active:not(:disabled),
+  .icon-button:active:not(:disabled) {
+    scale: 1;
+  }
+
+  /* Loading indicators are exempt. A frozen spinner does not read as "motion
+     reduced", it reads as "hung" — and during a forty-minute import the
+     indeterminate bar is the only thing telling the user the app is alive.
+     They keep looping, slower. */
+  .spinner {
+    animation-duration: 1.4s !important;
+    animation-iteration-count: infinite !important;
+  }
+
+  .progress-indeterminate {
+    animation-duration: 2.6s !important;
+    animation-iteration-count: infinite !important;
+  }
+
+  /* This one is decorative — the placeholder's shape already says "loading". */
+  .skeleton-row::after {
+    animation: none !important;
   }
 }

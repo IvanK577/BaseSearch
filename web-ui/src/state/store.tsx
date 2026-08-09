@@ -67,8 +67,14 @@ export function capabilitiesForAuth(auth: AuthState | null): {
   };
 }
 
+/* Light is the default and, more importantly, the CSS base: :root carries the
+   light values and [data-theme="dark"] overrides them. The server sends
+   script-src 'self', so a pre-paint inline bootstrap is blocked and weakening
+   the CSP for a colour is not a trade worth making — making light the base
+   means the very first paint is already right with no JS, and only someone who
+   has chosen dark ever sees this effect change anything. */
 function initialTheme(): Theme {
-  return localStorage.getItem("bs-theme") === "light" ? "light" : "dark";
+  return localStorage.getItem("bs-theme") === "dark" ? "dark" : "light";
 }
 
 export function StoreProvider({ children }: { children: ReactNode }) {

@@ -1,6 +1,5 @@
 * {
   box-sizing: border-box;
-  letter-spacing: 0;
 }
 
 html,
@@ -15,9 +14,10 @@ body {
   overflow: hidden;
   background: var(--bg);
   color: var(--text);
-  font-family: "Segoe UI Variable Text", "Aptos", "Segoe UI", system-ui, sans-serif;
-  font-size: 13px;
-  line-height: 1.45;
+  font-family: var(--font-ui);
+  font-size: var(--text-sm);
+  line-height: var(--text-sm-lh);
+  letter-spacing: 0;
   -webkit-font-smoothing: antialiased;
 }
 
@@ -34,24 +34,36 @@ button {
 
 :where(button, a, input, select, textarea, [tabindex]:not([tabindex="-1"])) {
   outline: none;
+  /* outline-color only. Animating outline-width would make the ring grow into
+     place, which reads as a delay on the one cue a keyboard user needs to be
+     instant. */
+  transition: outline-color var(--dur-press) var(--ease-out);
 }
 
+/* outline, not box-shadow. The old ring painted its inner spacer in var(--bg),
+   so every focused control sitting on --panel, --panel-solid, --sidebar or
+   --bg-2 drew a dark halo of the wrong colour around itself. outline-offset
+   leaves that gap transparent, so the ring is correct on every surface without
+   having to know what it is sitting on. */
 button:focus-visible,
 a:focus-visible,
 input:focus-visible,
 select:focus-visible,
 textarea:focus-visible,
 [tabindex]:not([tabindex="-1"]):focus-visible {
-  box-shadow: var(--focus);
+  outline: var(--focus-ring) solid var(--focus-color);
+  outline-offset: var(--focus-offset);
 }
 
 input[type="checkbox"],
 input[type="radio"] {
-  accent-color: var(--flame-orange);
+  accent-color: var(--flame-500);
 }
 
+/* A hot orange flash on every drag through a half-million-row grid is
+   exhausting; the neutral tint reads as selection just as clearly. */
 ::selection {
-  background: rgba(237, 106, 50, 0.3);
+  background: var(--selection);
 }
 
 ::-webkit-scrollbar {
@@ -60,8 +72,9 @@ input[type="radio"] {
 }
 
 ::-webkit-scrollbar-thumb {
-  border-radius: 4px;
+  border-radius: var(--radius-sm);
   background: var(--border-strong);
+  transition: background-color var(--dur-quick) var(--ease-standard);
 }
 
 ::-webkit-scrollbar-thumb:hover {
@@ -112,7 +125,7 @@ input[type="radio"] {
   width: 18px;
   height: 18px;
   border: 2px solid var(--border-strong);
-  border-top-color: var(--flame-orange);
+  border-top-color: var(--text-dim);
   border-radius: 50%;
   animation: spin 0.7s linear infinite;
 }
@@ -162,12 +175,34 @@ input[type="radio"] {
   }
 }
 
+/* margin-left animates LAYOUT: every frame of an infinite loop re-flowed the
+   progress bar's parent while an import was running. translateX composites. */
 @keyframes sweep {
   from {
-    margin-left: -40%;
+    transform: translateX(-120%);
   }
   to {
-    margin-left: 100%;
+    transform: translateX(340%);
+  }
+}
+
+/* Same fix for the loading placeholder: background-position repaints the whole
+   gradient each frame. A pseudo-element sliding across composites instead. */
+@keyframes shimmer-sweep {
+  from {
+    transform: translateX(-100%);
+  }
+  to {
+    transform: translateX(100%);
+  }
+}
+
+/* The one entrance. Six pixels, not twenty — this is a data tool announcing
+   that numbers arrived, not a page introducing itself. */
+@keyframes rise {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
   }
 }
 
