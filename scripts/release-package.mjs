@@ -381,7 +381,14 @@ function verifyManifest(args) {
 
 const [command, ...values] = process.argv.slice(2);
 const args = parseArgs(values);
-mkdirSync(path.dirname(path.resolve(args.out ?? ".")), { recursive: true });
+// Only render-readme writes to --out; write-manifest and verify take --root.
+// Creating the parent unconditionally meant those two mkdir'd the REPOSITORY'S
+// parent directory, which is silently harmless while the checkout sits a few
+// levels deep and a hard EPERM once it sits directly under a drive root:
+// Windows refuses mkdir on "D:\" even with recursive: true.
+if (args.out) {
+  mkdirSync(path.dirname(path.resolve(args.out)), { recursive: true });
+}
 
 if (command === "render-readme") renderReadme(args);
 else if (command === "write-manifest") writeManifest(args);
