@@ -1,4 +1,4 @@
-# Base Search 2.1.0
+# Base Search 2.1.1
 
 [![CI](https://github.com/IvanK577/BaseSearch/actions/workflows/ci.yml/badge.svg)](https://github.com/IvanK577/BaseSearch/actions/workflows/ci.yml)
 
@@ -79,8 +79,9 @@ builds everything, and launches Base Search at the end.
 8. Open **Data**, then **Exports**, to create a CSV or XLSX file from the
    current query.
 
-Use **Settings** to switch between the dark and light themes or choose one of
-the eleven available interface languages.
+Base Search opens in the light theme. Use **Settings** to switch to the dark
+theme or to choose one of the eleven available interface languages. The theme
+is remembered per computer.
 
 ## Supported Data
 

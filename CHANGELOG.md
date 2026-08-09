@@ -2,6 +2,48 @@
 
 All notable changes to Base Search are documented in this file.
 
+## 2.1.1 - 2026-08-09
+
+An interface release. Nothing about importing, searching, or analysing changed
+— the engine, the database format, and every number are identical to 2.1.0.
+
+### Changed
+
+- **The light theme is now the default.** It is also the base the interface is
+  built on rather than a variant applied afterwards, so the first frame is
+  already correct and no longer flashes the other theme while starting. The
+  dark theme is unchanged and still one click away in Settings; if you had
+  already chosen it, your choice is kept.
+- The interface is drawn with rules instead of floating cards. Sections on
+  Search and Analyze now run the full width of the window and share a dividing
+  line with the section below, which puts more rows on screen. Settings, Data,
+  and the job pages keep their narrower centred column.
+- Corners are square throughout, borders are graded into three weights, and
+  section labels, stat labels, and chart axes are set in a monospaced face, so
+  a label is distinguishable from a value at a glance.
+- The smallest text rises from 9px to 11px. Nothing you have to read is set
+  below that any more.
+- Growth and difference columns are green for up and red for down. They were
+  amber and red, two shades of the same warning colour.
+
+### Fixed
+
+- A switch in the "on" position no longer shows green. Green means an action
+  succeeded; an enabled switch only reports the current state, so every switch
+  in the app — including the theme toggle in Settings — looked like a status
+  light reporting success.
+- Bars in the monthly chart grow from the axis instead of from their own
+  middle, so a bar no longer briefly extends below the baseline it is measured
+  against.
+- The import progress bar and the loading placeholders no longer recalculate
+  the page layout on every frame they animate. This was running for the whole
+  duration of an import.
+- Controls that changed appearance instantly on hover or click now do so
+  consistently; twenty-one of them had no transition at all.
+- The "reduce motion" system setting is honoured more precisely: movement and
+  looping animation stop, colour feedback stays, and loading indicators keep
+  turning — a frozen spinner reads as a hang, not as reduced motion.
+
 ## 2.1.0 - 2026-08-02
 
 A correctness and speed release driven by two standing reports: that importing
