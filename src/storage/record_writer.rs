@@ -29,7 +29,27 @@ pub(crate) fn insert_batch(
     source_file: &str,
     records: &[ImportRecord],
 ) -> rusqlite::Result<(u64, u64)> {
-    insert_batch_scoped(conn, source_file, None, None, records)
+    // A batch is all-or-nothing. The importer supplies that itself by holding
+    // one transaction open for the whole file, but this entry point is reached
+    // with none open, and the savepoint that used to be inside
+    // `insert_batch_scoped` was silently providing it: removing the savepoint
+    // turned a failure on row three of four into three committed rows. It also
+    // turned one transaction into one per row, which cost about half the speed
+    // on this path.
+    if !conn.is_autocommit() {
+        return insert_batch_scoped(conn, source_file, None, None, records);
+    }
+    conn.execute_batch("BEGIN IMMEDIATE")?;
+    match insert_batch_scoped(conn, source_file, None, None, records) {
+        Ok(counts) => {
+            conn.execute_batch("COMMIT")?;
+            Ok(counts)
+        }
+        Err(error) => {
+            let _ = conn.execute_batch("ROLLBACK");
+            Err(error)
+        }
+    }
 }
 
 pub(crate) fn insert_batch_scoped(
@@ -64,21 +84,21 @@ pub(crate) fn insert_batch_scoped(
                         schema_id, source_id
                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)";
 
-    // WHY there is no savepoint around this batch: the whole file is imported
-    // inside one `BEGIN IMMEDIATE` opened by `begin_import_file`, and every
-    // failure path in `import_file_with_options` answers with a full
-    // `rollback_import_file`, so a per-batch rollback point was never the thing
-    // that undid a failed batch.
+    // WHY there is no savepoint around this batch. It does not open one, so
+    // EVERY caller must supply the transaction: the importer holds one
+    // `BEGIN IMMEDIATE` for the whole file (`begin_import_file`) and answers any
+    // failure with a full `rollback_import_file`, and `insert_batch` above opens
+    // one when it is called with none active.
     //
-    // It was not free. Inside an open savepoint SQLite has to be able to return
-    // to the mark, so it journals the original content of every page the batch
-    // touches. With fifteen indexes over random keys each further row lands on
-    // more pages the savepoint is already holding, so the cost of a row grows
-    // with the number of rows already in the batch — quadratic in `BATCH_SIZE`.
-    // Measured on a 400k-row database at the current `BATCH_SIZE` of 8192:
-    // 0.70s for the batch without the savepoint, 140.75s with it. That is the
-    // whole difference between a first import (~14k rows/s, read indexes
-    // dropped) and every later one (~100 rows/s).
+    // The savepoint was not free. Inside an open one SQLite has to be able to
+    // return to the mark, so it journals the original content of every page the
+    // batch touches. With fifteen indexes over random keys each further row
+    // lands on more pages the savepoint is already holding, so the cost of a row
+    // grows with the number of rows already in the batch — quadratic in
+    // `BATCH_SIZE`. End to end on a 400k-row database, importing 50 400 rows:
+    // about 506s with it and 5.6s without, on the same machine and disk. The
+    // per-batch figures quoted earlier came from a Python model of this loop,
+    // not from the product, and should not be repeated as measurements.
     let mut first_seen: u64 = 0;
     let mut duplicates: u64 = 0;
     let mut canonical_by_hash = load_existing_canonicals(conn, schema_id, records)?;
@@ -264,6 +284,54 @@ mod tests {
             owners.get(&HASH),
             Some(&(7, "earliest.xlsx".to_string())),
             "id 3 sorts first but is a duplicate, so id 7 owns the fingerprint"
+        );
+    }
+
+    /// A batch is all-or-nothing even when the caller opened no transaction.
+    ///
+    /// The savepoint that used to wrap every batch was quietly supplying that
+    /// guarantee here: removing it turned a failure on the third row of four
+    /// into three rows committed and kept. The importer never noticed because
+    /// it holds its own transaction; this entry point does not.
+    #[test]
+    fn a_failed_batch_outside_a_transaction_leaves_nothing_behind() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = connection::open(&dir.path().join("atomic.db")).unwrap();
+        // Refuse the third row of the batch, the way a constraint or a disk
+        // error would. It has to be the third and not the first: a batch that
+        // fails on its opening row leaves nothing behind either way, which is
+        // what made an earlier version of this test unable to fail.
+        conn.execute_batch(
+            "CREATE TRIGGER refuse_third BEFORE INSERT ON records
+             WHEN NEW.row_hash = x'02020202020202020202020202020202'
+             BEGIN SELECT RAISE(ABORT, 'refused'); END;",
+        )
+        .unwrap();
+        assert!(conn.is_autocommit(), "the caller opened no transaction");
+
+        let batch: Vec<ImportRecord> = (0u8..4)
+            .map(|index| ImportRecord {
+                hash: [index; 16],
+                year: None,
+                values: vec![String::new(); crate::schema::COLUMNS.len()],
+                extra: None,
+            })
+            .collect();
+        assert!(
+            super::insert_batch(&conn, "one-batch.csv", &batch).is_err(),
+            "the batch must report the refusal"
+        );
+
+        let rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM records", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            rows, 0,
+            "the two rows written before the refusal must not survive it"
+        );
+        assert!(
+            conn.is_autocommit(),
+            "a failed batch must not leave a transaction open"
         );
     }
 

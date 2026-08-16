@@ -70,18 +70,40 @@ fn resolve_default_db_path(
     // their old workspace is often nowhere near this folder. What is never
     // accepted is a path that is not a Base Search database, so a confused
     // answer cannot silently point the app at some unrelated file.
+    //
+    // The choice is NOT written down here. Opening it can still fail, and a
+    // remembered path that cannot be opened is unrecoverable from inside the
+    // app: it is re-selected on every start, the desktop has no way to change
+    // it, and the only cure is deleting the pointer file by hand. It is
+    // recorded by `remember_workspace` once an open has actually succeeded.
     if let Some(selected) = choose_sibling(&candidates)
         && (candidates.contains(&selected) || looks_like_base_search_database(&selected))
     {
-        if let Err(error) = save_workspace_selection(&stable, &selected) {
-            eprintln!(
-                "[base-search] Could not remember the selected V1 workspace {}: {error}",
-                selected.display()
-            );
-        }
         return selected;
     }
     stable
+}
+
+/// Records which database to reopen next time, once it has opened successfully.
+///
+/// Called from the startup worker's success path. Writing it any earlier risks
+/// pinning the app to a file it cannot open.
+pub fn remember_workspace(database: &Path) {
+    remember_workspace_at(&default_stable_database_path(), database);
+}
+
+fn remember_workspace_at(stable: &Path, database: &Path) {
+    if database == stable {
+        // The default needs no pointer, and not writing one keeps a fresh
+        // install free of state it would have to clean up.
+        return;
+    }
+    if let Err(error) = save_workspace_selection(stable, database) {
+        eprintln!(
+            "[base-search] Could not remember the selected workspace {}: {error}",
+            database.display()
+        );
+    }
 }
 
 /// Where a new workspace lives when nothing existing is chosen.
@@ -259,6 +281,16 @@ fn package_database_candidates(package: &Path) -> [PathBuf; 2] {
     ]
 }
 
+/// Whether this file is a Base Search workspace, as opposed to some other
+/// SQLite database.
+///
+/// A table merely *named* `records` is not enough: plenty of applications have
+/// one, and accepting a stranger's is not a harmless mistake. Opening it starts
+/// the upgrade machinery, which writes a backup beside it, adds a `meta` table
+/// and switches it to WAL before failing on the first missing column — a
+/// foreign file modified, and no working workspace at the end of it. The two
+/// columns checked here have existed in every release that ever wrote this
+/// table, so no genuine workspace is turned away.
 fn looks_like_base_search_database(path: &Path) -> bool {
     if !path.is_file() {
         return false;
@@ -269,16 +301,19 @@ fn looks_like_base_search_database(path: &Path) -> bool {
     ) else {
         return false;
     };
-    connection
-        .query_row(
-            "SELECT EXISTS(
-                 SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'records'
-             )",
-            [],
-            |row| row.get::<_, i64>(0),
-        )
-        .map(|exists| exists != 0)
-        .unwrap_or(false)
+    let columns = connection
+        .prepare("SELECT name FROM pragma_table_info('records')")
+        .and_then(|mut statement| {
+            statement
+                .query_map([], |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()
+        });
+    let Ok(columns) = columns else {
+        return false;
+    };
+    ["row_hash", "source_file"]
+        .iter()
+        .all(|required| columns.iter().any(|name| name == required))
 }
 
 fn confirm_sibling_workspace(candidates: &[PathBuf]) -> Option<PathBuf> {
@@ -385,7 +420,7 @@ pub(super) fn open_parent_folder(path: &Path) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{RuntimePlatform, resolve_default_db_path};
+    use super::{RuntimePlatform, remember_workspace_at, resolve_default_db_path};
 
     #[test]
     fn versioned_packages_share_a_stable_default_but_existing_portable_data_wins() {
@@ -519,15 +554,7 @@ mod tests {
             .join("BaseSearch-1.6.5")
             .join("data")
             .join("base_search.db");
-        std::fs::create_dir_all(old_database.parent().unwrap()).unwrap();
-        let old_connection = rusqlite::Connection::open(&old_database).unwrap();
-        old_connection
-            .execute_batch(
-                "CREATE TABLE records(id INTEGER PRIMARY KEY, description TEXT);
-                 INSERT INTO records(description) VALUES ('V1 marker');",
-            )
-            .unwrap();
-        drop(old_connection);
+        write_workspace(&old_database, "V1 marker");
         let bytes_before = std::fs::read(&old_database).unwrap();
         let v2_executable = temp.path().join("BaseSearch-2.0.0").join("BaseSearch.exe");
 
@@ -555,12 +582,22 @@ mod tests {
             "the V1 database must not be copied"
         );
         assert!(
-            stable_database
+            !stable_database
                 .parent()
                 .unwrap()
                 .join("workspace-selection-v1.json")
                 .is_file(),
-            "only an explicit workspace pointer should be persisted"
+            "the choice must not be recorded until the database has opened"
+        );
+
+        // The startup worker records it only after a successful open.
+        remember_workspace_at(&stable_database, &old_database);
+        assert!(
+            stable_database
+                .parent()
+                .unwrap()
+                .join("workspace-selection-v1.json")
+                .is_file()
         );
 
         assert_eq!(
@@ -582,9 +619,29 @@ mod tests {
         let connection = rusqlite::Connection::open(path).unwrap();
         connection
             .execute_batch(&format!(
-                "CREATE TABLE records(id INTEGER PRIMARY KEY, description TEXT);
-                 INSERT INTO records(description) VALUES ('{marker}');"
+                "CREATE TABLE records(
+                     id INTEGER PRIMARY KEY,
+                     row_hash BLOB NOT NULL,
+                     source_file TEXT NOT NULL,
+                     description TEXT
+                 );
+                 INSERT INTO records(row_hash, source_file, description)
+                 VALUES (x'00', '{marker}.xlsx', '{marker}');"
             ))
+            .unwrap();
+    }
+
+    /// A database from some other application that happens to have a table
+    /// called `records`. Accepting one of these is how a wrong pick used to
+    /// modify a stranger's file and then wedge the app.
+    fn write_foreign_database(path: &std::path::Path) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        rusqlite::Connection::open(path)
+            .unwrap()
+            .execute_batch(
+                "CREATE TABLE records(id INTEGER PRIMARY KEY, note TEXT, amount REAL);
+                 INSERT INTO records(note, amount) VALUES ('unrelated', 12.5);",
+            )
             .unwrap();
     }
 
@@ -721,6 +778,59 @@ mod tests {
                 },
             ),
             stable
+        );
+    }
+
+    /// A wrong pick used to be unrecoverable: the path was written down before
+    /// the database was opened, so a file that could not be opened was
+    /// re-selected on every start, with no way to change it from inside the
+    /// app. The gate also accepted any SQLite file with a table named
+    /// `records`, which plenty of unrelated applications have — and opening one
+    /// modifies it (a `meta` table, WAL mode, a backup written beside it)
+    /// before failing.
+    #[test]
+    fn a_foreign_database_is_refused_and_nothing_is_written_down() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        let local = temp.path().join("local-app-data");
+        let foreign = temp
+            .path()
+            .join("notes")
+            .join("data")
+            .join("base_search.db");
+        write_foreign_database(&foreign);
+        let executable = temp.path().join("BaseSearch-2.2.0").join("BaseSearch.exe");
+        let stable = local
+            .join("Base Search")
+            .join("data")
+            .join("base_search.db");
+
+        let mut offered = Vec::new();
+        let selected = resolve_default_db_path(
+            RuntimePlatform::Windows,
+            &executable,
+            Some(&home),
+            Some(&local),
+            None,
+            |candidates| {
+                offered = candidates.to_vec();
+                // Even a person insisting on it must not get it.
+                Some(foreign.clone())
+            },
+        );
+
+        assert!(
+            offered.is_empty(),
+            "a table merely named `records` is not a workspace: {offered:?}"
+        );
+        assert_eq!(selected, stable, "the default workspace is used instead");
+        assert!(
+            !stable
+                .parent()
+                .unwrap()
+                .join("workspace-selection-v1.json")
+                .is_file(),
+            "a refused pick must leave nothing behind"
         );
     }
 

@@ -252,6 +252,9 @@ fn handle_startup_done(
                 decode_stored_queries_with_fallback(saved_queries_v2, saved_queries_v1);
             app.db_total_rows = Some(total_rows);
             app.db_ready = true;
+            // Recorded only now: the database opened. Writing it earlier is how
+            // a mistaken pick used to wedge the app on a file it could not open.
+            crate::app::platform::remember_workspace(&app.db_path);
             app.lite_db = Some(*db);
             app.show_help = first_run;
             app.status = StatusLine::default();
