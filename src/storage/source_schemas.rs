@@ -78,7 +78,24 @@ pub(crate) fn ensure_schema(conn: &Connection) -> rusqlite::Result<()> {
          BEGIN
              SELECT RAISE(ABORT, 'canonical payload belongs to another source schema');
          END;",
-    )
+    )?;
+    // Added after 2.1: what the data itself says the value column is
+    // denominated in, kept apart from the answer a person gave.
+    if !table_has_column(conn, "source_schemas", "detected_currency")? {
+        conn.execute_batch("ALTER TABLE source_schemas ADD COLUMN detected_currency TEXT;")?;
+    }
+    Ok(())
+}
+
+fn table_has_column(conn: &Connection, table: &str, column: &str) -> rusqlite::Result<bool> {
+    let mut statement = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let mut rows = statement.query([])?;
+    while let Some(row) = rows.next()? {
+        if row.get::<_, String>(1)? == column {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 pub(crate) fn register_schema(
@@ -313,6 +330,75 @@ pub(crate) fn compatibility_shape_with_fields(
         backing.entry(assigned).or_default().push(field.field_id);
     }
     Ok(Some((TableShape { columns }, backing)))
+}
+
+/// Rows needed before the evidence below is worth believing.
+const CURRENCY_EVIDENCE_MIN_ROWS: i64 = 30;
+/// Share of comparable rows that must agree. Left of 1.0 because a source file
+/// always carries a few mistyped or rounded rows.
+const CURRENCY_EVIDENCE_AGREEMENT: f64 = 0.95;
+/// How far a row may be off and still count as agreeing. `РФВ` is published
+/// rounded to a few decimals, so the product of two rounded numbers cannot be
+/// expected to match to the cent.
+const CURRENCY_EVIDENCE_TOLERANCE: f64 = 0.02;
+
+/// Works out, from the data itself, whether this schema's value column is in
+/// US dollars.
+///
+/// The customs layout names no currency in any column, but it does state the
+/// same amount twice: `ФВ вал.контр` is the invoice value *in the contract
+/// currency*, and `РФВ` is the invoice value *in dollars per kilogram*. So
+/// `РФВ × вага` reproduces `ФВ` exactly when the contract currency is the
+/// dollar, and misses by the exchange rate when it is not. That is a fact the
+/// file can be asked about rather than a default anyone has to type.
+///
+/// Returns `None` unless the evidence is strong: too few comparable rows, a
+/// missing `РФВ` column, or disagreement all leave the currency unknown, which
+/// is the honest answer and the one analytics already handles.
+///
+/// Which weight `РФВ` is per is not stated — the reference values beside it
+/// come in explicit net and gross variants and this one does not — so both are
+/// tried and the better agreement wins.
+pub(crate) fn detect_schema_currency(
+    conn: &Connection,
+    schema_id: i64,
+) -> rusqlite::Result<Option<String>> {
+    let (comparable, by_net, by_gross): (i64, i64, i64) = conn.query_row(
+        "SELECT COUNT(*),
+                COALESCE(SUM(CASE WHEN ABS(v - r * n) <= ?2 * v THEN 1 ELSE 0 END), 0),
+                COALESCE(SUM(CASE WHEN ABS(v - r * g) <= ?2 * v THEN 1 ELSE 0 END), 0)
+           FROM (
+             SELECT num_value_grouped(currency_control_value) AS v,
+                    num_value(rfv_usd_kg) AS r,
+                    num_value(net_kg) AS n,
+                    num_value(gross_kg) AS g
+               FROM records
+              WHERE schema_id = ?1 AND dup_first_file IS NULL
+           )
+          WHERE v > 0 AND r > 0 AND (n > 0 OR g > 0)",
+        params![schema_id, CURRENCY_EVIDENCE_TOLERANCE],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    )?;
+    if comparable < CURRENCY_EVIDENCE_MIN_ROWS {
+        return Ok(None);
+    }
+    let agreement = by_net.max(by_gross) as f64 / comparable as f64;
+    Ok((agreement >= CURRENCY_EVIDENCE_AGREEMENT).then(|| "USD".to_string()))
+}
+
+/// Stores what [`detect_schema_currency`] concluded. Kept apart from
+/// `fixed_currency` so a person's own answer is never overwritten by evidence,
+/// and so clearing their answer falls back to it rather than to nothing.
+pub(crate) fn set_detected_currency(
+    conn: &Connection,
+    schema_id: i64,
+    currency: Option<&str>,
+) -> rusqlite::Result<()> {
+    conn.execute(
+        "UPDATE source_schemas SET detected_currency = ?2 WHERE id = ?1",
+        params![schema_id, currency],
+    )?;
+    Ok(())
 }
 
 /// The currency and weight unit pinned across the workspace, when every

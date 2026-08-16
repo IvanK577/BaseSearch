@@ -23,8 +23,18 @@ use crate::storage::table_shape;
 fn columns_for(conn: &Connection, row_alias: &str) -> AnalyticsColumns {
     AnalyticsColumns::for_alias(table_shape::effective(conn), row_alias)
         .with_schema_fixed_values(
+            // A stated answer first, then what the data itself showed. Both are
+            // per-row subqueries on `schema_id`, so a workspace holding several
+            // sources keeps each one's currency instead of flattening them, and
+            // rows predating source schemas match neither and stay honestly
+            // unknown.
             Some(format!(
-                "(SELECT schema_meta.fixed_currency FROM source_schemas schema_meta WHERE schema_meta.id = {row_alias}.schema_id)"
+                "COALESCE(
+                     (SELECT schema_meta.fixed_currency FROM source_schemas schema_meta
+                       WHERE schema_meta.id = {row_alias}.schema_id),
+                     (SELECT schema_meta.detected_currency FROM source_schemas schema_meta
+                       WHERE schema_meta.id = {row_alias}.schema_id)
+                 )"
             )),
             Some(format!(
                 "(SELECT schema_meta.fixed_weight_unit FROM source_schemas schema_meta WHERE schema_meta.id = {row_alias}.schema_id)"

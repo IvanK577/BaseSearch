@@ -433,6 +433,31 @@ impl Db {
         .map_err(|error| error.to_string())
     }
 
+    /// Asks the data what currency each schema's value column is in, and
+    /// records the answer. Runs after an import commits, when the rows exist.
+    ///
+    /// Nothing here overwrites a currency a person stated: that lives in a
+    /// separate column and outranks this one when analytics resolves it.
+    pub fn refresh_detected_currencies(&self) {
+        let Ok(schemas) = source_schemas::list(&self.conn) else {
+            return;
+        };
+        for schema in schemas {
+            match source_schemas::detect_schema_currency(&self.conn, schema.id) {
+                Ok(detected) => {
+                    let _ = source_schemas::set_detected_currency(
+                        &self.conn,
+                        schema.id,
+                        detected.as_deref(),
+                    );
+                }
+                Err(error) => {
+                    eprintln!("[base-search] could not read the currency evidence: {error}");
+                }
+            }
+        }
+    }
+
     // ---------- reusable source mappings ----------
 
     pub fn list_source_mapping_profiles(

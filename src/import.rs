@@ -790,6 +790,10 @@ pub fn import_file_with_options(
             file_hash: Some(file_hash.as_str()),
             quality: &summary.quality,
         });
+        // The rows are in, so the file can now be asked what currency its
+        // amounts are in — see `detect_schema_currency`. Doing it here rather
+        // than per row keeps it one aggregate over the finished import.
+        db.refresh_detected_currencies();
         // Imports are the biggest WAL producers. Truncate the log once the
         // import is durable so the database does not keep a WAL the size of
         // the imported data on disk. Best effort: concurrent readers only
