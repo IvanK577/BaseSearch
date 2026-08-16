@@ -21,18 +21,24 @@ optional parts of the product.
 Base Search is a portable folder — there is no installer and nothing to
 register. Versioned ZIP packages appear on
 [GitHub Releases](https://github.com/IvanK577/BaseSearch/releases) when a
-release tag is published. Until the first release is published there, use the
-ready-to-run Windows folder included in this repository, or build from source.
+release tag is published.
 
-### Windows quick start
+**The repository does not carry a prebuilt Windows folder.** It used to, and a
+committed binary is exactly the thing that goes stale without anyone noticing:
+the copy in `dist\` stayed at 2.0 while the source moved on, so the documented
+quick start handed people an old build under a new version number. Worse, the
+two builds disagree about the search-index version, and alternating between
+them rebuilds the whole full-text index on every import. Take a release
+package, or build the current source.
 
-1. On the repository page, click the green **Code** button and choose
-   **Download ZIP** (or clone the repository with Git).
-2. Extract the whole archive to a writable folder.
-3. Open the extracted `dist\BaseSearch` folder.
-4. Double-click `BaseSearch.exe` (or `Open Base Search.cmd`).
-5. Leave **Personal workspace** selected and click **Start workspace**.
-6. Wait for **Ready**. Base Search opens the workspace in your default browser
+### Windows release package
+
+1. Download the Windows ZIP from
+   [GitHub Releases](https://github.com/IvanK577/BaseSearch/releases).
+2. Extract the entire ZIP to a writable folder, keeping every file together.
+3. Double-click `BaseSearch.exe` (or `Open Base Search.cmd`).
+4. Leave **Personal workspace** selected and click **Start workspace**.
+5. Wait for **Ready**. Base Search opens the workspace in your default browser
    at the Local URL shown by the launcher.
 
 Keep the launcher open while you work. It shows the database path, the exact
@@ -40,16 +46,22 @@ local URL, startup progress, and any startup error. Run only one copy of
 `BaseSearch.exe` at a time: a second launcher cannot share the port of the
 first one, so close the previous window before starting again.
 
-Every binary, in this repository and in packaged releases alike, runs on the
-SQLite + FTS5 engine. The optional DuckDB OLAP projection is not shipped; it is
-built only from source with the `duckdb-olap` feature.
+### Windows from source
 
-### Windows release package (when published)
+When no release covers the commit you want, build the same package the release
+pipeline builds:
 
-1. Download the Windows ZIP from
-   [GitHub Releases](https://github.com/IvanK577/BaseSearch/releases).
-2. Extract the entire ZIP to a writable folder.
-3. Open `Open Base Search.cmd` or `BaseSearch.exe` and continue as above.
+```powershell
+pwsh scripts/package-release.ps1
+```
+
+It writes `release_packages\BaseSearch-<version>-windows-x86_64\`, which is the
+folder to run and the folder to copy to another machine. Prerequisites are in
+[Build From Source](#build-from-source).
+
+Every binary, from a release or from that script, runs on the SQLite + FTS5
+engine. The optional DuckDB OLAP projection is not shipped; it is built only
+from source with the `duckdb-olap` feature.
 
 ### macOS and Linux
 
