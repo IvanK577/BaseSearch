@@ -13,6 +13,7 @@ import type {
   DatabaseStats,
   EngineStatus,
   FixedSemanticField,
+  FixedValuesResponse,
   ImportLogEntry,
   Job,
   PivotDim,
@@ -133,6 +134,14 @@ export const api = {
       `/api/columns/${encodeURIComponent(columnId)}/semantic`,
       { semantic },
     ),
+
+  /** Pins the currency and weight unit for sources that state neither. Pass
+   *  null to stop pinning one. */
+  setFixedValues: (currency: string | null, weightUnit: string | null) =>
+    postJson<FixedValuesResponse>("/api/schema/fixed-values", {
+      currency,
+      weight_unit: weightUnit,
+    }),
 
   search: (
     query: Query,

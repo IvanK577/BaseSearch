@@ -8,7 +8,7 @@ use rusqlite::Connection;
 use rusqlite::types::Value;
 
 use crate::domain::table::{
-    ImportSource, SemanticField, SourceSchema, SourceSchemaField, TableShape,
+    ImportSource, SemanticField, SourceSchema, SourceSchemaField, TableShape, validate_fixed_value,
 };
 use crate::search::{
     FieldInfo, field_catalog_for_context, field_catalog_for_source_fields,
@@ -399,6 +399,38 @@ impl Db {
         column.semantic = semantic;
         table_shape::set(&self.conn, &shape);
         true
+    }
+
+    /// The currency and weight unit pinned for this workspace, or `None` for a
+    /// field the registered schemas do not agree on.
+    pub fn workspace_fixed_values(&self) -> (Option<String>, Option<String>) {
+        source_schemas::workspace_fixed_values(&self.conn).unwrap_or((None, None))
+    }
+
+    /// Pins the currency and weight unit a source does not state itself, after
+    /// the data has already been imported. `None` clears one.
+    ///
+    /// This is the remedy the analytics hint points at: without it, a customs
+    /// export — which carries an invoice amount and no currency code anywhere —
+    /// could only ever be told its currency at import time, so an existing
+    /// database was stuck reading "unknown currency" with no way back.
+    pub fn set_workspace_fixed_values(
+        &self,
+        currency: Option<&str>,
+        weight_unit: Option<&str>,
+    ) -> Result<usize, String> {
+        let currency = currency
+            .map(|value| validate_fixed_value(SemanticField::Currency, value))
+            .transpose()?;
+        let weight_unit = weight_unit
+            .map(|value| validate_fixed_value(SemanticField::WeightUnit, value))
+            .transpose()?;
+        source_schemas::set_workspace_fixed_values(
+            &self.conn,
+            currency.as_deref(),
+            weight_unit.as_deref(),
+        )
+        .map_err(|error| error.to_string())
     }
 
     // ---------- reusable source mappings ----------

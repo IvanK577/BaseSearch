@@ -1,5 +1,7 @@
 use super::ACCENT;
-use super::format::{fmt_compact, fmt_decimal};
+use super::format::{
+    fmt_compact, fmt_decimal, fmt_money_compact, fmt_money_exact, fmt_money_per_kg,
+};
 use super::ui_text::trunc_label;
 use crate::db::{AnalyticsFilterAction, AnalyticsGroupRow, AnalyticsSection, AnalyticsSectionKind};
 use crate::i18n::{Lang, fmt, group_digits, tr};
@@ -353,7 +355,7 @@ fn compact_bar_row(
     let mono_font = egui::FontId::new(11.5, egui::FontFamily::Monospace);
     let right_text = format!(
         "{} · {}%",
-        fmt_compact(row.total_value_usd),
+        fmt_money_compact(&row.measures, lang),
         fmt_decimal(row.share_percent, 1)
     );
     let right_w = right_text.chars().count() as f32 * 7.0;
@@ -402,7 +404,7 @@ fn analytics_row_tooltip_ui(ui: &mut egui::Ui, row: &AnalyticsGroupRow, lang: La
             tooltip_metric(
                 ui,
                 tr(lang).total_value,
-                fmt_decimal(row.total_value_usd, 2),
+                fmt_money_exact(&row.measures, lang),
             );
             tooltip_metric(
                 ui,
@@ -423,7 +425,7 @@ fn analytics_row_tooltip_ui(ui: &mut egui::Ui, row: &AnalyticsGroupRow, lang: La
             tooltip_metric(
                 ui,
                 tr(lang).avg_value_kg,
-                fmt_decimal(row.avg_value_per_net_kg, 2),
+                fmt_money_per_kg(&row.measures, lang),
             );
         });
     ui.add_space(3.0);

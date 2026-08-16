@@ -315,6 +315,64 @@ pub(crate) fn compatibility_shape_with_fields(
     Ok(Some((TableShape { columns }, backing)))
 }
 
+/// The currency and weight unit pinned across the workspace, when every
+/// registered schema agrees. A workspace whose schemas disagree reports `None`
+/// for the field they disagree on, so the editor shows "mixed" rather than
+/// silently presenting one file's answer as everyone's.
+pub(crate) fn workspace_fixed_values(
+    conn: &Connection,
+) -> rusqlite::Result<(Option<String>, Option<String>)> {
+    let mut statement =
+        conn.prepare("SELECT fixed_currency, fixed_weight_unit FROM source_schemas")?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, Option<String>>(0)?,
+                row.get::<_, Option<String>>(1)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let (currencies, units): (Vec<_>, Vec<_>) = rows.into_iter().unzip();
+    Ok((agreed_value(currencies), agreed_value(units)))
+}
+
+/// The one value every schema carries, or `None` when they disagree — or when
+/// there are no schemas at all. Both cases mean the same thing to the editor:
+/// there is no workspace-wide answer to show.
+fn agreed_value(values: Vec<Option<String>>) -> Option<String> {
+    let mut values = values.into_iter();
+    let first = values.next()?;
+    values.all(|value| value == first).then_some(first)?
+}
+
+/// Pins the currency and weight unit for every registered schema, or clears
+/// them with `None`. Returns the number of schemas the write changed.
+///
+/// Applying it to every schema is deliberate. A column that states the currency
+/// still wins — `AnalyticsColumns::currency_expr` reads the mapped column
+/// first and only falls back to this — so pinning a value cannot override data
+/// that carries its own. What it fixes is the opposite case: files that state
+/// nothing, which is every customs export, where before this the answer could
+/// only be given at import time and never afterwards.
+///
+/// The schema fingerprint is left alone on purpose. It identifies the layout
+/// that was imported, not the reading a person later applies to it, and
+/// rewriting it here would either collide with another schema's fingerprint or
+/// orphan the rows already pointing at this one.
+pub(crate) fn set_workspace_fixed_values(
+    conn: &Connection,
+    currency: Option<&str>,
+    weight_unit: Option<&str>,
+) -> rusqlite::Result<usize> {
+    let changed = conn.execute(
+        "UPDATE source_schemas
+            SET fixed_currency = ?1, fixed_weight_unit = ?2
+          WHERE fixed_currency IS NOT ?1 OR fixed_weight_unit IS NOT ?2",
+        params![currency, weight_unit],
+    )?;
+    Ok(changed)
+}
+
 /// Writes an analytical meaning through to the physical source fields behind
 /// one compatibility column. Returns true when at least one field changed.
 pub(crate) fn set_fields_semantic(

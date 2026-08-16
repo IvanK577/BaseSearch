@@ -45,6 +45,43 @@ pub enum SemanticField {
     WeightUnit,
 }
 
+/// The two meanings a person may pin for a whole table instead of a column.
+///
+/// They are exactly the measures analytics refuses to combine without: money is
+/// never added across currencies, weights never across units. A source that
+/// states neither leaves analytics unable to label a total — the customs
+/// profile states neither, since its value column holds the invoice amount and
+/// the currency code appears nowhere in the file — so a person has to be able
+/// to say it once and have every reading follow.
+pub const FIXABLE_SEMANTICS: [SemanticField; 2] =
+    [SemanticField::Currency, SemanticField::WeightUnit];
+
+/// Longest fixed value accepted. Currency codes and unit names are short; the
+/// bound exists so a pasted paragraph cannot become a grouping label.
+pub const MAX_FIXED_VALUE_CHARS: usize = 32;
+
+/// Checks one pinned value and returns it trimmed.
+///
+/// Import and the post-import editor both resolve through here, so a value the
+/// importer would have refused cannot arrive later through the other door.
+pub fn validate_fixed_value(semantic: SemanticField, value: &str) -> Result<String, String> {
+    if !FIXABLE_SEMANTICS.contains(&semantic) {
+        return Err(format!(
+            "Fixed values are not supported for {semantic:?}; use Currency or WeightUnit."
+        ));
+    }
+    let value = value.trim();
+    if value.is_empty() {
+        return Err(format!("Fixed {semantic:?} value must not be empty."));
+    }
+    if value.chars().count() > MAX_FIXED_VALUE_CHARS {
+        return Err(format!(
+            "Fixed {semantic:?} value must be at most {MAX_FIXED_VALUE_CHARS} characters."
+        ));
+    }
+    Ok(value.to_string())
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SourceColumn {
     pub id: String,

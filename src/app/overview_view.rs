@@ -1,25 +1,35 @@
 use super::ACCENT;
-use super::format::{fmt_compact, fmt_decimal};
+use super::format::{
+    fmt_compact, fmt_decimal, fmt_money_compact, fmt_money_per_kg, value_per_document,
+};
 use crate::db::AnalyticsOverview;
 use crate::i18n::{Lang, group_digits, tr};
 
-pub(super) fn overview_story_cards(ui: &mut egui::Ui, overview: &AnalyticsOverview, lang: Lang) {
+/// One stat card: title, headline figure, two supporting lines, hover help.
+pub(super) type StoryCard = (&'static str, String, String, String, &'static str);
+
+/// The text of the four overview cards, separated from drawing them so the
+/// numbers can be asserted without an egui context. Every money string here
+/// resolves through the currency-bucketed measures; reading the raw
+/// `total_value_usd` at any of these sites is what made the desktop print a
+/// sum across currencies that the browser refuses to show.
+pub(super) fn overview_story_card_data(overview: &AnalyticsOverview, lang: Lang) -> [StoryCard; 4] {
     let rows_per_decl = safe_ratio(overview.row_count as f64, overview.declaration_count as f64);
-    let value_per_decl = safe_ratio(overview.total_value_usd, overview.declaration_count as f64);
+    let value_per_decl = value_per_document(&overview.measures, overview.declaration_count);
     let net_per_decl = safe_ratio(overview.total_net_kg, overview.declaration_count as f64);
     let country_total = overview
         .distinct_origin_countries
         .max(overview.distinct_dispatch_countries)
         .max(overview.distinct_trade_countries);
-    let cards = [
+    [
         (
             overview_scale_title(lang),
-            fmt_compact(overview.total_value_usd),
+            fmt_money_compact(&overview.measures, lang),
             overview_weight_line(overview, lang),
             format!(
                 "{}: {}",
                 tr(lang).avg_value_kg,
-                fmt_decimal(overview.avg_value_per_net_kg, 2)
+                fmt_money_per_kg(&overview.measures, lang)
             ),
             overview_scale_help(lang),
         ),
@@ -44,7 +54,11 @@ pub(super) fn overview_story_cards(ui: &mut egui::Ui, overview: &AnalyticsOvervi
             overview_countries_line(country_total, lang),
             overview_goods_help(lang),
         ),
-    ];
+    ]
+}
+
+pub(super) fn overview_story_cards(ui: &mut egui::Ui, overview: &AnalyticsOverview, lang: Lang) {
+    let cards = overview_story_card_data(overview, lang);
 
     let gap = 10.0;
     let avail = ui.available_width();
@@ -137,21 +151,27 @@ fn overview_rows_line(rows: u64, lang: Lang) -> String {
 
 fn overview_declaration_density_line(
     rows_per_decl: f64,
-    value_per_decl: f64,
+    value_per_decl: Option<f64>,
     lang: Lang,
 ) -> String {
+    // `None` means the rows span several currencies, so the value half of this
+    // line is dropped rather than filled with a sum of unlike money.
+    let value = match value_per_decl {
+        Some(value) => fmt_compact(value),
+        None => tr(lang).mixed_currencies.to_string(),
+    };
     match lang {
         Lang::Ua => format!(
             "{}: {} рядків | {} сума",
             overview_per_declaration_label(lang),
             fmt_decimal(rows_per_decl, 1),
-            fmt_compact(value_per_decl)
+            value
         ),
         _ => format!(
             "{}: {} rows | {} value",
             overview_per_declaration_label(lang),
             fmt_decimal(rows_per_decl, 1),
-            fmt_compact(value_per_decl)
+            value
         ),
     }
 }
@@ -332,5 +352,67 @@ pub(super) fn overview_trade_countries_help(lang: Lang) -> &'static str {
     match lang {
         Lang::Ua => "Кількість різних країн торгівлі у знайдених рядках.",
         _ => "Number of distinct trade countries in the matched rows.",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::overview_story_card_data;
+    use crate::db::{AnalyticsCurrencyTotal, AnalyticsMeasures, AnalyticsOverview};
+    use crate::i18n::Lang;
+
+    fn overview(totals: Vec<AnalyticsCurrencyTotal>, raw_sum: f64) -> AnalyticsOverview {
+        AnalyticsOverview {
+            row_count: 2,
+            declaration_count: 2,
+            // The scalar the cards used to read. It stays populated on purpose:
+            // the point of the test is that nothing renders it.
+            total_value_usd: raw_sum,
+            measures: AnalyticsMeasures {
+                currency_totals: totals,
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    fn bucket(currency: &str, known: bool, total: f64) -> AnalyticsCurrencyTotal {
+        AnalyticsCurrencyTotal {
+            currency: currency.to_string(),
+            known,
+            valued_rows: 1,
+            total_value: total,
+        }
+    }
+
+    #[test]
+    fn the_scale_card_carries_the_currency_it_is_denominated_in() {
+        let cards = overview_story_card_data(
+            &overview(vec![bucket("USD", true, 1500.0)], 1500.0),
+            Lang::En,
+        );
+        assert_eq!(cards[0].1, "1500 USD");
+    }
+
+    #[test]
+    fn the_scale_card_refuses_to_add_two_currencies() {
+        let mixed = overview(
+            vec![bucket("USD", true, 1000.0), bucket("EUR", true, 500.0)],
+            1500.0,
+        );
+        let cards = overview_story_card_data(&mixed, Lang::En);
+        assert_eq!(cards[0].1, "Several currencies");
+        // The per-document line on the documents card is money too.
+        assert!(
+            cards[1].3.contains("Several currencies"),
+            "value per document must not be an average across currencies: {}",
+            cards[1].3
+        );
+        for card in &cards {
+            assert!(
+                !card.1.contains("1500") && !card.3.contains("1500"),
+                "the cross-currency sum reached a card: {card:?}"
+            );
+        }
     }
 }

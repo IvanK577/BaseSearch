@@ -348,24 +348,12 @@ fn validate_fixed_values(
     }
     let mut validated = BTreeMap::new();
     for (semantic, value) in values {
-        if !matches!(
-            semantic,
-            SemanticField::Currency | SemanticField::WeightUnit
-        ) {
-            return Err(format!(
-                "Fixed values are not supported for {semantic:?}; use Currency or WeightUnit."
-            ));
-        }
-        let value = value.trim();
-        if value.is_empty() {
-            return Err(format!("Fixed {semantic:?} value must not be empty."));
-        }
-        if value.chars().count() > 32 {
-            return Err(format!(
-                "Fixed {semantic:?} value must be at most 32 characters."
-            ));
-        }
-        validated.insert(*semantic, value.to_string());
+        // One rule, shared with the post-import editor on the Columns page, so
+        // the two doors into `source_schemas.fixed_currency` cannot drift.
+        validated.insert(
+            *semantic,
+            crate::domain::table::validate_fixed_value(*semantic, value)?,
+        );
     }
     Ok(validated)
 }

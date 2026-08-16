@@ -825,6 +825,9 @@ fn required_permission(method: &Method, path: &str) -> Option<Permission> {
     } else if path.starts_with("/admin/network") {
         Some(Permission::ManageNetwork)
     } else if path.ends_with("/semantic")
+        // Pinning the workspace currency or weight unit reinterprets every
+        // stored number for everyone, so it is a mapping decision, not a read.
+        || (path == "/schema/fixed-values" && is_mutating_method(method))
         || (path.starts_with("/imports/profiles") && is_mutating_method(method))
     {
         Some(Permission::ManageMappings)

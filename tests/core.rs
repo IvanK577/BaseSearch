@@ -3920,6 +3920,127 @@ fn group_and_month_rows_inherit_the_single_currency_bucket() {
     assert!(top[0].compatible_usd.is_none());
 }
 
+/// A customs export names no currency anywhere — its value column holds the
+/// invoice amount and the code is simply absent — so every total reads
+/// "unknown currency", the browser's monthly value chart refuses to draw
+/// (`commonCurrency` is null when no row carries a known bucket), and value
+/// shares fall back to row counts. Until this existed the only place to answer
+/// was the import screen, which left an already-loaded database with no way
+/// back: the analytics hint pointed at the Columns page, and that page could
+/// only remap a column which was never in the file.
+#[test]
+fn pinning_a_currency_after_import_labels_every_analytics_reading() {
+    let dir = tempfile::tempdir().unwrap();
+    let xlsx = dir.path().join("pin-currency.xlsx");
+    let db_path = dir.path().join("data").join("pin-currency.db");
+    write_test_xlsx(
+        &xlsx,
+        &[
+            vec![
+                ("declaration_number", "24UA100110000201U1"),
+                ("declaration_date", "15.03.2024"),
+                ("recipient", "ТОВ «АЛЬФА»"),
+                ("edrpou", "33333333"),
+                ("product_code", "8517130000"),
+                ("net_kg", "10"),
+                ("currency_control_value", "1000"),
+            ],
+            vec![
+                ("declaration_number", "24UA100110000202U1"),
+                ("declaration_date", "16.03.2024"),
+                ("recipient", "ТОВ «БЕТА»"),
+                ("edrpou", "44444444"),
+                ("product_code", "8517130000"),
+                ("net_kg", "5"),
+                ("currency_control_value", "500"),
+            ],
+        ],
+    );
+    let mut db = Db::open(&db_path).unwrap();
+    let summary = import::import_file(&mut db, &xlsx, &AtomicBool::new(false), &mut |_, _, _| {});
+    assert_eq!(summary.error, None);
+    assert_eq!(summary.imported, 2);
+
+    // The state the complaint describes.
+    let before = db.analytics(&Query::default(), 10).unwrap();
+    assert!(!before.overview.measures.currency_totals[0].known);
+    assert!(before.overview.measures.compatible_usd_total().is_none());
+    assert_eq!(db.workspace_fixed_values(), (None, None));
+
+    // One answer, given after the data is already loaded.
+    assert_eq!(
+        db.set_workspace_fixed_values(Some(" usd "), Some("kg")),
+        Ok(1)
+    );
+    assert_eq!(
+        db.workspace_fixed_values(),
+        (Some("usd".to_string()), Some("kg".to_string())),
+        "the pinned value is stored trimmed"
+    );
+
+    let after = db.analytics(&Query::default(), 10).unwrap();
+    let totals = &after.overview.measures.currency_totals;
+    assert_eq!(totals.len(), 1);
+    assert!(totals[0].known, "a pinned currency is a known currency");
+    assert_eq!(totals[0].currency, "USD");
+    assert_close(totals[0].total_value, 1500.0);
+
+    // This is the field the browser reads before it will draw the value chart
+    // or compute a value share, so pinning has to reach it and not merely
+    // relabel the bucket.
+    assert_close(
+        after.overview.measures.compatible_usd_total().unwrap(),
+        1500.0,
+    );
+    assert!(after.overview.compatible_usd.is_some());
+
+    // Month and group rows inherit the same labelled bucket.
+    assert!(
+        after
+            .months
+            .iter()
+            .all(|month| month.measures.currency_totals[0].currency == "USD"),
+        "every month row must carry the pinned currency"
+    );
+    assert!(
+        after
+            .top_recipients
+            .iter()
+            .all(|row| row.measures.currency_totals[0].currency == "USD"),
+        "every group row must carry the pinned currency"
+    );
+
+    // The weight unit rides the same mechanism: pinned "kg" turns a raw weight
+    // column into a normalized kilogram total.
+    let weights = &after.overview.measures.net_weight_totals;
+    assert_eq!(weights.len(), 1);
+    assert!(weights[0].known);
+    assert_eq!(weights[0].normalized_unit.as_deref(), Some("kg"));
+    assert_close(weights[0].total_kg.unwrap(), 15.0);
+
+    // Clearing puts the reading back, so the control is not a one-way door.
+    assert_eq!(db.set_workspace_fixed_values(None, None), Ok(1));
+    let cleared = db.analytics(&Query::default(), 10).unwrap();
+    assert!(!cleared.overview.measures.currency_totals[0].known);
+    assert_eq!(db.workspace_fixed_values(), (None, None));
+
+    // Writing the same values twice reports that nothing moved.
+    assert_eq!(db.set_workspace_fixed_values(Some("EUR"), None), Ok(1));
+    assert_eq!(db.set_workspace_fixed_values(Some("EUR"), None), Ok(0));
+
+    // The importer's rules apply to this door too, and a rejected value must
+    // not disturb what is already stored.
+    assert!(
+        db.set_workspace_fixed_values(Some("   "), None)
+            .is_err_and(|error| error.contains("must not be empty"))
+    );
+    assert!(
+        db.set_workspace_fixed_values(Some(&"X".repeat(33)), None)
+            .is_err_and(|error| error.contains("at most"))
+    );
+    assert_eq!(db.workspace_fixed_values().0, Some("EUR".to_string()));
+}
+
 /// Opening a database carried over from an older version rebuilds it, which is
 /// minutes of work on a large one. That whole time the window showed a spinner
 /// and a rising seconds counter and nothing else, because every account of the
@@ -4055,6 +4176,66 @@ fn a_duplicate_row_always_names_the_file_that_brought_it_in_first() {
         vec!["first.csv", "first.csv"],
         "later copies must all name the first file, not each other"
     );
+}
+
+/// Money from two currencies must never arrive as one number.
+///
+/// The browser already refused to show a scalar here. The desktop read
+/// `overview.total_value_usd`, which is a plain `SUM(value)` over every bucket,
+/// so the two interfaces printed different things from the same database and
+/// the desktop's number was hryvnia added to dollars.
+#[test]
+fn several_currencies_never_collapse_into_one_desktop_figure() {
+    let dir = tempfile::tempdir().unwrap();
+    let usd = dir.path().join("usd.csv");
+    let eur = dir.path().join("eur.csv");
+    std::fs::write(&usd, "Одержувач,Вартість,Нетто\nТОВ «АЛЬФА»,1000,10\n").unwrap();
+    std::fs::write(&eur, "Одержувач,Вартість,Нетто\nТОВ «БЕТА»,500,5\n").unwrap();
+
+    let mut db = Db::open(&dir.path().join("mixed.db")).unwrap();
+    for (path, currency) in [(&usd, "USD"), (&eur, "EUR")] {
+        let name = path.file_name().unwrap().to_string_lossy().into_owned();
+        let options = import::ImportOptions::default().with_sheet_fixed_values(
+            name,
+            [
+                (SemanticField::Currency, currency),
+                (SemanticField::WeightUnit, "kg"),
+            ],
+        );
+        let summary = import::import_file_with_options(
+            &mut db,
+            path,
+            &options,
+            &AtomicBool::new(false),
+            &mut |_, _, _| {},
+        );
+        assert_eq!(summary.error, None);
+        assert_eq!(summary.imported, 1);
+    }
+
+    let analytics = db.analytics(&Query::default(), 10).unwrap();
+    let totals = &analytics.overview.measures.currency_totals;
+    assert_eq!(totals.len(), 2, "each currency keeps its own bucket");
+    assert!(totals.iter().all(|total| total.known));
+
+    // No single money figure is true of these rows, and the helper every
+    // desktop money site now reads says so.
+    assert_eq!(analytics.overview.measures.single_currency_total(), None);
+    assert!(analytics.overview.compatible_usd.is_none());
+    // Whatever bucketing a subset row ends up with, no row may offer a scalar
+    // that is the two currencies added together.
+    for row in &analytics.top_recipients {
+        if let Some((total, _)) = row.measures.single_currency_total() {
+            assert!(
+                (total - 1500.0).abs() > 1e-6,
+                "group row {} offered the cross-currency sum as one figure",
+                row.label
+            );
+        }
+    }
+
+    // The raw scalar is still 1500 — that is exactly why nothing may render it.
+    assert_close(analytics.overview.total_value_usd, 1500.0);
 }
 
 /// Two recipient synonyms must not cancel each other out.

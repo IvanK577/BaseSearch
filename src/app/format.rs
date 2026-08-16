@@ -1,3 +1,6 @@
+use crate::db::AnalyticsMeasures;
+use crate::i18n::{Lang, tr};
+
 /// "2024-03" -> "03'24".
 pub(super) fn short_month(month: &str) -> String {
     match (month.get(0..4), month.get(5..7)) {
@@ -55,9 +58,128 @@ pub(super) fn fmt_decimal(value: f64, decimals: usize) -> String {
     grouped
 }
 
+/// Money for a stat tile, carrying the currency it is denominated in.
+///
+/// The desktop used to print `SUM(value)` with no label at all, which is the
+/// right number only while every row happens to share a currency. When they do
+/// not, no scalar is true of them, and saying so is the only honest option —
+/// the per-currency breakdown is in `measures.currency_totals`.
+pub(super) fn fmt_money_compact(measures: &AnalyticsMeasures, lang: Lang) -> String {
+    label_money(
+        measures.single_currency_total(),
+        measures.currency_totals.is_empty(),
+        lang,
+        fmt_compact,
+    )
+}
+
+/// Money per kilogram on the same rule.
+pub(super) fn fmt_money_per_kg(measures: &AnalyticsMeasures, lang: Lang) -> String {
+    label_money(
+        measures.single_currency_per_net_kg(),
+        measures.value_per_net_weight.is_empty(),
+        lang,
+        |value| fmt_decimal(value, 2),
+    )
+}
+
+/// Money at full precision, for report tables and tooltips.
+pub(super) fn fmt_money_exact(measures: &AnalyticsMeasures, lang: Lang) -> String {
+    label_money(
+        measures.single_currency_total(),
+        measures.currency_totals.is_empty(),
+        lang,
+        |value| fmt_decimal(value, 2),
+    )
+}
+
+fn label_money(
+    figure: Option<(f64, &str)>,
+    nothing_to_show: bool,
+    lang: Lang,
+    render: impl Fn(f64) -> String,
+) -> String {
+    match figure {
+        // A single bucket whose currency the source never stated: show the
+        // number bare, as it has always been shown, and let the standing
+        // currency note explain it.
+        Some((value, "")) => render(value),
+        Some((value, code)) => format!("{} {code}", render(value)),
+        // No money in these rows at all is a zero, not a currency conflict.
+        None if nothing_to_show => render(0.0),
+        None => tr(lang).mixed_currencies.to_string(),
+    }
+}
+
+/// Value per document, which is only meaningful inside a single currency.
+pub(super) fn value_per_document(measures: &AnalyticsMeasures, documents: u64) -> Option<f64> {
+    let (total, _) = measures.single_currency_total()?;
+    (documents > 0).then(|| total / documents as f64)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{fmt_compact, fmt_decimal, short_month};
+    use super::{
+        fmt_compact, fmt_decimal, fmt_money_compact, fmt_money_exact, short_month,
+        value_per_document,
+    };
+    use crate::db::{AnalyticsCurrencyTotal, AnalyticsMeasures};
+    use crate::i18n::Lang;
+
+    fn bucket(currency: &str, known: bool, total: f64) -> AnalyticsCurrencyTotal {
+        AnalyticsCurrencyTotal {
+            currency: currency.to_string(),
+            known,
+            valued_rows: 1,
+            total_value: total,
+        }
+    }
+
+    fn measures(totals: Vec<AnalyticsCurrencyTotal>) -> AnalyticsMeasures {
+        AnalyticsMeasures {
+            currency_totals: totals,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_single_bucket_shows_its_number_with_its_currency() {
+        let usd = measures(vec![bucket("USD", true, 1500.0)]);
+        assert_eq!(fmt_money_compact(&usd, Lang::En), "1500 USD");
+        assert_eq!(fmt_money_exact(&usd, Lang::En), "1\u{202F}500 USD");
+        assert_eq!(value_per_document(&usd, 3), Some(500.0));
+    }
+
+    #[test]
+    fn an_unstated_currency_still_shows_the_number() {
+        let unknown = measures(vec![bucket("__unknown__", false, 1500.0)]);
+        assert_eq!(fmt_money_compact(&unknown, Lang::En), "1500");
+        assert_eq!(value_per_document(&unknown, 3), Some(500.0));
+    }
+
+    #[test]
+    fn several_currencies_never_collapse_into_one_number() {
+        let mixed = measures(vec![
+            bucket("USD", true, 1000.0),
+            bucket("EUR", true, 500.0),
+        ]);
+        assert_eq!(fmt_money_compact(&mixed, Lang::En), "Several currencies");
+        assert_eq!(fmt_money_exact(&mixed, Lang::En), "Several currencies");
+        assert!(
+            !fmt_money_compact(&mixed, Lang::En).contains("1500"),
+            "the two buckets must never be added together"
+        );
+        assert_eq!(
+            value_per_document(&mixed, 3),
+            None,
+            "a per-document average across currencies is not a number"
+        );
+    }
+
+    #[test]
+    fn no_money_at_all_is_a_zero_not_a_currency_conflict() {
+        assert_eq!(fmt_money_compact(&measures(vec![]), Lang::En), "0.0");
+    }
 
     #[test]
     fn short_month_compacts_iso_month() {

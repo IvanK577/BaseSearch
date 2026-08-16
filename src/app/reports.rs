@@ -1,5 +1,7 @@
 use super::analytics_groups::section_title;
-use super::format::{fmt_compact, fmt_decimal};
+use super::format::{
+    fmt_compact, fmt_decimal, fmt_money_compact, fmt_money_exact, fmt_money_per_kg,
+};
 use super::month_chart::{MonthMetric, months_chart};
 use super::price_view::price_metric_title;
 use super::ui_text::{query_summary, trunc_label};
@@ -60,16 +62,16 @@ pub(super) fn report_markdown(analytics: &Analytics, query: &Query, lang: Lang) 
         group_digits(analytics.overview.declaration_count)
     ));
     out.push_str(&format!(
-        "- Total value: {:.2}\n",
-        analytics.overview.total_value_usd
+        "- Total value: {}\n",
+        fmt_money_exact(&analytics.overview.measures, lang)
     ));
     out.push_str(&format!(
         "- Net weight: {:.3} kg\n",
         analytics.overview.total_net_kg
     ));
     out.push_str(&format!(
-        "- Average value/kg: {:.2}\n\n",
-        analytics.overview.avg_value_per_net_kg
+        "- Average value/kg: {}\n\n",
+        fmt_money_per_kg(&analytics.overview.measures, lang)
     ));
     append_report_sections(&mut out, "Companies", &analytics.company_sections);
     append_report_sections(&mut out, "Goods", &analytics.product_sections);
@@ -95,7 +97,7 @@ pub(super) fn report_html(analytics: &Analytics, query: &Query, lang: Lang) -> S
         ),
         (
             tr(lang).total_value,
-            format!("{:.2}", analytics.overview.total_value_usd),
+            fmt_money_exact(&analytics.overview.measures, lang),
         ),
         (
             tr(lang).net_weight,
@@ -103,7 +105,7 @@ pub(super) fn report_html(analytics: &Analytics, query: &Query, lang: Lang) -> S
         ),
         (
             tr(lang).avg_value_kg,
-            fmt_decimal(analytics.overview.avg_value_per_net_kg, 2),
+            fmt_money_per_kg(&analytics.overview.measures, lang),
         ),
         (
             tr(lang).unique_edrpou,
@@ -166,7 +168,7 @@ pub(super) fn report_ui(ui: &mut egui::Ui, analytics: &Analytics, query: &Query,
         kpi_tile(
             ui,
             tr(lang).total_value,
-            fmt_compact(analytics.overview.total_value_usd),
+            fmt_money_compact(&analytics.overview.measures, lang),
             tr(lang).total_value_help,
         );
         kpi_tile(
@@ -178,7 +180,7 @@ pub(super) fn report_ui(ui: &mut egui::Ui, analytics: &Analytics, query: &Query,
         kpi_tile(
             ui,
             tr(lang).avg_value_kg,
-            fmt_decimal(analytics.overview.avg_value_per_net_kg, 2),
+            fmt_money_per_kg(&analytics.overview.measures, lang),
             tr(lang).avg_value_kg_help,
         );
         kpi_tile(

@@ -53,6 +53,8 @@ const response: SchemaResponse = {
   columns: [],
   has_shape: false,
   total_rows: 12,
+  fixed_currency: null,
+  fixed_weight_unit: null,
 };
 
 beforeEach(() => {

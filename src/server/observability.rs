@@ -255,6 +255,7 @@ pub(crate) fn normalized_api_route(path: &str) -> Option<&'static str> {
         ["admin", "users", _] => "/api/v2/admin/users/{username}",
         ["admin", "duckdb", "rebuild"] => "/api/v2/admin/duckdb/rebuild",
         ["schema"] => "/api/v2/schema",
+        ["schema", "fixed-values"] => "/api/v2/schema/fixed-values",
         ["columns", _, "semantic"] => "/api/v2/columns/{id}/semantic",
         ["search"] => "/api/v2/search",
         ["count"] => "/api/v2/count",

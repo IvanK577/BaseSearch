@@ -322,6 +322,46 @@ impl AnalyticsMeasures {
             .sum()
     }
 
+    /// The one money figure these rows can honestly show, with the label it
+    /// has to carry: the currency code for a recognized bucket, or an empty
+    /// label for a single bucket whose currency the source never stated.
+    ///
+    /// `None` means the rows span more than one currency, and no single number
+    /// is true of them. Callers that print a scalar must render this as
+    /// "not comparable" and fall back to `currency_totals`, never to
+    /// `SUM(value)` — adding hryvnia to dollars produces a number that looks
+    /// authoritative and means nothing.
+    pub fn single_currency_total(&self) -> Option<(f64, &str)> {
+        match self.currency_totals.as_slice() {
+            [only] => Some((
+                only.total_value,
+                if only.known {
+                    only.currency.as_str()
+                } else {
+                    ""
+                },
+            )),
+            _ => None,
+        }
+    }
+
+    /// Value per kilogram on the same rule: one currency bucket, one figure.
+    pub fn single_currency_per_net_kg(&self) -> Option<(f64, &str)> {
+        match self.value_per_net_weight.as_slice() {
+            [only] => only.value_per_weight.map(|ratio| {
+                (
+                    ratio,
+                    if only.currency.starts_with("__unknown__") {
+                        ""
+                    } else {
+                        only.currency.as_str()
+                    },
+                )
+            }),
+            _ => None,
+        }
+    }
+
     pub fn compatible_usd_total(&self) -> Option<f64> {
         self.compatible_value_total
             .as_ref()

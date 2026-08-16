@@ -74,6 +74,7 @@ fn api_router() -> Router<AppState> {
         )
         .route("/admin/users/{username}", delete(auth::delete_user))
         .route("/schema", get(schema::schema))
+        .route("/schema/fixed-values", post(schema::set_fixed_values))
         .route("/columns/{id}/semantic", post(schema::set_semantic))
         .route("/search", post(search::search))
         .route("/count", post(search::count))

@@ -177,6 +177,19 @@ export interface SchemaResponse {
   columns: SourceColumn[];
   has_shape: boolean;
   total_rows: number;
+  /** Currency pinned for sources that state none. Null when nothing is pinned,
+   *  or when the imported schemas disagree. */
+  fixed_currency: string | null;
+  /** Weight unit pinned for sources that state none, same rule. */
+  fixed_weight_unit: string | null;
+}
+
+export interface FixedValuesResponse {
+  ok: boolean;
+  fixed_currency: string | null;
+  fixed_weight_unit: string | null;
+  /** Schemas the write moved, so the caller can say nothing changed. */
+  changed_schemas: number;
 }
 
 export interface StorageInfo {

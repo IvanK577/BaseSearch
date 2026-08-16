@@ -51,6 +51,7 @@ export function ColumnsPage() {
 
   return (
     <div className="stack content-narrow">
+      <FixedValuesPanel schema={schema} onSaved={setSchema} />
       <div className="panel panel-pad">
         <div className="section-title">{t("columns_title")}</div>
         <p className="muted" style={{ marginTop: 0 }}>
@@ -90,6 +91,94 @@ export function ColumnsPage() {
             </tbody>
           </table>
         </div>
+      </div>
+    </div>
+  );
+}
+
+// Pins the currency and weight unit for sources that state neither.
+//
+// This is where the "unknown currency" hint on Analyze has to land. Before it
+// existed the hint sent people here and the page could only remap a column —
+// no use at all for a customs export, which carries an invoice amount and no
+// currency code anywhere in the file.
+function FixedValuesPanel({
+  schema,
+  onSaved,
+}: {
+  schema: SchemaResponse;
+  onSaved: (next: (prev: SchemaResponse | null) => SchemaResponse | null) => void;
+}) {
+  const { t } = useI18n();
+  const { toast, canEditData } = useStore();
+  const [currency, setCurrency] = useState(schema.fixed_currency ?? "");
+  const [weightUnit, setWeightUnit] = useState(schema.fixed_weight_unit ?? "");
+  const [saving, setSaving] = useState(false);
+
+  const dirty =
+    currency.trim() !== (schema.fixed_currency ?? "") ||
+    weightUnit.trim() !== (schema.fixed_weight_unit ?? "");
+
+  const apply = async () => {
+    setSaving(true);
+    try {
+      const res = await api.setFixedValues(
+        currency.trim() === "" ? null : currency.trim(),
+        weightUnit.trim() === "" ? null : weightUnit.trim(),
+      );
+      onSaved((prev) =>
+        prev
+          ? {
+              ...prev,
+              fixed_currency: res.fixed_currency,
+              fixed_weight_unit: res.fixed_weight_unit,
+            }
+          : prev,
+      );
+      setCurrency(res.fixed_currency ?? "");
+      setWeightUnit(res.fixed_weight_unit ?? "");
+      toast(t("columns_context_saved"), "success");
+    } catch (err) {
+      toast((err as ApiError)?.message ?? t("columns_update_failed"), "error");
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <div className="panel panel-pad">
+      <div className="section-title">{t("columns_context_title")}</div>
+      <p className="muted" style={{ marginTop: 0 }}>
+        {t("columns_context_desc")}
+      </p>
+      <div className="row" style={{ gap: 16, flexWrap: "wrap", alignItems: "flex-end" }}>
+        <label className="field">
+          <span className="field-label">{t("imports_profile_currency")}</span>
+          <input
+            className="input"
+            value={currency}
+            disabled={!canEditData || saving}
+            placeholder={t("imports_profile_currency_hint")}
+            onChange={(event) => setCurrency(event.target.value)}
+          />
+        </label>
+        <label className="field">
+          <span className="field-label">{t("imports_profile_weight_unit")}</span>
+          <input
+            className="input"
+            value={weightUnit}
+            disabled={!canEditData || saving}
+            placeholder={t("imports_profile_weight_unit_hint")}
+            onChange={(event) => setWeightUnit(event.target.value)}
+          />
+        </label>
+        <button
+          className="btn"
+          disabled={!canEditData || saving || !dirty}
+          onClick={apply}
+        >
+          {t("common_apply")}
+        </button>
       </div>
     </div>
   );
