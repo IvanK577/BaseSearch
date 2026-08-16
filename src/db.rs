@@ -92,6 +92,21 @@ impl Db {
         })
     }
 
+    /// Opens a database and reports each phase of a first-open upgrade.
+    ///
+    /// A database carried over from an older version is rebuilt on this call,
+    /// which is minutes of work on a large one. Without the callback the only
+    /// account of it went to stderr, which a windowed release build does not
+    /// have, so the window sat on a spinner for the whole upgrade.
+    pub fn open_with_progress(
+        path: &Path,
+        progress: &mut dyn FnMut(StartupPhase),
+    ) -> Result<Db, String> {
+        Ok(Db {
+            conn: storage_connection::open_with_progress(path, progress)?,
+        })
+    }
+
     pub fn open_runtime(path: &Path) -> Result<Db, String> {
         Ok(Db {
             conn: storage_connection::open_runtime(path)?,

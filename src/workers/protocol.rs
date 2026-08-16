@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use crate::db::{
     Analytics, AnalyticsScope, AnalyticsSection, AnalyticsSectionKind, CompanyProfile, Db,
-    PivotDim, PivotMetric, PivotResult, Query, Undervaluation,
+    PivotDim, PivotMetric, PivotResult, Query, StartupPhase, Undervaluation,
 };
 use crate::export::ExportError;
 use crate::import::{FileSummary, ImportPhase};
@@ -144,6 +144,9 @@ pub enum Msg {
     ExportDone(Result<(u64, PathBuf), ExportError>),
     DbCleared(Result<(), String>),
     MaintenanceDone(Result<String, String>),
+    /// What opening the database is doing, so a first-open upgrade shows its
+    /// phase instead of an unexplained spinner.
+    StartupProgress(StartupPhase),
     StartupDone(Result<StartupData, String>),
     Fatal(String),
 }

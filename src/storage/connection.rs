@@ -4,6 +4,7 @@ use std::time::Duration;
 use rusqlite::functions::FunctionFlags;
 use rusqlite::{Connection, OpenFlags, OptionalExtension};
 
+use crate::db_types::StartupPhase;
 use crate::storage::extra::{extra_value_for_header, parse_extra};
 use crate::storage::maintenance;
 use crate::storage::migrations;
@@ -28,6 +29,18 @@ const GIBIBYTE: u64 = 1024 * 1024 * 1024;
 const MIN_UPGRADE_HEADROOM_BYTES: u64 = GIBIBYTE;
 
 pub(crate) fn open(path: &Path) -> Result<Connection, String> {
+    open_with_progress(path, &mut |_| {})
+}
+
+/// Opens a database, reporting each phase of a first-open upgrade.
+///
+/// The callback runs on the calling thread, before the connection is returned,
+/// so a UI has to be driven from somewhere else — the desktop opens the
+/// database on a worker thread and forwards these into its startup screen.
+pub(crate) fn open_with_progress(
+    path: &Path,
+    progress: &mut dyn FnMut(StartupPhase),
+) -> Result<Connection, String> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|err| format!("{}: {err}", parent.display()))?;
     }
@@ -35,7 +48,7 @@ pub(crate) fn open(path: &Path) -> Result<Connection, String> {
         .map(|metadata| metadata.len() > 0)
         .unwrap_or(false);
     let conn = Connection::open(path).map_err(|err| err.to_string())?;
-    initialize(&conn, path, database_existed)?;
+    initialize(&conn, path, database_existed, progress)?;
     let heal_started = std::time::Instant::now();
     heal_oversized_wal(&conn, path);
     if heal_started.elapsed().as_secs() >= 1 {
@@ -55,7 +68,12 @@ pub(crate) fn open_runtime(path: &Path) -> Result<Connection, String> {
     Ok(conn)
 }
 
-fn initialize(conn: &Connection, path: &Path, database_existed: bool) -> Result<(), String> {
+fn initialize(
+    conn: &Connection,
+    path: &Path,
+    database_existed: bool,
+    progress: &mut dyn FnMut(StartupPhase),
+) -> Result<(), String> {
     // Startup phases on a large database can take real time; report any phase
     // that exceeds one second so slow starts are diagnosable from the log.
     let phase_started = std::cell::Cell::new(std::time::Instant::now());
@@ -80,14 +98,15 @@ fn initialize(conn: &Connection, path: &Path, database_existed: bool) -> Result<
     } else {
         None
     };
+    progress(StartupPhase::CheckingVersion);
     let upgrade_required = database_existed
         && migrations::destructive_upgrade_required(conn).map_err(|err| err.to_string())?;
     report("checking the schema version");
     let backup = if upgrade_required || recorded_backup.is_some() {
         Some(match recorded_backup {
-            Some(backup) => reuse_pre_upgrade_backup(path, backup)?,
+            Some(backup) => reuse_pre_upgrade_backup(path, backup, progress)?,
             None => {
-                let backup = create_pre_upgrade_backup(conn, path)?;
+                let backup = create_pre_upgrade_backup(conn, path, progress)?;
                 record_pre_upgrade_backup(conn, &backup)?;
                 backup
             }
@@ -96,10 +115,15 @@ fn initialize(conn: &Connection, path: &Path, database_existed: bool) -> Result<
         None
     };
     if backup.is_some() {
+        // Only a real upgrade announces itself. `ensure_schema` also runs on
+        // every ordinary open — it is idempotent DDL — and saying "upgrading"
+        // there would put "do not close the window" in front of a person every
+        // single start.
+        progress(StartupPhase::UpgradingStructure);
         eprintln!("[base-search] One-time database upgrade: applying schema changes.");
     }
     phase_started.set(std::time::Instant::now());
-    if let Err(error) = migrations::ensure_schema(conn) {
+    if let Err(error) = migrations::ensure_schema(conn, progress) {
         return Err(match backup {
             Some(backup) => format!(
                 "Database upgrade failed: {error}. The pre-upgrade backup is at {}",
@@ -110,6 +134,7 @@ fn initialize(conn: &Connection, path: &Path, database_existed: bool) -> Result<
     }
     report("ensuring tables and indexes");
     if let Some(backup) = backup {
+        progress(StartupPhase::VerifyingUpgrade);
         eprintln!("[base-search] One-time database upgrade: verifying the upgraded database.");
         sqlite_integrity_check(conn).map_err(|error| {
             format!(
@@ -205,7 +230,12 @@ fn clear_recorded_pre_upgrade_backup(conn: &Connection) -> Result<(), String> {
     .map_err(|error| error.to_string())
 }
 
-fn reuse_pre_upgrade_backup(database: &Path, backup: PathBuf) -> Result<PathBuf, String> {
+fn reuse_pre_upgrade_backup(
+    database: &Path,
+    backup: PathBuf,
+    progress: &mut dyn FnMut(StartupPhase),
+) -> Result<PathBuf, String> {
+    progress(StartupPhase::VerifyingBackup);
     if !backup_path_belongs_to_database(database, &backup) || !backup.is_file() {
         return Err(format!(
             "A previous one-time database upgrade is incomplete, but its recorded backup is missing or does not belong beside this database: {}. Refusing to continue; the database was not modified",
@@ -252,8 +282,12 @@ fn backup_path_belongs_to_database(database: &Path, backup: &Path) -> bool {
     )) && backup_name.to_string_lossy().ends_with(".bak")
 }
 
-fn create_pre_upgrade_backup(conn: &Connection, path: &Path) -> Result<PathBuf, String> {
-    create_pre_upgrade_backup_with_available_space(conn, path, |directory| {
+fn create_pre_upgrade_backup(
+    conn: &Connection,
+    path: &Path,
+    progress: &mut dyn FnMut(StartupPhase),
+) -> Result<PathBuf, String> {
+    create_pre_upgrade_backup_with_available_space(conn, path, progress, |directory| {
         fs2::available_space(directory).map_err(|error| error.to_string())
     })
 }
@@ -261,8 +295,10 @@ fn create_pre_upgrade_backup(conn: &Connection, path: &Path) -> Result<PathBuf, 
 fn create_pre_upgrade_backup_with_available_space(
     conn: &Connection,
     path: &Path,
+    progress: &mut dyn FnMut(StartupPhase),
     available_space: impl FnOnce(&Path) -> Result<u64, String>,
 ) -> Result<PathBuf, String> {
+    progress(StartupPhase::CheckingFreeSpace);
     eprintln!(
         "[base-search] One-time database upgrade: checking free disk space for a verified backup."
     );
@@ -317,6 +353,7 @@ fn create_pre_upgrade_backup_with_available_space(
             backup.display()
         )
     })?;
+    progress(StartupPhase::CreatingBackup);
     eprintln!(
         "[base-search] One-time database upgrade: creating backup at {} (source footprint {}, required free space {}, available {}).",
         backup.display(),
@@ -332,6 +369,7 @@ fn create_pre_upgrade_backup_with_available_space(
         ));
     }
 
+    progress(StartupPhase::VerifyingBackup);
     eprintln!(
         "[base-search] One-time database upgrade: verifying the complete backup (full integrity check)."
     );
@@ -708,9 +746,13 @@ mod tests {
             .execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
             .unwrap();
 
-        let error =
-            create_pre_upgrade_backup_with_available_space(&connection, &database, |_| Ok(1024))
-                .unwrap_err();
+        let error = create_pre_upgrade_backup_with_available_space(
+            &connection,
+            &database,
+            &mut |_| {},
+            |_| Ok(1024),
+        )
+        .unwrap_err();
 
         assert!(
             error.contains("Insufficient free space")

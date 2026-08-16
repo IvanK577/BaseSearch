@@ -1,5 +1,6 @@
 use rusqlite::{Connection, params};
 
+use crate::db_types::StartupPhase;
 use crate::domain::table::SemanticField;
 use crate::schema::{COLUMNS, column_for_semantic};
 use crate::storage::{
@@ -16,10 +17,13 @@ pub(crate) fn destructive_upgrade_required(conn: &Connection) -> rusqlite::Resul
     Ok(meta::get(conn, "records_schema").as_deref() != Some(RECORDS_SCHEMA_VERSION))
 }
 
-pub(crate) fn ensure_schema(conn: &Connection) -> rusqlite::Result<()> {
+pub(crate) fn ensure_schema(
+    conn: &Connection,
+    progress: &mut dyn FnMut(StartupPhase),
+) -> rusqlite::Result<()> {
     ensure_meta_schema(conn)?;
     ensure_fts_schema(conn)?;
-    migrate_records_schema(conn)?;
+    migrate_records_schema(conn, progress)?;
     conn.execute_batch(&format!(
         "{records};
         {fts}
@@ -230,7 +234,10 @@ fn records_ddl() -> String {
     records_ddl_for("records")
 }
 
-fn migrate_records_schema(conn: &Connection) -> rusqlite::Result<()> {
+fn migrate_records_schema(
+    conn: &Connection,
+    progress: &mut dyn FnMut(StartupPhase),
+) -> rusqlite::Result<()> {
     let current_schema = meta::get(conn, "records_schema");
     let hash_rebuild_pending =
         meta::get(conn, RECORD_HASH_REBUILD_PENDING_KEY).as_deref() == Some("1");
@@ -280,7 +287,7 @@ fn migrate_records_schema(conn: &Connection) -> rusqlite::Result<()> {
                     "[base-search] One-time database upgrade: resuming an interrupted row fingerprint rebuild."
                 );
                 crate::storage::maintenance::checkpoint_wal_truncate(conn)?;
-                rebuild_record_hashes(conn, total_rows.max(0) as u64)?;
+                rebuild_record_hashes(conn, total_rows.max(0) as u64, progress)?;
                 meta::delete(conn, RECORD_HASH_REBUILD_PENDING_KEY)?;
             }
             if table_exists(conn, "import_log")? {
@@ -290,7 +297,7 @@ fn migrate_records_schema(conn: &Connection) -> rusqlite::Result<()> {
                 meta::set(conn, "fts_watermark", "0");
             }
             if schema_version < 5 {
-                backfill_derived_columns(conn)?;
+                backfill_derived_columns(conn, progress)?;
             } else {
                 ensure_derived_columns(conn)?;
             }
@@ -367,7 +374,7 @@ fn migrate_records_schema(conn: &Connection) -> rusqlite::Result<()> {
             "[base-search] One-time database upgrade: finalizing the legacy table copy before rebuilding row fingerprints."
         );
         crate::storage::maintenance::checkpoint_wal_truncate(conn)?;
-        rebuild_record_hashes(conn, legacy_rows.max(0) as u64)?;
+        rebuild_record_hashes(conn, legacy_rows.max(0) as u64, progress)?;
         meta::delete(conn, RECORD_HASH_REBUILD_PENDING_KEY)?;
         if table_exists(conn, "import_log")? {
             import_log::reset_file_hashes(conn)?;
@@ -376,7 +383,7 @@ fn migrate_records_schema(conn: &Connection) -> rusqlite::Result<()> {
     }
 
     if table_exists(conn, "records")? {
-        backfill_derived_columns(conn)?;
+        backfill_derived_columns(conn, progress)?;
     }
     meta::set(conn, "records_schema", RECORDS_SCHEMA_VERSION);
     // The migration rewrites large parts of the table, which can leave a WAL
@@ -392,7 +399,10 @@ const BACKFILL_CHUNK_ROWS: i64 = 200_000;
 /// Progress messages start at this size; small databases upgrade silently.
 const BACKFILL_PROGRESS_MIN_ROWS: i64 = 100_000;
 
-fn backfill_derived_columns(conn: &Connection) -> rusqlite::Result<()> {
+fn backfill_derived_columns(
+    conn: &Connection,
+    progress: &mut dyn FnMut(StartupPhase),
+) -> rusqlite::Result<()> {
     ensure_derived_columns(conn)?;
     let total: i64 = conn.query_row("SELECT COUNT(*) FROM records", [], |row| row.get(0))?;
     if total == 0 {
@@ -417,6 +427,10 @@ fn backfill_derived_columns(conn: &Connection) -> rusqlite::Result<()> {
     let started = std::time::Instant::now();
     let mut done_rows: i64 = 0;
     let mut cursor: i64 = 0;
+    progress(StartupPhase::ComputingTypedColumns {
+        done: 0,
+        total: total.max(0) as u64,
+    });
     loop {
         let next_cursor: Option<i64> = conn.query_row(
             "SELECT MAX(id) FROM (SELECT id FROM records WHERE id > ?1 ORDER BY id LIMIT ?2)",
@@ -429,6 +443,10 @@ fn backfill_derived_columns(conn: &Connection) -> rusqlite::Result<()> {
         let changed = conn.execute(&update_sql, params![cursor, BACKFILL_CHUNK_ROWS])?;
         done_rows += changed as i64;
         cursor = next_cursor;
+        progress(StartupPhase::ComputingTypedColumns {
+            done: done_rows.min(total).max(0) as u64,
+            total: total.max(0) as u64,
+        });
         // Fold the chunk back into the main file so the WAL never grows to
         // database size during the upgrade.
         let _ = crate::storage::maintenance::checkpoint_wal_truncate(conn);
@@ -487,14 +505,19 @@ struct HashRebuildStats {
     max_batch_rows: usize,
 }
 
-fn rebuild_record_hashes(conn: &Connection, total_rows: u64) -> rusqlite::Result<()> {
-    rebuild_record_hashes_in_chunks(conn, total_rows, HASH_REBUILD_CHUNK_ROWS).map(|_| ())
+fn rebuild_record_hashes(
+    conn: &Connection,
+    total_rows: u64,
+    progress: &mut dyn FnMut(StartupPhase),
+) -> rusqlite::Result<()> {
+    rebuild_record_hashes_in_chunks(conn, total_rows, HASH_REBUILD_CHUNK_ROWS, progress).map(|_| ())
 }
 
 fn rebuild_record_hashes_in_chunks(
     conn: &Connection,
     total_rows: u64,
     chunk_rows: usize,
+    progress: &mut dyn FnMut(StartupPhase),
 ) -> rusqlite::Result<HashRebuildStats> {
     assert!(chunk_rows > 0, "hash rebuild chunks must not be empty");
     let select: Vec<String> = COLUMNS
@@ -511,6 +534,10 @@ fn rebuild_record_hashes_in_chunks(
     let started = std::time::Instant::now();
     let mut cursor = None;
     let mut stats = HashRebuildStats::default();
+    progress(StartupPhase::RebuildingFingerprints {
+        done: 0,
+        total: total_rows,
+    });
 
     loop {
         let (sql, parameters) = if let Some(cursor) = cursor {
@@ -574,6 +601,10 @@ fn rebuild_record_hashes_in_chunks(
         stats.rows = stats.rows.saturating_add(batch_rows as u64);
         stats.batches = stats.batches.saturating_add(1);
         stats.max_batch_rows = stats.max_batch_rows.max(batch_rows);
+        progress(StartupPhase::RebuildingFingerprints {
+            done: stats.rows.min(total_rows),
+            total: total_rows,
+        });
         if report_progress {
             let percent = if total_rows == 0 {
                 100.0
@@ -644,7 +675,9 @@ mod tests {
                 .unwrap();
         }
 
-        let stats = rebuild_record_hashes_in_chunks(&connection, fixtures.len() as u64, 2).unwrap();
+        let stats =
+            rebuild_record_hashes_in_chunks(&connection, fixtures.len() as u64, 2, &mut |_| {})
+                .unwrap();
 
         assert_eq!(stats.rows, 3);
         assert_eq!(stats.batches, 2);
@@ -679,7 +712,7 @@ mod tests {
         meta::set(&connection, "records_schema", "5");
         meta::set(&connection, RECORD_HASH_REBUILD_PENDING_KEY, "1");
 
-        migrate_records_schema(&connection).unwrap();
+        migrate_records_schema(&connection, &mut |_| {}).unwrap();
 
         assert_eq!(
             meta::get(&connection, RECORD_HASH_REBUILD_PENDING_KEY),
@@ -727,8 +760,8 @@ mod tests {
             .unwrap();
         meta::set(&connection, "records_schema", "5");
 
-        migrate_records_schema(&connection).unwrap();
-        migrate_records_schema(&connection).unwrap();
+        migrate_records_schema(&connection, &mut |_| {}).unwrap();
+        migrate_records_schema(&connection, &mut |_| {}).unwrap();
 
         assert!(table_has_column(&connection, "records", "canonical_id").unwrap());
         assert_eq!(

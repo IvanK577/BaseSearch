@@ -13,6 +13,7 @@ use crate::workers::{self, Msg, WorkerReq};
 pub(super) fn drain_messages(app: &mut App, ctx: &egui::Context) {
     while let Ok(msg) = app.msg_rx.try_recv() {
         match msg {
+            Msg::StartupProgress(phase) => app.startup_phase = Some(phase),
             Msg::StartupDone(result) => handle_startup_done(app, ctx, result),
             Msg::SearchPage {
                 generation,

@@ -1,4 +1,4 @@
-﻿//! Graphical interface: search bar, filters, paginated table, record card,
+//! Graphical interface: search bar, filters, paginated table, record card,
 //! import/export progress, and settings.
 
 use std::collections::HashSet;
@@ -140,6 +140,8 @@ pub struct App {
     db_total_rows: Option<u64>,
     db_ready: bool,
     startup_started: Instant,
+    /// What opening the database is doing, while it is still opening.
+    pub(super) startup_phase: Option<crate::db::StartupPhase>,
     status: StatusLine,
 
     op: Option<OpState>,
@@ -248,6 +250,7 @@ impl App {
             db_total_rows: None,
             db_ready: false,
             startup_started: Instant::now(),
+            startup_phase: None,
             status: StatusLine::default(),
             op: None,
             import_report: None,
@@ -277,6 +280,12 @@ impl App {
     fn persist(&self, key: &str, value: &str) {
         if let Some(db) = &self.lite_db {
             db.meta_set(key, value);
+        }
+        if key == "lang" {
+            // Mirrored outside the database as well: the prompts that choose
+            // which workspace to open run before any database is open, so the
+            // stored preference is unreachable to them.
+            platform::remember_prompt_language(Lang::from_code(value));
         }
     }
 
@@ -656,7 +665,14 @@ impl App {
     }
 
     fn ui_startup_state(&self, ui: &mut egui::Ui) {
-        startup_state(ui, &self.db_path, &self.startup_started, &self.status);
+        startup_state(
+            ui,
+            &self.db_path,
+            &self.startup_started,
+            self.startup_phase,
+            &self.status,
+            self.t(),
+        );
     }
 
     fn ui_results_empty_state(&mut self, ui: &mut egui::Ui) {

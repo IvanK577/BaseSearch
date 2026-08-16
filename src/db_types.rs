@@ -2,6 +2,48 @@ use serde::{Deserialize, Serialize};
 
 use crate::search::{FieldInfo, QueryExpr};
 
+/// What opening a database is doing right now.
+///
+/// Opening is usually instant, but a database carried over from an older
+/// version is rebuilt on the first open: backed up, verified, copied, its row
+/// fingerprints and typed columns recomputed. On a multi-gigabyte database that
+/// is minutes of work. It used to report itself only through `eprintln!`, and
+/// the release build has no console — so the window sat on "Opening database"
+/// with a spinner and a rising seconds counter, which is indistinguishable from
+/// a hang. Every phase below is a thing the person can be told.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StartupPhase {
+    CheckingVersion,
+    CheckingFreeSpace,
+    CreatingBackup,
+    VerifyingBackup,
+    UpgradingStructure,
+    RebuildingFingerprints { done: u64, total: u64 },
+    ComputingTypedColumns { done: u64, total: u64 },
+    VerifyingUpgrade,
+}
+
+impl StartupPhase {
+    /// Progress within the phase, when it has any. `None` means the phase
+    /// cannot say how far along it is and the bar stays indeterminate.
+    pub fn progress(&self) -> Option<(u64, u64)> {
+        match *self {
+            StartupPhase::RebuildingFingerprints { done, total }
+            | StartupPhase::ComputingTypedColumns { done, total } => Some((done, total)),
+            _ => None,
+        }
+    }
+
+    /// True while the database is being rewritten, as opposed to inspected.
+    /// The window uses this to add "do not close" and the one-time note.
+    pub fn is_upgrade(&self) -> bool {
+        !matches!(
+            self,
+            StartupPhase::CheckingVersion | StartupPhase::CheckingFreeSpace
+        )
+    }
+}
+
 /// Filter values; an empty string means the filter is not set.
 #[derive(Default, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]

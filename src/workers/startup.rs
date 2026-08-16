@@ -7,7 +7,16 @@ use crate::db::Db;
 pub fn spawn_startup(db_path: PathBuf, tx: Sender<Msg>, ctx: egui::Context) {
     std::thread::spawn(move || {
         let result = (|| -> Result<StartupData, String> {
-            let db = Db::open(&db_path)?;
+            // Opening rebuilds a database carried over from an older version,
+            // which is minutes of work on a large one. Forward each phase so
+            // the startup screen can say what is happening instead of showing
+            // a spinner that is indistinguishable from a hang.
+            let phase_tx = tx.clone();
+            let phase_ctx = ctx.clone();
+            let db = Db::open_with_progress(&db_path, &mut |phase| {
+                let _ = phase_tx.send(Msg::StartupProgress(phase));
+                phase_ctx.request_repaint();
+            })?;
             let lang_code = db.meta_get("lang");
             let theme = db.meta_get("theme");
             let zoom = db.meta_get("zoom");

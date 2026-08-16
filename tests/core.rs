@@ -3920,6 +3920,106 @@ fn group_and_month_rows_inherit_the_single_currency_bucket() {
     assert!(top[0].compatible_usd.is_none());
 }
 
+/// Opening a database carried over from an older version rebuilds it, which is
+/// minutes of work on a large one. That whole time the window showed a spinner
+/// and a rising seconds counter and nothing else, because every account of the
+/// upgrade went to `eprintln!` and a windowed release build has no console —
+/// so it was indistinguishable from a hang. These phases are what the startup
+/// screen now says out loud.
+#[test]
+fn opening_a_database_that_needs_an_upgrade_reports_its_phases() {
+    use base_search::db::StartupPhase;
+
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("upgrade.db");
+    let mut db = Db::open(&db_path).unwrap();
+    let mut values = vec![String::new(); COLUMNS.len()];
+    values[col_index("declaration_number").unwrap()] = "24UA100110000001U1".to_string();
+    values[col_index("recipient").unwrap()] = "ТОВ «АЛЬФА»".to_string();
+    db.insert_batch(
+        "legacy.xlsx",
+        &[ImportRecord {
+            hash: canonical_record_hash(&values, None),
+            year: Some(2024),
+            values,
+            extra: None,
+        }],
+    )
+    .unwrap();
+    // Put the database back to how an older version left it, including the
+    // marker that says its row fingerprints still need recomputing.
+    db.meta_set("records_schema", "1");
+    db.meta_set("records_hash_rebuild_pending_v1", "1");
+    drop(db);
+
+    let mut phases = Vec::new();
+    let db = Db::open_with_progress(&db_path, &mut |phase| phases.push(phase)).unwrap();
+    drop(db);
+
+    assert_eq!(
+        phases.first(),
+        Some(&StartupPhase::CheckingVersion),
+        "phases: {phases:?}"
+    );
+    let position = |wanted: StartupPhase| {
+        phases
+            .iter()
+            .position(|phase| *phase == wanted)
+            .unwrap_or_else(|| panic!("{wanted:?} was never reported; got {phases:?}"))
+    };
+    // A verified backup exists before anything is rewritten, and the person is
+    // told so — this is the step that needs twice the database in free space.
+    assert!(position(StartupPhase::CheckingFreeSpace) < position(StartupPhase::CreatingBackup));
+    assert!(position(StartupPhase::CreatingBackup) < position(StartupPhase::VerifyingBackup));
+    assert!(position(StartupPhase::VerifyingBackup) < position(StartupPhase::UpgradingStructure));
+    assert_eq!(
+        phases.last(),
+        Some(&StartupPhase::VerifyingUpgrade),
+        "the upgrade ends by verifying what it produced"
+    );
+
+    // The two long phases carry counts, and the count has to ADVANCE. Simply
+    // announcing a phase once with "0 of N" would leave the bar frozen for the
+    // whole rebuild, which is the thing being fixed — so each of them must be
+    // seen both starting and having made progress.
+    let advanced = |kind: &str| {
+        let seen: Vec<(u64, u64)> = phases
+            .iter()
+            .filter(|phase| {
+                matches!(
+                    (kind, phase),
+                    ("fingerprints", StartupPhase::RebuildingFingerprints { .. })
+                        | ("typed", StartupPhase::ComputingTypedColumns { .. })
+                )
+            })
+            .filter_map(StartupPhase::progress)
+            .collect();
+        assert!(
+            seen.iter().any(|(done, _)| *done == 0),
+            "{kind} must report its start: {phases:?}"
+        );
+        assert!(
+            seen.iter()
+                .any(|(done, total)| *done > 0 && *done <= *total && *total > 0),
+            "{kind} must report progress, not only a total: {phases:?}"
+        );
+    };
+    advanced("fingerprints");
+    advanced("typed");
+
+    // Opening the same database again is an ordinary open. Reporting upgrade
+    // phases here would put "do not close the window" in front of someone
+    // every single start.
+    let mut second = Vec::new();
+    Db::open_with_progress(&db_path, &mut |phase| second.push(phase)).unwrap();
+    assert_eq!(
+        second,
+        vec![StartupPhase::CheckingVersion],
+        "a database that needs nothing must not announce an upgrade"
+    );
+    assert!(!second.iter().any(StartupPhase::is_upgrade));
+}
+
 /// Every copy of a row must point back at the file that brought it in first.
 ///
 /// The importer's per-batch lookup resolves that owner. It used to select every

@@ -49,6 +49,45 @@ impl Lang {
         }
     }
 
+    /// Best match for an operating-system locale tag such as `uk_UA.UTF-8`,
+    /// `pt-BR`, or `zh-Hans-CN`.
+    ///
+    /// Only the primary subtag is consulted. `uk` is Ukrainian's ISO code
+    /// while this app spells the language `ua`, so both are accepted. An
+    /// unknown tag returns `None` rather than quietly meaning English, because
+    /// callers need to tell "no preference stated" from "chose English".
+    pub fn from_locale_tag(tag: &str) -> Option<Lang> {
+        let primary = tag
+            .split(['.', '@', '_', '-'])
+            .next()
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        match primary.as_str() {
+            "en" => Some(Lang::En),
+            "ua" | "uk" => Some(Lang::Ua),
+            "de" => Some(Lang::De),
+            "es" => Some(Lang::Es),
+            "fr" => Some(Lang::Fr),
+            "pl" => Some(Lang::Pl),
+            "pt" => Some(Lang::Pt),
+            "ro" => Some(Lang::Ro),
+            "hu" => Some(Lang::Hu),
+            "bg" => Some(Lang::Bg),
+            "zh" => Some(Lang::Zh),
+            _ => None,
+        }
+    }
+
+    /// Language for the screens that appear before a database is open, and so
+    /// before the stored preference can be read: the workspace prompts. Reads
+    /// the usual locale variables and gives up rather than guessing.
+    pub fn from_environment() -> Option<Lang> {
+        ["LC_ALL", "LC_MESSAGES", "LANG", "LANGUAGE"]
+            .into_iter()
+            .filter_map(|name| std::env::var(name).ok())
+            .find_map(|value| value.split(':').find_map(Lang::from_locale_tag))
+    }
+
     pub fn label(self) -> &'static str {
         match self {
             Lang::En => "English",
@@ -211,6 +250,28 @@ pub struct Tr {
     pub mini_summary: &'static str,
     pub metric_price: &'static str,
     pub currency_note: &'static str,
+    pub mixed_currencies: &'static str,
+    pub startup_opening: &'static str,
+    pub startup_hint: &'static str,
+    pub startup_database_label: &'static str,
+    pub startup_size_label: &'static str,
+    pub startup_elapsed_label: &'static str,
+    pub startup_failed: &'static str,
+    pub upgrade_once_note: &'static str,
+    pub phase_checking_version: &'static str,
+    pub phase_checking_space: &'static str,
+    pub phase_backup: &'static str,
+    pub phase_verify_backup: &'static str,
+    pub phase_upgrading: &'static str,
+    pub phase_fingerprints: &'static str,
+    pub phase_typed_columns: &'static str,
+    pub phase_search_index: &'static str,
+    pub phase_verifying: &'static str,
+    pub workspace_found_title: &'static str,
+    pub workspace_found_body: &'static str,
+    pub workspace_several_title: &'static str,
+    pub workspace_several_body: &'static str,
+    pub workspace_database_filter: &'static str,
     pub hs_level_label: &'static str,
     pub hs_full: &'static str,
     pub open_profile: &'static str,
@@ -447,6 +508,28 @@ pub static UA: Tr = Tr {
     mini_summary: "{} рядків · {} ФВ · {} кг нетто",
     metric_price: "ФВ/кг",
     currency_note: "Суми та ціни — як у файлах-джерелах: «вартість» може бути у валюті контракту, а не лише в доларах.",
+    mixed_currencies: "Кілька валют",
+    startup_opening: "Відкриття бази даних",
+    startup_hint: "Вікно готове. Велика локальна база може відкриватися довше.",
+    startup_database_label: "База даних",
+    startup_size_label: "Розмір",
+    startup_elapsed_label: "Минуло",
+    startup_failed: "Не вдалося відкрити базу даних",
+    upgrade_once_note: "Оновлення структури виконується один раз після встановлення нової версії. На великій базі це може тривати кілька хвилин — не закривайте вікно. Перед змінами створюється перевірена резервна копія.",
+    phase_checking_version: "Перевірка версії бази",
+    phase_checking_space: "Перевірка вільного місця на диску",
+    phase_backup: "Створення резервної копії",
+    phase_verify_backup: "Перевірка резервної копії",
+    phase_upgrading: "Оновлення структури бази",
+    phase_fingerprints: "Перерахунок відбитків рядків",
+    phase_typed_columns: "Обчислення типізованих колонок",
+    phase_search_index: "Перебудова пошукового індексу",
+    phase_verifying: "Перевірка оновленої бази",
+    workspace_found_title: "Знайдено наявну робочу базу",
+    workspace_found_body: "Знайдено наявну базу даних Base Search:\n\n{}\n\nВикористати її? Вона залишиться на місці — її не буде переміщено чи видалено.",
+    workspace_several_title: "Виберіть наявну робочу базу",
+    workspace_several_body: "Знайдено кілька наявних баз даних Base Search:\n\n{}\n\nВибрати потрібну? Відповідь «Ні» почне нову порожню базу.",
+    workspace_database_filter: "База даних Base Search",
     hs_level_label: "Рівень коду:",
     hs_full: "повні",
     open_profile: "Профіль компанії",
@@ -679,6 +762,28 @@ pub static EN: Tr = Tr {
     mini_summary: "{} rows · {} value · {} kg net",
     metric_price: "Value/kg",
     currency_note: "Values and prices are taken from the source files as-is: the value may be in the contract currency, not only USD.",
+    mixed_currencies: "Several currencies",
+    startup_opening: "Opening the database",
+    startup_hint: "The window is ready. A large local database can take a moment.",
+    startup_database_label: "Database",
+    startup_size_label: "Size",
+    startup_elapsed_label: "Elapsed",
+    startup_failed: "Could not open the database",
+    upgrade_once_note: "This structure upgrade runs once after an update. On a large database it can take several minutes — do not close the window. A verified backup is made before anything changes.",
+    phase_checking_version: "Checking the database version",
+    phase_checking_space: "Checking free disk space",
+    phase_backup: "Creating a verified backup",
+    phase_verify_backup: "Verifying the backup",
+    phase_upgrading: "Upgrading the database structure",
+    phase_fingerprints: "Rebuilding row fingerprints",
+    phase_typed_columns: "Computing typed columns",
+    phase_search_index: "Rebuilding the search index",
+    phase_verifying: "Verifying the upgraded database",
+    workspace_found_title: "Existing workspace found",
+    workspace_found_body: "An existing Base Search database was found:\n\n{}\n\nUse it? It stays where it is and is not moved or deleted.",
+    workspace_several_title: "Choose an existing workspace",
+    workspace_several_body: "Several existing Base Search databases were found:\n\n{}\n\nChoose the one to use? Answering No starts a new empty workspace instead.",
+    workspace_database_filter: "Base Search database",
     hs_level_label: "Code level:",
     hs_full: "full",
     open_profile: "Company profile",
@@ -911,6 +1016,28 @@ pub static DE: Tr = Tr {
     mini_summary: "{} Zeilen · {} Wert · {} kg netto",
     metric_price: "Wert/kg",
     currency_note: "Werte und Preise stammen unverändert aus den Quelldateien: Der Wert kann in der Vertragswährung statt nur in USD angegeben sein.",
+    mixed_currencies: "Mehrere Währungen",
+    startup_opening: "Datenbank wird geöffnet",
+    startup_hint: "Das Fenster ist bereit. Eine große lokale Datenbank kann einen Moment dauern.",
+    startup_database_label: "Datenbank",
+    startup_size_label: "Größe",
+    startup_elapsed_label: "Vergangen",
+    startup_failed: "Die Datenbank konnte nicht geöffnet werden",
+    upgrade_once_note: "Diese Strukturaktualisierung läuft einmalig nach einem Update. Bei einer großen Datenbank kann sie mehrere Minuten dauern — schließen Sie das Fenster nicht. Vorher wird eine geprüfte Sicherung angelegt.",
+    phase_checking_version: "Datenbankversion wird geprüft",
+    phase_checking_space: "Freier Speicherplatz wird geprüft",
+    phase_backup: "Geprüfte Sicherung wird erstellt",
+    phase_verify_backup: "Sicherung wird überprüft",
+    phase_upgrading: "Datenbankstruktur wird aktualisiert",
+    phase_fingerprints: "Zeilen-Fingerabdrücke werden neu berechnet",
+    phase_typed_columns: "Typisierte Spalten werden berechnet",
+    phase_search_index: "Suchindex wird neu aufgebaut",
+    phase_verifying: "Aktualisierte Datenbank wird überprüft",
+    workspace_found_title: "Vorhandener Arbeitsbereich gefunden",
+    workspace_found_body: "Eine vorhandene Base-Search-Datenbank wurde gefunden:\n\n{}\n\nVerwenden? Sie bleibt an ihrem Ort und wird weder verschoben noch gelöscht.",
+    workspace_several_title: "Vorhandenen Arbeitsbereich wählen",
+    workspace_several_body: "Mehrere vorhandene Base-Search-Datenbanken wurden gefunden:\n\n{}\n\nEine auswählen? Mit Nein wird stattdessen ein neuer leerer Arbeitsbereich begonnen.",
+    workspace_database_filter: "Base-Search-Datenbank",
     hs_level_label: "Codeebene:",
     hs_full: "voll",
     open_profile: "Firmenprofil",
@@ -1143,6 +1270,28 @@ pub static ES: Tr = Tr {
     mini_summary: "{} filas · {} valor · {} kg neto",
     metric_price: "Valor/kg",
     currency_note: "Los valores y precios se toman de los archivos de origen tal cual: el valor puede estar en la moneda del contrato, no solo en USD.",
+    mixed_currencies: "Varias monedas",
+    startup_opening: "Abriendo la base de datos",
+    startup_hint: "La ventana está lista. Una base de datos local grande puede tardar un momento.",
+    startup_database_label: "Base de datos",
+    startup_size_label: "Tamaño",
+    startup_elapsed_label: "Transcurrido",
+    startup_failed: "No se pudo abrir la base de datos",
+    upgrade_once_note: "Esta actualización de estructura se ejecuta una vez tras actualizar. En una base grande puede tardar varios minutos: no cierre la ventana. Antes se crea una copia de seguridad verificada.",
+    phase_checking_version: "Comprobando la versión de la base de datos",
+    phase_checking_space: "Comprobando el espacio libre en disco",
+    phase_backup: "Creando una copia de seguridad verificada",
+    phase_verify_backup: "Verificando la copia de seguridad",
+    phase_upgrading: "Actualizando la estructura de la base de datos",
+    phase_fingerprints: "Recalculando las huellas de las filas",
+    phase_typed_columns: "Calculando las columnas tipadas",
+    phase_search_index: "Reconstruyendo el índice de búsqueda",
+    phase_verifying: "Verificando la base de datos actualizada",
+    workspace_found_title: "Se encontró un espacio de trabajo existente",
+    workspace_found_body: "Se encontró una base de datos de Base Search existente:\n\n{}\n\n¿Usarla? Permanece donde está y no se mueve ni se elimina.",
+    workspace_several_title: "Elija un espacio de trabajo existente",
+    workspace_several_body: "Se encontraron varias bases de datos de Base Search:\n\n{}\n\n¿Elegir cuál usar? Responder No inicia un espacio de trabajo nuevo y vacío.",
+    workspace_database_filter: "Base de datos de Base Search",
     hs_level_label: "Nivel de código:",
     hs_full: "completo",
     open_profile: "Perfil de empresa",
@@ -1375,6 +1524,28 @@ pub static FR: Tr = Tr {
     mini_summary: "{} lignes · {} valeur · {} kg net",
     metric_price: "Valeur/kg",
     currency_note: "Les valeurs et les prix sont repris tels quels des fichiers source : la valeur peut être dans la devise du contrat, pas uniquement en USD.",
+    mixed_currencies: "Plusieurs devises",
+    startup_opening: "Ouverture de la base de données",
+    startup_hint: "La fenêtre est prête. Une grande base locale peut prendre un moment.",
+    startup_database_label: "Base de données",
+    startup_size_label: "Taille",
+    startup_elapsed_label: "Écoulé",
+    startup_failed: "Impossible d’ouvrir la base de données",
+    upgrade_once_note: "Cette mise à niveau de structure ne s’exécute qu’une fois après une mise à jour. Sur une grande base, elle peut prendre plusieurs minutes — ne fermez pas la fenêtre. Une sauvegarde vérifiée est créée avant toute modification.",
+    phase_checking_version: "Vérification de la version de la base",
+    phase_checking_space: "Vérification de l’espace disque disponible",
+    phase_backup: "Création d’une sauvegarde vérifiée",
+    phase_verify_backup: "Vérification de la sauvegarde",
+    phase_upgrading: "Mise à niveau de la structure de la base",
+    phase_fingerprints: "Recalcul des empreintes de lignes",
+    phase_typed_columns: "Calcul des colonnes typées",
+    phase_search_index: "Reconstruction de l’index de recherche",
+    phase_verifying: "Vérification de la base mise à niveau",
+    workspace_found_title: "Espace de travail existant trouvé",
+    workspace_found_body: "Une base de données Base Search existante a été trouvée :\n\n{}\n\nL’utiliser ? Elle reste où elle est et n’est ni déplacée ni supprimée.",
+    workspace_several_title: "Choisir un espace de travail existant",
+    workspace_several_body: "Plusieurs bases de données Base Search existantes ont été trouvées :\n\n{}\n\nEn choisir une ? Répondre Non démarre un nouvel espace de travail vide.",
+    workspace_database_filter: "Base de données Base Search",
     hs_level_label: "Niveau de code :",
     hs_full: "complet",
     open_profile: "Profil de société",
@@ -1607,6 +1778,28 @@ pub static PL: Tr = Tr {
     mini_summary: "{} wierszy · {} wartość · {} kg netto",
     metric_price: "Wartość/kg",
     currency_note: "Wartości i ceny pochodzą z plików źródłowych bez zmian: wartość może być w walucie kontraktu, a nie tylko w USD.",
+    mixed_currencies: "Kilka walut",
+    startup_opening: "Otwieranie bazy danych",
+    startup_hint: "Okno jest gotowe. Duża lokalna baza może chwilę potrwać.",
+    startup_database_label: "Baza danych",
+    startup_size_label: "Rozmiar",
+    startup_elapsed_label: "Upłynęło",
+    startup_failed: "Nie udało się otworzyć bazy danych",
+    upgrade_once_note: "Ta aktualizacja struktury wykonuje się raz po aktualizacji programu. Na dużej bazie może potrwać kilka minut — nie zamykaj okna. Wcześniej powstaje zweryfikowana kopia zapasowa.",
+    phase_checking_version: "Sprawdzanie wersji bazy",
+    phase_checking_space: "Sprawdzanie wolnego miejsca na dysku",
+    phase_backup: "Tworzenie zweryfikowanej kopii zapasowej",
+    phase_verify_backup: "Weryfikacja kopii zapasowej",
+    phase_upgrading: "Aktualizowanie struktury bazy",
+    phase_fingerprints: "Przeliczanie odcisków wierszy",
+    phase_typed_columns: "Obliczanie kolumn typowanych",
+    phase_search_index: "Przebudowa indeksu wyszukiwania",
+    phase_verifying: "Weryfikacja zaktualizowanej bazy",
+    workspace_found_title: "Znaleziono istniejący obszar roboczy",
+    workspace_found_body: "Znaleziono istniejącą bazę danych Base Search:\n\n{}\n\nUżyć jej? Pozostanie na swoim miejscu — nie zostanie przeniesiona ani usunięta.",
+    workspace_several_title: "Wybierz istniejący obszar roboczy",
+    workspace_several_body: "Znaleziono kilka istniejących baz danych Base Search:\n\n{}\n\nWybrać jedną? Odpowiedź Nie rozpocznie nowy pusty obszar roboczy.",
+    workspace_database_filter: "Baza danych Base Search",
     hs_level_label: "Poziom kodu:",
     hs_full: "pełny",
     open_profile: "Profil firmy",
@@ -1839,6 +2032,28 @@ pub static PT: Tr = Tr {
     mini_summary: "{} linhas · {} valor · {} kg líq.",
     metric_price: "Valor/kg",
     currency_note: "Os valores e preços são retirados dos ficheiros de origem tal como estão: o valor pode estar na moeda do contrato, não apenas em USD.",
+    mixed_currencies: "Várias moedas",
+    startup_opening: "A abrir a base de dados",
+    startup_hint: "A janela está pronta. Uma base de dados local grande pode demorar um momento.",
+    startup_database_label: "Base de dados",
+    startup_size_label: "Tamanho",
+    startup_elapsed_label: "Decorrido",
+    startup_failed: "Não foi possível abrir a base de dados",
+    upgrade_once_note: "Esta atualização de estrutura é executada uma vez após atualizar. Numa base grande pode demorar vários minutos — não feche a janela. Antes é criada uma cópia de segurança verificada.",
+    phase_checking_version: "A verificar a versão da base de dados",
+    phase_checking_space: "A verificar o espaço livre em disco",
+    phase_backup: "A criar uma cópia de segurança verificada",
+    phase_verify_backup: "A verificar a cópia de segurança",
+    phase_upgrading: "A atualizar a estrutura da base de dados",
+    phase_fingerprints: "A recalcular as impressões das linhas",
+    phase_typed_columns: "A calcular as colunas tipadas",
+    phase_search_index: "A reconstruir o índice de pesquisa",
+    phase_verifying: "A verificar a base de dados atualizada",
+    workspace_found_title: "Foi encontrado um espaço de trabalho existente",
+    workspace_found_body: "Foi encontrada uma base de dados Base Search existente:\n\n{}\n\nUsá-la? Permanece onde está e não é movida nem eliminada.",
+    workspace_several_title: "Escolha um espaço de trabalho existente",
+    workspace_several_body: "Foram encontradas várias bases de dados Base Search:\n\n{}\n\nEscolher qual usar? Responder Não inicia um novo espaço de trabalho vazio.",
+    workspace_database_filter: "Base de dados Base Search",
     hs_level_label: "Nível do código:",
     hs_full: "completo",
     open_profile: "Perfil da empresa",
@@ -2071,6 +2286,28 @@ pub static RO: Tr = Tr {
     mini_summary: "{} rânduri · {} valoare · {} kg net",
     metric_price: "Valoare/kg",
     currency_note: "Valorile și prețurile sunt preluate ca atare din fișierele-sursă: valoarea poate fi în moneda contractului, nu doar în USD.",
+    mixed_currencies: "Mai multe monede",
+    startup_opening: "Se deschide baza de date",
+    startup_hint: "Fereastra este pregătită. O bază de date locală mare poate dura un moment.",
+    startup_database_label: "Bază de date",
+    startup_size_label: "Dimensiune",
+    startup_elapsed_label: "Scurs",
+    startup_failed: "Baza de date nu a putut fi deschisă",
+    upgrade_once_note: "Această actualizare a structurii rulează o singură dată după actualizare. Pe o bază mare poate dura câteva minute — nu închideți fereastra. În prealabil se creează o copie de siguranță verificată.",
+    phase_checking_version: "Se verifică versiunea bazei de date",
+    phase_checking_space: "Se verifică spațiul liber pe disc",
+    phase_backup: "Se creează o copie de siguranță verificată",
+    phase_verify_backup: "Se verifică copia de siguranță",
+    phase_upgrading: "Se actualizează structura bazei de date",
+    phase_fingerprints: "Se recalculează amprentele rândurilor",
+    phase_typed_columns: "Se calculează coloanele tipizate",
+    phase_search_index: "Se reconstruiește indexul de căutare",
+    phase_verifying: "Se verifică baza de date actualizată",
+    workspace_found_title: "S-a găsit un spațiu de lucru existent",
+    workspace_found_body: "A fost găsită o bază de date Base Search existentă:\n\n{}\n\nO folosiți? Rămâne unde este și nu este mutată sau ștearsă.",
+    workspace_several_title: "Alegeți un spațiu de lucru existent",
+    workspace_several_body: "Au fost găsite mai multe baze de date Base Search:\n\n{}\n\nAlegeți una? Răspunsul Nu pornește un spațiu de lucru nou și gol.",
+    workspace_database_filter: "Bază de date Base Search",
     hs_level_label: "Nivel cod:",
     hs_full: "complet",
     open_profile: "Profil companie",
@@ -2303,6 +2540,28 @@ pub static HU: Tr = Tr {
     mini_summary: "{} sor · {} érték · {} kg nettó",
     metric_price: "Érték/kg",
     currency_note: "Az értékek és árak változatlanul a forrásfájlokból származnak: az érték a szerződés pénznemében is lehet, nemcsak USD-ben.",
+    mixed_currencies: "Több pénznem",
+    startup_opening: "Az adatbázis megnyitása",
+    startup_hint: "Az ablak kész. Egy nagy helyi adatbázis eltarthat egy ideig.",
+    startup_database_label: "Adatbázis",
+    startup_size_label: "Méret",
+    startup_elapsed_label: "Eltelt",
+    startup_failed: "Az adatbázist nem sikerült megnyitni",
+    upgrade_once_note: "Ez a szerkezeti frissítés frissítés után egyszer fut le. Nagy adatbázison több percig is tarthat — ne zárja be az ablakot. Előtte ellenőrzött biztonsági mentés készül.",
+    phase_checking_version: "Az adatbázis verziójának ellenőrzése",
+    phase_checking_space: "Szabad lemezterület ellenőrzése",
+    phase_backup: "Ellenőrzött biztonsági mentés készítése",
+    phase_verify_backup: "A biztonsági mentés ellenőrzése",
+    phase_upgrading: "Az adatbázis szerkezetének frissítése",
+    phase_fingerprints: "Sorlenyomatok újraszámítása",
+    phase_typed_columns: "Tipizált oszlopok számítása",
+    phase_search_index: "A keresési index újraépítése",
+    phase_verifying: "A frissített adatbázis ellenőrzése",
+    workspace_found_title: "Meglévő munkaterület található",
+    workspace_found_body: "Meglévő Base Search adatbázis található:\n\n{}\n\nHasználja? A helyén marad, nem kerül áthelyezésre vagy törlésre.",
+    workspace_several_title: "Válasszon meglévő munkaterületet",
+    workspace_several_body: "Több meglévő Base Search adatbázis található:\n\n{}\n\nVálaszt egyet? A Nem válasz új, üres munkaterületet indít.",
+    workspace_database_filter: "Base Search adatbázis",
     hs_level_label: "Kódszint:",
     hs_full: "teljes",
     open_profile: "Cégprofil",
@@ -2535,6 +2794,28 @@ pub static BG: Tr = Tr {
     mini_summary: "{} реда · {} стойност · {} кг нето",
     metric_price: "Стойност/кг",
     currency_note: "Стойностите и цените са взети от изходните файлове както са: стойността може да е във валутата на договора, не само в USD.",
+    mixed_currencies: "Няколко валути",
+    startup_opening: "Отваряне на базата данни",
+    startup_hint: "Прозорецът е готов. Голяма локална база може да отнеме малко време.",
+    startup_database_label: "База данни",
+    startup_size_label: "Размер",
+    startup_elapsed_label: "Изминало",
+    startup_failed: "Базата данни не можа да бъде отворена",
+    upgrade_once_note: "Тази структурна актуализация се изпълнява веднъж след обновяване. При голяма база може да отнеме няколко минути — не затваряйте прозореца. Преди това се създава проверено резервно копие.",
+    phase_checking_version: "Проверка на версията на базата",
+    phase_checking_space: "Проверка на свободното дисково пространство",
+    phase_backup: "Създаване на проверено резервно копие",
+    phase_verify_backup: "Проверка на резервното копие",
+    phase_upgrading: "Актуализиране на структурата на базата",
+    phase_fingerprints: "Преизчисляване на отпечатъците на редовете",
+    phase_typed_columns: "Изчисляване на типизираните колони",
+    phase_search_index: "Възстановяване на индекса за търсене",
+    phase_verifying: "Проверка на обновената база",
+    workspace_found_title: "Намерена е съществуваща работна база",
+    workspace_found_body: "Намерена е съществуваща база данни на Base Search:\n\n{}\n\nДа се използва ли? Тя остава на мястото си и не се премества или изтрива.",
+    workspace_several_title: "Изберете съществуваща работна база",
+    workspace_several_body: "Намерени са няколко съществуващи бази данни на Base Search:\n\n{}\n\nДа изберете ли една? Отговор „Не“ започва нова празна работна база.",
+    workspace_database_filter: "База данни на Base Search",
     hs_level_label: "Ниво на код:",
     hs_full: "пълни",
     open_profile: "Профил на фирмата",
@@ -2767,6 +3048,28 @@ pub static ZH: Tr = Tr {
     mini_summary: "{} 行 · {} 价值 · {} kg 净重",
     metric_price: "价值/kg",
     currency_note: "数值和价格按源文件原样显示：价值可能以合同货币计，而不仅是美元。",
+    mixed_currencies: "多种币种",
+    startup_opening: "正在打开数据库",
+    startup_hint: "窗口已就绪。较大的本地数据库可能需要一些时间。",
+    startup_database_label: "数据库",
+    startup_size_label: "大小",
+    startup_elapsed_label: "已用时",
+    startup_failed: "无法打开数据库",
+    upgrade_once_note: "此结构升级在更新后只运行一次。数据库较大时可能需要数分钟，请勿关闭窗口。更改前会先创建并校验备份。",
+    phase_checking_version: "正在检查数据库版本",
+    phase_checking_space: "正在检查磁盘可用空间",
+    phase_backup: "正在创建并校验备份",
+    phase_verify_backup: "正在校验备份",
+    phase_upgrading: "正在升级数据库结构",
+    phase_fingerprints: "正在重建行指纹",
+    phase_typed_columns: "正在计算类型化列",
+    phase_search_index: "正在重建搜索索引",
+    phase_verifying: "正在校验升级后的数据库",
+    workspace_found_title: "找到已有工作区",
+    workspace_found_body: "找到已有的 Base Search 数据库：\n\n{}\n\n要使用它吗？它会留在原处，不会被移动或删除。",
+    workspace_several_title: "选择已有工作区",
+    workspace_several_body: "找到多个已有的 Base Search 数据库：\n\n{}\n\n要选择使用哪一个吗？选择「否」将新建一个空工作区。",
+    workspace_database_filter: "Base Search 数据库",
     hs_level_label: "编码层级：",
     hs_full: "完整",
     open_profile: "公司档案",
@@ -3354,4 +3657,80 @@ pub fn group_digits(n: u64) -> String {
         out.push(ch);
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Lang, tr};
+
+    #[test]
+    fn a_locale_tag_maps_to_the_language_it_names() {
+        // Ukrainian is `uk` in ISO and `ua` in this app; both have to work,
+        // because the first comes from the operating system and the second
+        // from the app's own stored preference.
+        assert_eq!(Lang::from_locale_tag("uk_UA.UTF-8"), Some(Lang::Ua));
+        assert_eq!(Lang::from_locale_tag("ua"), Some(Lang::Ua));
+        assert_eq!(Lang::from_locale_tag("pt-BR"), Some(Lang::Pt));
+        assert_eq!(Lang::from_locale_tag("zh-Hans-CN"), Some(Lang::Zh));
+        assert_eq!(Lang::from_locale_tag("DE@euro"), Some(Lang::De));
+        // Unknown is not English: a caller has to tell "nothing stated" from
+        // "chose English", or it can never fall through to the next source.
+        assert_eq!(Lang::from_locale_tag("ja_JP"), None);
+        assert_eq!(Lang::from_locale_tag(""), None);
+        assert_eq!(Lang::from_locale_tag("C"), None);
+    }
+
+    #[test]
+    fn every_language_states_the_startup_and_upgrade_screens() {
+        for lang in Lang::ALL {
+            let t = tr(lang);
+            for (name, value) in [
+                ("startup_opening", t.startup_opening),
+                ("startup_hint", t.startup_hint),
+                ("startup_database_label", t.startup_database_label),
+                ("startup_size_label", t.startup_size_label),
+                ("startup_elapsed_label", t.startup_elapsed_label),
+                ("startup_failed", t.startup_failed),
+                ("upgrade_once_note", t.upgrade_once_note),
+                ("phase_checking_version", t.phase_checking_version),
+                ("phase_checking_space", t.phase_checking_space),
+                ("phase_backup", t.phase_backup),
+                ("phase_verify_backup", t.phase_verify_backup),
+                ("phase_upgrading", t.phase_upgrading),
+                ("phase_fingerprints", t.phase_fingerprints),
+                ("phase_typed_columns", t.phase_typed_columns),
+                ("phase_search_index", t.phase_search_index),
+                ("phase_verifying", t.phase_verifying),
+                ("mixed_currencies", t.mixed_currencies),
+                ("workspace_found_title", t.workspace_found_title),
+                ("workspace_several_title", t.workspace_several_title),
+                ("workspace_database_filter", t.workspace_database_filter),
+            ] {
+                assert!(
+                    !value.trim().is_empty(),
+                    "{name} is empty in {}",
+                    lang.code()
+                );
+            }
+        }
+    }
+
+    /// The two workspace prompts interpolate a path. A translation that lost
+    /// the placeholder would show the question without the thing it asks about.
+    #[test]
+    fn workspace_prompts_keep_their_path_placeholder() {
+        for lang in Lang::ALL {
+            let t = tr(lang);
+            for (name, body) in [
+                ("workspace_found_body", t.workspace_found_body),
+                ("workspace_several_body", t.workspace_several_body),
+            ] {
+                assert!(
+                    body.contains("{}"),
+                    "{name} in {} has no place to put the path",
+                    lang.code()
+                );
+            }
+        }
+    }
 }

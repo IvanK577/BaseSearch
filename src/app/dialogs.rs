@@ -3,7 +3,7 @@ use std::time::Instant;
 
 use super::ACCENT;
 use super::state::StatusLine;
-use crate::db::RecordCard;
+use crate::db::{RecordCard, StartupPhase};
 use crate::i18n::{Lang, Tr, help_sections};
 
 pub(super) enum ResultsEmptyAction {
@@ -28,38 +28,74 @@ pub(super) struct SettingsWindowInput<'a> {
     pub(super) app_version: &'a str,
 }
 
+/// The label for what opening the database is doing right now.
+pub(super) fn startup_phase_label(phase: StartupPhase, t: &Tr) -> &'static str {
+    match phase {
+        StartupPhase::CheckingVersion => t.phase_checking_version,
+        StartupPhase::CheckingFreeSpace => t.phase_checking_space,
+        StartupPhase::CreatingBackup => t.phase_backup,
+        StartupPhase::VerifyingBackup => t.phase_verify_backup,
+        StartupPhase::UpgradingStructure => t.phase_upgrading,
+        StartupPhase::RebuildingFingerprints { .. } => t.phase_fingerprints,
+        StartupPhase::ComputingTypedColumns { .. } => t.phase_typed_columns,
+        StartupPhase::VerifyingUpgrade => t.phase_verifying,
+    }
+}
+
 pub(super) fn startup_state(
     ui: &mut egui::Ui,
     db_path: &Path,
     startup_started: &Instant,
+    phase: Option<StartupPhase>,
     status: &StatusLine,
+    t: &Tr,
 ) {
     ui.add_space((ui.available_height() * 0.28).max(0.0));
     ui.vertical_centered(|ui| {
         ui.spinner();
         ui.add_space(12.0);
-        ui.heading("Opening database");
-        ui.label(
-            egui::RichText::new("The window is ready. Large local databases can take a moment.")
-                .weak(),
-        );
+        ui.heading(t.startup_opening);
+        // A plain open says nothing beyond "this can take a moment". An
+        // upgrade says which of its phases is running, because it rewrites the
+        // database and the person needs to know not to close the window.
+        match phase.filter(StartupPhase::is_upgrade) {
+            Some(phase) => {
+                ui.label(egui::RichText::new(startup_phase_label(phase, t)).strong());
+                if let Some((done, total)) = phase.progress()
+                    && total > 0
+                {
+                    ui.add_space(6.0);
+                    let fraction = (done as f32 / total as f32).clamp(0.0, 1.0);
+                    ui.add(
+                        egui::ProgressBar::new(fraction)
+                            .desired_width(320.0)
+                            .text(format!("{done} / {total}")),
+                    );
+                }
+                ui.add_space(6.0);
+                ui.label(egui::RichText::new(t.upgrade_once_note).weak());
+            }
+            None => {
+                ui.label(egui::RichText::new(t.startup_hint).weak());
+            }
+        }
         ui.add_space(12.0);
         egui::Grid::new("startup_database_state")
             .num_columns(2)
             .spacing([18.0, 6.0])
             .show(ui, |ui| {
-                ui.label(egui::RichText::new("Database").weak());
+                ui.label(egui::RichText::new(t.startup_database_label).weak());
                 ui.label(db_path.display().to_string());
                 ui.end_row();
 
-                ui.label(egui::RichText::new("Size").weak());
+                ui.label(egui::RichText::new(t.startup_size_label).weak());
                 let size = std::fs::metadata(db_path)
                     .map(|meta| meta.len())
                     .unwrap_or(0);
                 ui.label(format!("{:.2} GB", size as f64 / (1u64 << 30) as f64));
                 ui.end_row();
 
-                ui.label(egui::RichText::new("Elapsed").weak());
+                ui.label(egui::RichText::new(t.startup_elapsed_label).weak());
                 ui.label(format!("{} s", startup_started.elapsed().as_secs()));
                 ui.end_row();
             });
