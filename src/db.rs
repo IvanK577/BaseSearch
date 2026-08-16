@@ -156,8 +156,11 @@ impl Db {
         record_writer::rollback_import_file(&self.conn);
     }
 
-    /// Inserts a row batch. Duplicates are inserted and flagged.
-    /// Returns (inserted physical rows, duplicate rows).
+    /// Inserts a row batch that belongs to no registered source schema.
+    /// Duplicates are inserted and flagged. Returns (inserted rows, duplicates).
+    ///
+    /// Imports use `insert_batch_for_source`; this is the schema-less path the
+    /// test fixtures and pre-2.0 databases use.
     pub fn insert_batch(
         &mut self,
         source_file: &str,

@@ -3920,6 +3920,43 @@ fn group_and_month_rows_inherit_the_single_currency_bucket() {
     assert!(top[0].compatible_usd.is_none());
 }
 
+/// Every copy of a row must point back at the file that brought it in first.
+///
+/// The importer's per-batch lookup resolves that owner. It used to select every
+/// matching row `ORDER BY id` and keep the first, which made SQLite sort rows it
+/// then discarded; it now asks for `MIN(id)` directly. Same answer, and this is
+/// the test that says so — get the aggregate wrong and a duplicate starts
+/// naming whichever file the query happened to reach first.
+#[test]
+fn a_duplicate_row_always_names_the_file_that_brought_it_in_first() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = Db::open(&dir.path().join("owners.db")).unwrap();
+    let row = "Одержувач,ЕДРПОУ,Код товару,Вартість\nТОВ «АЛЬФА»,33333333,8517130000,1000\n";
+
+    for (index, name) in ["first.csv", "second.csv", "third.csv"].iter().enumerate() {
+        let path = dir.path().join(name);
+        // Same row every time; a trailing comment column keeps the FILE hash
+        // different so the whole-file duplicate check does not skip it.
+        std::fs::write(&path, format!("{row}\n{}", ",".repeat(index))).unwrap();
+        let summary =
+            import::import_file(&mut db, &path, &AtomicBool::new(false), &mut |_, _, _| {});
+        assert_eq!(summary.error, None, "{name}");
+    }
+
+    let occurrences = Query {
+        record_scope: RecordScope::Occurrences,
+        ..Default::default()
+    };
+    let (ids, _, dups) = db.search_page(&occurrences, 10, 0).unwrap();
+    assert_eq!(ids.len(), 3, "all three copies are stored");
+    let owners: Vec<&str> = dups.iter().filter_map(|owner| owner.as_deref()).collect();
+    assert_eq!(
+        owners,
+        vec!["first.csv", "first.csv"],
+        "later copies must all name the first file, not each other"
+    );
+}
+
 /// Two recipient synonyms must not cancel each other out.
 ///
 /// A registry that heads its importer column "Отримувач" and also carries
