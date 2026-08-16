@@ -2,6 +2,80 @@
 
 All notable changes to Base Search are documented in this file.
 
+## 2.2.0 - 2026-08-16
+
+The release that finally makes a second import fast. 2.1.0 claimed to fix the
+slow-import report and did not: it fixed reading the file and the first bulk
+load, while the cause sat elsewhere and only showed up once a database had
+something in it.
+
+### Fixed
+
+- **Importing into a database that already holds data is dozens of times
+  faster.** Every batch of rows was wrapped in a savepoint, and inside one
+  SQLite has to journal the original content of every page the batch touches —
+  so the cost of a row grew with the number of rows already in the batch.
+  Measured end to end by alternating the old and new builds on one machine,
+  each import into a fresh copy of the same 300 000-row database: a 50 400-row
+  file took **506 seconds before and 5.6 seconds after**; separate 8 000-row
+  files took 152 s and 106 s before against 2.2 s and 3.1 s after. The savepoint
+  was never what undid a failed batch — the whole file is one transaction and
+  any error rolls all of it back, which is unchanged and still covered by its
+  tests.
+- **The currency is worked out from the file, without being asked.** A customs
+  export names no currency in any column, so every total used to read "unknown
+  currency", the monthly value chart drew nothing at all, and value shares
+  quietly fell back to counting rows. But the file states the same amount
+  twice: `ФВ вал.контр` is the invoice value in the contract currency, and
+  `РФВ` is that same value in dollars per kilogram — so multiplying `РФВ` by
+  the weight reproduces the amount exactly when the contract is in dollars, and
+  misses by the exchange rate when it is not. After each import that comparison
+  is run over the imported rows, and the currency is recognized only when at
+  least thirty rows can be compared and at least 95 % of them agree. Anything
+  short of that stays unknown rather than guessing.
+
+  A currency can still be stated by hand — Data → Columns, next to the column
+  meanings — and a stated answer outranks the recognized one. Each imported file
+  keeps its own answer, so a workspace holding several sources no longer merges
+  their money into one figure.
+- **The desktop stops adding money across currencies on its headline figures.**
+  It printed a plain sum over every currency with no label at all. The overview
+  cards, the ranking bars and their tooltips, and the report summaries now carry
+  the currency or say the rows span several, as the browser does. Several other
+  places — the KPI tiles beside the cards, the monthly chart, the group table
+  cells, Compare, the company dossier and the clipboard export — still print the
+  old unlabelled sum and are yet to be converted.
+
+- **An existing database is never mistaken for a workspace.** Choosing one only
+  checked for a table named `records`, which other applications have too, and
+  the choice was written down before the file was opened — so one wrong pick
+  modified an unrelated database and then reopened it, failing, on every later
+  start with no way to change it from inside the app. The choice is now recorded
+  only after the database opens, and a file has to carry Base Search's own
+  columns to be offered at all.
+- **An existing workspace is found by what is in it, not what its folder is
+  called.** Only folders named `BaseSearch-X.Y.Z` were recognised, so a version
+  1 database in a folder of your own naming was invisible and Base Search
+  started empty without a word. A database somewhere else entirely can now be
+  chosen by hand.
+- Duplicate rows always point back at the file that brought the row in first,
+  and the lookup that decides this no longer sorts rows it discards.
+
+### Changed
+
+- **A first-open upgrade says what it is doing.** Opening a database from an
+  older version rebuilds it, which is minutes of work on a large one, and the
+  window used to show only a spinner and a rising seconds counter. It now names
+  each step — backing up, verifying, upgrading, recomputing — with a progress
+  bar for the two long ones and a note that this runs once.
+- The startup screen and both workspace prompts are translated into all eleven
+  languages. They were English only, and they are where you decide what happens
+  to your data.
+- **The repository no longer carries a prebuilt Windows folder.** The copy in
+  `dist\` had drifted to an older build while the documented quick start still
+  pointed at it, and mixing the two rebuilt the whole search index on every
+  import. Use a release package or `scripts/package-release.ps1`.
+
 ## 2.1.1 - 2026-08-09
 
 An interface release. Nothing about importing, searching, or analysing changed
