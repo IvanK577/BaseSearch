@@ -24,6 +24,57 @@ pub enum StartupPhase {
 }
 
 impl StartupPhase {
+    /// Stable name for crossing a process boundary.
+    ///
+    /// The browser workspace runs the database in a child process, so the only
+    /// way this reaches the window is through that child's output. Sending a
+    /// name rather than a sentence is what lets the launcher show it in the
+    /// reader's language and draw a real progress bar, instead of echoing
+    /// English prose it cannot interpret.
+    pub fn wire_name(&self) -> &'static str {
+        match self {
+            StartupPhase::CheckingVersion => "checking_version",
+            StartupPhase::CheckingFreeSpace => "checking_free_space",
+            StartupPhase::CreatingBackup => "creating_backup",
+            StartupPhase::VerifyingBackup => "verifying_backup",
+            StartupPhase::UpgradingStructure => "upgrading_structure",
+            StartupPhase::RebuildingFingerprints { .. } => "rebuilding_fingerprints",
+            StartupPhase::ComputingTypedColumns { .. } => "computing_typed_columns",
+            StartupPhase::VerifyingUpgrade => "verifying_upgrade",
+        }
+    }
+
+    /// Rebuilds a phase from [`StartupPhase::wire_name`] and its counts.
+    pub fn from_wire(name: &str, done: u64, total: u64) -> Option<StartupPhase> {
+        Some(match name {
+            "checking_version" => StartupPhase::CheckingVersion,
+            "checking_free_space" => StartupPhase::CheckingFreeSpace,
+            "creating_backup" => StartupPhase::CreatingBackup,
+            "verifying_backup" => StartupPhase::VerifyingBackup,
+            "upgrading_structure" => StartupPhase::UpgradingStructure,
+            "rebuilding_fingerprints" => StartupPhase::RebuildingFingerprints { done, total },
+            "computing_typed_columns" => StartupPhase::ComputingTypedColumns { done, total },
+            "verifying_upgrade" => StartupPhase::VerifyingUpgrade,
+            _ => return None,
+        })
+    }
+
+    /// The line a child process prints for the launcher to read.
+    pub fn wire_line(&self) -> String {
+        let (done, total) = self.progress().unwrap_or((0, 0));
+        format!("[base-search] phase {} {done} {total}", self.wire_name())
+    }
+
+    /// Reads back a line written by [`StartupPhase::wire_line`].
+    pub fn parse_wire_line(line: &str) -> Option<StartupPhase> {
+        let rest = line.trim().strip_prefix("[base-search] phase ")?;
+        let mut parts = rest.split_whitespace();
+        let name = parts.next()?;
+        let done = parts.next()?.parse().ok()?;
+        let total = parts.next()?.parse().ok()?;
+        StartupPhase::from_wire(name, done, total)
+    }
+
     /// Progress within the phase, when it has any. `None` means the phase
     /// cannot say how far along it is and the bar stays indeterminate.
     pub fn progress(&self) -> Option<(u64, u64)> {
@@ -34,13 +85,89 @@ impl StartupPhase {
         }
     }
 
-    /// True while the database is being rewritten, as opposed to inspected.
-    /// The window uses this to add "do not close" and the one-time note.
+    /// True once the open is doing upgrade work rather than the instant check
+    /// every start performs. The window uses this to name the phase and add the
+    /// one-time "do not close" note.
+    ///
+    /// `CheckingFreeSpace` counts: it is only reached when an upgrade is going
+    /// ahead, and the full `quick_check` that follows it is minutes of silence
+    /// on a large database — the exact stretch this reporting exists for.
     pub fn is_upgrade(&self) -> bool {
-        !matches!(
-            self,
-            StartupPhase::CheckingVersion | StartupPhase::CheckingFreeSpace
-        )
+        !matches!(self, StartupPhase::CheckingVersion)
+    }
+}
+
+#[cfg(test)]
+mod startup_phase_tests {
+    use super::StartupPhase;
+
+    /// The browser workspace runs the database in a child process, so this
+    /// round trip is the only way an upgrade reaches the window people are
+    /// actually looking at. A name that does not survive it means the launcher
+    /// falls back to echoing the child's English prose.
+    #[test]
+    fn every_phase_survives_the_trip_between_processes() {
+        let phases = [
+            StartupPhase::CheckingVersion,
+            StartupPhase::CheckingFreeSpace,
+            StartupPhase::CreatingBackup,
+            StartupPhase::VerifyingBackup,
+            StartupPhase::UpgradingStructure,
+            StartupPhase::RebuildingFingerprints {
+                done: 1_200,
+                total: 5_000,
+            },
+            StartupPhase::ComputingTypedColumns {
+                done: 0,
+                total: 90_000,
+            },
+            StartupPhase::VerifyingUpgrade,
+        ];
+        for phase in phases {
+            let line = phase.wire_line();
+            assert_eq!(
+                StartupPhase::parse_wire_line(&line),
+                Some(phase),
+                "{line} did not survive the round trip"
+            );
+        }
+        // Distinct names, or two phases would be indistinguishable on the wire.
+        let mut names: Vec<&str> = phases.iter().map(StartupPhase::wire_name).collect();
+        names.sort_unstable();
+        let count = names.len();
+        names.dedup();
+        assert_eq!(names.len(), count, "two phases share a wire name");
+    }
+
+    /// The launcher reads every line the child prints. Ordinary output must not
+    /// be mistaken for a phase.
+    #[test]
+    fn ordinary_output_is_not_read_as_a_phase() {
+        for line in [
+            "[base-search] startup: configuring the database connection took 2.0s",
+            "[base-search] phase",
+            "[base-search] phase not_a_phase 0 0",
+            "[base-search] phase creating_backup x y",
+            "warning: something else entirely",
+            "",
+        ] {
+            assert_eq!(
+                StartupPhase::parse_wire_line(line),
+                None,
+                "{line:?} was mistaken for a phase"
+            );
+        }
+    }
+
+    /// Only the instant check every start performs is silent. Everything after
+    /// it is rewriting the database and has to say so — including the free
+    /// space check, which is followed by a full read of the file.
+    #[test]
+    fn only_the_version_check_stays_quiet() {
+        assert!(!StartupPhase::CheckingVersion.is_upgrade());
+        assert!(StartupPhase::CheckingFreeSpace.is_upgrade());
+        assert!(StartupPhase::CreatingBackup.is_upgrade());
+        assert!(StartupPhase::VerifyingUpgrade.is_upgrade());
     }
 }
 

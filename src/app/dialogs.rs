@@ -4,7 +4,7 @@ use std::time::Instant;
 use super::ACCENT;
 use super::state::StatusLine;
 use crate::db::{RecordCard, StartupPhase};
-use crate::i18n::{Lang, Tr, help_sections};
+use crate::i18n::{Lang, Tr, help_sections, startup_phase_label};
 
 pub(super) enum ResultsEmptyAction {
     Import,
@@ -26,20 +26,6 @@ pub(super) struct SettingsWindowInput<'a> {
     pub(super) db_ready: bool,
     pub(super) t: &'a Tr,
     pub(super) app_version: &'a str,
-}
-
-/// The label for what opening the database is doing right now.
-pub(super) fn startup_phase_label(phase: StartupPhase, t: &Tr) -> &'static str {
-    match phase {
-        StartupPhase::CheckingVersion => t.phase_checking_version,
-        StartupPhase::CheckingFreeSpace => t.phase_checking_space,
-        StartupPhase::CreatingBackup => t.phase_backup,
-        StartupPhase::VerifyingBackup => t.phase_verify_backup,
-        StartupPhase::UpgradingStructure => t.phase_upgrading,
-        StartupPhase::RebuildingFingerprints { .. } => t.phase_fingerprints,
-        StartupPhase::ComputingTypedColumns { .. } => t.phase_typed_columns,
-        StartupPhase::VerifyingUpgrade => t.phase_verifying,
-    }
 }
 
 pub(super) fn startup_state(

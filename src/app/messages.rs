@@ -289,8 +289,12 @@ fn handle_startup_done(
             app.db_ready = false;
             app.search_in_flight = false;
             app.count_in_flight = false;
+            // Clear the phase, or the screen keeps a live spinner and "this
+            // runs once, do not close the window" above the error, forever.
+            app.startup_phase = None;
+            let t = crate::i18n::tr(crate::app::prompt_language());
             app.status = StatusLine {
-                text: format!("{}: {message}", app.t().error),
+                text: format!("{}: {message}", t.startup_failed),
                 is_error: true,
             };
         }

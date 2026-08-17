@@ -57,8 +57,8 @@ use dialogs::{
 use import_report_view::import_report_window;
 use month_chart::MonthMetric;
 use pivot_view::pivot_tsv;
-pub use platform::default_db_path;
 use platform::open_parent_folder;
+pub use platform::{default_db_path, prompt_language};
 use profile_view::{ProfileViewAction, profile_view};
 use reports::{report_html, report_markdown};
 use results_table::{ResultsTableInput, RowMenuAction, results_table};
@@ -665,13 +665,17 @@ impl App {
     }
 
     fn ui_startup_state(&self, ui: &mut egui::Ui) {
+        // The stored language lives inside the database this screen is still
+        // waiting on, so `self.lang` is the default until the open finishes —
+        // which is precisely the whole time this screen is visible. Use the
+        // same source the pre-database prompts use.
         startup_state(
             ui,
             &self.db_path,
             &self.startup_started,
             self.startup_phase,
             &self.status,
-            self.t(),
+            tr(prompt_language()),
         );
     }
 

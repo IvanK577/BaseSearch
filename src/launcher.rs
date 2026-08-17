@@ -12,6 +12,9 @@ use std::time::{Duration, Instant};
 use eframe::egui;
 use serde::{Deserialize, Serialize};
 
+use base_search::app::prompt_language;
+use base_search::db::StartupPhase;
+use base_search::i18n::{startup_phase_label, tr};
 use base_search::server::network::{
     TrustedIpv4Interface, discover_trusted_ipv4_interfaces, is_trusted_lan_ipv4,
     local_workspace_url, trusted_lan_workspace_url,
@@ -317,8 +320,14 @@ enum LaunchStatus {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum LaunchEvent {
-    Prepared { urls: WorkspaceUrls },
+    Prepared {
+        urls: WorkspaceUrls,
+    },
     Progress(String),
+    /// A recognized upgrade phase from the server child, carrying its own
+    /// counts. Kept apart from `Progress` so the window can show a translated
+    /// label and a real bar instead of echoing the child's English.
+    Phase(StartupPhase),
     Output(String),
     Ready,
     Failed(String),
@@ -334,6 +343,10 @@ struct LauncherModel {
     mode: WorkspaceMode,
     status: LaunchStatus,
     stage: String,
+    /// The recognized upgrade phase, when the server is in one. Drawn in the
+    /// reader's language with its own progress bar; `stage` stays the fallback
+    /// for everything that is not a recognized phase.
+    phase: Option<StartupPhase>,
     open_on_ready: bool,
     generation: u64,
     local_url: Option<String>,
@@ -453,6 +466,7 @@ impl LauncherModel {
             mode: WorkspaceMode::Personal,
             status: LaunchStatus::Stopped,
             stage: String::new(),
+            phase: None,
             open_on_ready,
             generation: 0,
             local_url: None,
@@ -521,11 +535,16 @@ impl LauncherModel {
             LaunchEvent::Prepared { urls } => {
                 self.local_url = Some(urls.local);
                 self.lan_url = urls.lan;
-                self.stage = "Opening the database".to_string();
+                self.stage = tr(prompt_language()).startup_opening.to_string();
+                self.phase = None;
                 None
             }
             LaunchEvent::Progress(stage) => {
                 self.stage = stage;
+                None
+            }
+            LaunchEvent::Phase(phase) => {
+                self.phase = Some(phase);
                 None
             }
             LaunchEvent::Output(_) => None,
@@ -1106,28 +1125,77 @@ impl LauncherApp {
         ui.separator();
         ui.add_space(12.0);
 
+        let t = tr(prompt_language());
         ui.horizontal(|ui| {
             if self.controller.model.status == LaunchStatus::Starting {
                 ui.spinner();
             }
             let (label, color) = match &self.controller.model.status {
-                LaunchStatus::Starting => ("Starting", egui::Color32::from_rgb(226, 153, 68)),
-                LaunchStatus::Ready => ("Ready", egui::Color32::from_rgb(90, 190, 125)),
-                LaunchStatus::Error(_) => ("Error", egui::Color32::from_rgb(225, 90, 80)),
-                LaunchStatus::Stopped => ("Stopped", egui::Color32::GRAY),
+                LaunchStatus::Starting => {
+                    (t.launcher_starting, egui::Color32::from_rgb(226, 153, 68))
+                }
+                LaunchStatus::Ready => (t.launcher_ready, egui::Color32::from_rgb(90, 190, 125)),
+                LaunchStatus::Error(_) => (t.launcher_error, egui::Color32::from_rgb(225, 90, 80)),
+                LaunchStatus::Stopped => (t.launcher_stopped, egui::Color32::GRAY),
             };
             ui.colored_label(color, egui::RichText::new(label).strong());
-            if self.controller.model.stage.is_empty() {
-                ui.label("Waiting to start");
-            } else {
-                ui.label(&self.controller.model.stage);
+            // A recognized phase is shown in the reader's language; anything
+            // else falls back to whatever the server said.
+            match self.controller.model.phase.filter(StartupPhase::is_upgrade) {
+                Some(phase) => {
+                    ui.label(egui::RichText::new(startup_phase_label(phase, t)).strong());
+                }
+                None if self.controller.model.stage.is_empty() => {
+                    ui.label(t.launcher_waiting);
+                }
+                None => {
+                    ui.label(&self.controller.model.stage);
+                }
             }
         });
+
+        // The upgrade is the one thing here worth a full account: it rewrites
+        // the database, it runs once, and on a large one it takes minutes. The
+        // launcher used to show a single English line for all of it.
+        if let Some(phase) = self.controller.model.phase.filter(StartupPhase::is_upgrade) {
+            ui.add_space(6.0);
+            if let Some((done, total)) = phase.progress()
+                && total > 0
+            {
+                let fraction = (done as f32 / total as f32).clamp(0.0, 1.0);
+                ui.add(
+                    egui::ProgressBar::new(fraction)
+                        .desired_width(360.0)
+                        .text(format!("{done} / {total}")),
+                );
+                ui.add_space(4.0);
+            }
+            ui.label(egui::RichText::new(t.upgrade_once_note).weak());
+            ui.add_space(4.0);
+            let size = std::fs::metadata(&self.controller.model.db_path)
+                .map(|meta| meta.len())
+                .unwrap_or(0);
+            ui.label(
+                egui::RichText::new(format!(
+                    "{}: {}   ·   {}: {:.2} GB",
+                    t.startup_database_label,
+                    self.controller.model.db_path.display(),
+                    t.startup_size_label,
+                    size as f64 / (1u64 << 30) as f64
+                ))
+                .weak()
+                .small(),
+            );
+        }
 
         if self.controller.model.status == LaunchStatus::Starting
             && let Some(elapsed) = self.controller.elapsed()
         {
-            ui.label(format!("Elapsed: {}s", elapsed.as_secs()));
+            ui.label(format!(
+                "{}: {}s",
+                t.startup_elapsed_label,
+                elapsed.as_secs()
+            ));
         }
 
         ui.add_space(14.0);
@@ -1425,7 +1493,9 @@ fn forward_output(
                 break;
             };
             send_event(&events, generation, LaunchEvent::Output(line.clone()));
-            if let Some(progress) = startup_progress_text(&line) {
+            if let Some(phase) = StartupPhase::parse_wire_line(&line) {
+                send_event(&events, generation, LaunchEvent::Phase(phase));
+            } else if let Some(progress) = startup_progress_text(&line) {
                 send_event(&events, generation, LaunchEvent::Progress(progress));
             }
         }

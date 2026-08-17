@@ -62,6 +62,23 @@ pub fn run(config: ServerConfig) -> Result<(), String> {
     runtime.block_on(serve(config))
 }
 
+/// Opens the database once through the migrating path, reporting each phase.
+///
+/// This is the open people actually wait on: the browser workspace is the
+/// default, and it runs in a child process the launcher started. A first open
+/// after an update rebuilds the database — minutes on a large one — and none of
+/// that reaches the window unless it is reported here. The reporter is a
+/// parameter so this can be tested without a running server; `serve` passes one
+/// that writes the line the launcher parses.
+fn open_database_for_serving(
+    db_path: &Path,
+    report: &mut dyn FnMut(crate::db::StartupPhase),
+) -> Result<(), String> {
+    Db::open_with_progress(db_path, report)
+        .map(|_| ())
+        .map_err(|err| format!("cannot open database: {err}"))
+}
+
 async fn serve(config: ServerConfig) -> Result<(), String> {
     config.validate_bind_policy()?;
     let db_path = config.db_path.clone();
@@ -69,9 +86,8 @@ async fn serve(config: ServerConfig) -> Result<(), String> {
         std::fs::create_dir_all(parent)
             .map_err(|err| format!("cannot create database folder: {err}"))?;
     }
-    // Open once through the migrating path so the schema is up to date; request
-    // handlers then use fast runtime connections.
-    Db::open(&db_path).map_err(|err| format!("cannot open database: {err}"))?;
+    // stderr is unbuffered, so each line arrives while its phase is running.
+    open_database_for_serving(&db_path, &mut |phase| eprintln!("{}", phase.wire_line()))?;
 
     let base_dir = db_path
         .parent()
@@ -314,5 +330,51 @@ pub(crate) fn sanitize_file_name(name: &str) -> String {
         "file".to_string()
     } else {
         trimmed.chars().take(180).collect()
+    }
+}
+
+#[cfg(test)]
+mod open_reporting_tests {
+    use super::open_database_for_serving;
+    use crate::db::{Db, ImportRecord, StartupPhase, canonical_record_hash};
+
+    /// The browser workspace is what people run, and its database is opened
+    /// here. If this path stops reporting, an upgrade is silent in the only
+    /// mode most people ever see — which is the state this whole mechanism
+    /// exists to end.
+    #[test]
+    fn serving_reports_the_upgrade_it_performs() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("serve.db");
+
+        // Leave the database the way an older version would have.
+        let mut db = Db::open(&path).unwrap();
+        let values = vec![String::new(); crate::schema::COLUMNS.len()];
+        db.insert_batch(
+            "legacy.xlsx",
+            &[ImportRecord {
+                hash: canonical_record_hash(&values, None),
+                year: Some(2024),
+                values,
+                extra: None,
+            }],
+        )
+        .unwrap();
+        db.meta_set("records_schema", "1");
+        drop(db);
+
+        let mut seen = Vec::new();
+        open_database_for_serving(&path, &mut |phase| seen.push(phase)).unwrap();
+
+        assert!(
+            seen.iter().any(StartupPhase::is_upgrade),
+            "an upgrade must be reported, got {seen:?}"
+        );
+        assert_eq!(seen.last(), Some(&StartupPhase::VerifyingUpgrade));
+
+        // A second open needs nothing and must not announce an upgrade.
+        let mut quiet = Vec::new();
+        open_database_for_serving(&path, &mut |phase| quiet.push(phase)).unwrap();
+        assert_eq!(quiet, vec![StartupPhase::CheckingVersion]);
     }
 }
