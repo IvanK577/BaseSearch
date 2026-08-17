@@ -298,29 +298,93 @@ pub(crate) struct SubsetTotals {
     pub(crate) paired_rows: u64,
     pub(crate) paired_value: f64,
     pub(crate) paired_net_source: f64,
-    /// The currency key every valued row in this subset shares, when they do
-    /// share one, from the subset's own `GROUP BY`.
+    /// This subset's own money, split by currency, when the caller could group
+    /// by it. Empty falls back to the query-level bucket, which is what a
+    /// caller that cannot group by currency passes.
     ///
-    /// It outranks the query-level bucket. A workspace holding dollars and
-    /// euros has no query-level bucket at all, so before this every group and
-    /// month row read "mixed currencies" — including the many rows that were
-    /// never mixed, like a company that has only ever traded in euros. `None`
-    /// falls back to the query-level bucket, which is what a caller that
-    /// cannot group by currency should pass.
-    pub(crate) own_currency: Option<String>,
+    /// It outranks the query-level bucket, and it is what makes a mixed
+    /// workspace readable. A workspace holding dollars and euros has no
+    /// query-level bucket at all, so every group row and month inherited
+    /// nothing: a company that only ever traded in euros reported no money,
+    /// and a row that genuinely held both reported a plain zero — which is
+    /// indistinguishable from having no money at all, and far worse than
+    /// saying the currencies differ.
+    pub(crate) own_currencies: Vec<SubsetCurrency>,
 }
 
-/// The subset's own currency bucket, or `None` when its valued rows span
-/// several — or when it has none, in which case there is nothing to label.
-fn single_currency(
-    row: &rusqlite::Row<'_>,
-    count_index: usize,
-    key_index: usize,
-) -> rusqlite::Result<Option<String>> {
-    if row.get::<_, i64>(count_index)? != 1 {
-        return Ok(None);
+/// One currency's share of a subset, from the subset's own `GROUP BY`.
+pub(crate) struct SubsetCurrency {
+    pub(crate) currency: String,
+    pub(crate) valued_rows: u64,
+    pub(crate) total_value: f64,
+    pub(crate) paired_rows: u64,
+    pub(crate) paired_value: f64,
+    pub(crate) paired_net_source: f64,
+}
+
+/// One block of aggregates per currency the query as a whole holds.
+///
+/// Nothing is scanned twice: these are conditional sums inside the query that
+/// was already grouping the subset. The list is the query's own bucket list —
+/// as many currencies as the filtered rows actually contain, which is two or
+/// three in practice and never unbounded. A subset cannot hold a currency the
+/// query does not, so the split is complete.
+fn per_currency_columns(
+    buckets: &[AnalyticsCurrencyTotal],
+    value: &str,
+    currency: &str,
+    net: &str,
+) -> String {
+    let mut sql = String::new();
+    for bucket in buckets {
+        let key = sql_string(&bucket.currency);
+        let valued = format!("{value} IS NOT NULL AND {currency} = {key}");
+        let paired = format!("{valued} AND ({net}) > 0");
+        sql.push_str(&format!(
+            ",
+            COUNT(CASE WHEN {valued} THEN 1 END),
+            COALESCE(SUM(CASE WHEN {valued} THEN {value} END), 0.0),
+            COUNT(CASE WHEN {paired} THEN 1 END),
+            COALESCE(SUM(CASE WHEN {paired} THEN {value} END), 0.0),
+            COALESCE(SUM(CASE WHEN {paired} THEN ({net}) END), 0.0)"
+        ));
     }
-    row.get::<_, Option<String>>(key_index)
+    sql
+}
+
+/// Columns written by [`per_currency_columns`] for one currency.
+const PER_CURRENCY_COLUMNS: usize = 5;
+
+/// A SQL string literal. Currency keys come from the data, so the quotes are
+/// doubled rather than assumed absent.
+fn sql_string(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
+/// Reads back the block [`per_currency_columns`] wrote, dropping the currencies
+/// this subset holds none of.
+fn read_own_currencies(
+    row: &rusqlite::Row<'_>,
+    buckets: &[AnalyticsCurrencyTotal],
+    first: usize,
+) -> rusqlite::Result<Vec<SubsetCurrency>> {
+    let mut out = Vec::new();
+    for (index, bucket) in buckets.iter().enumerate() {
+        let base = first + index * PER_CURRENCY_COLUMNS;
+        let valued_rows = row.get::<_, i64>(base)? as u64;
+        if valued_rows == 0 {
+            continue;
+        }
+        out.push(SubsetCurrency {
+            currency: bucket.currency.clone(),
+            valued_rows,
+            total_value: row.get(base + 1)?,
+            paired_rows: row.get::<_, i64>(base + 2)? as u64,
+            paired_value: row.get(base + 3)?,
+            paired_net_source: row.get(base + 4)?,
+        });
+    }
+    Ok(out)
 }
 
 fn subset_weight(
@@ -362,23 +426,24 @@ pub(crate) fn inherited_measures(
     query: &AnalyticsMeasures,
     subset: SubsetTotals,
 ) -> AnalyticsMeasures {
-    let currency = subset
-        .own_currency
-        .as_ref()
-        .map(|key| AnalyticsCurrencyTotal {
-            known: currency_is_known(key),
-            currency: key.clone(),
+    let own: Vec<AnalyticsCurrencyTotal> = subset
+        .own_currencies
+        .iter()
+        .map(|bucket| AnalyticsCurrencyTotal {
+            known: currency_is_known(&bucket.currency),
+            currency: bucket.currency.clone(),
+            valued_rows: bucket.valued_rows,
+            total_value: bucket.total_value,
+        })
+        .collect();
+    let inherited = own.is_empty().then(|| {
+        single_bucket(&query.currency_totals).map(|bucket| AnalyticsCurrencyTotal {
+            known: bucket.known,
+            currency: bucket.currency.clone(),
             valued_rows: subset.valued_rows,
             total_value: subset.total_value,
         })
-        .or_else(|| {
-            single_bucket(&query.currency_totals).map(|bucket| AnalyticsCurrencyTotal {
-                known: bucket.known,
-                currency: bucket.currency.clone(),
-                valued_rows: subset.valued_rows,
-                total_value: subset.total_value,
-            })
-        });
+    });
     let net_unit = single_bucket(&query.net_weight_totals);
     let net_weight_totals = net_unit
         .map(|bucket| subset_weight(bucket, subset.net_rows, subset.total_net_source))
@@ -392,31 +457,72 @@ pub(crate) fn inherited_measures(
     };
     // A value-per-weight ratio needs both a labelled currency and a weight unit
     // convertible to kilograms; an unknown unit has no factor and is skipped.
-    let value_per_weight = match (currency.as_ref(), net_unit) {
-        (Some(currency), Some(unit)) => unit.factor_to_kg.map(|factor| {
-            let total_weight = subset.paired_net_source * factor;
-            AnalyticsValuePerWeight {
-                currency: currency.currency.clone(),
-                normalized_weight_unit: "kg".to_string(),
-                source_weight_units: vec![unit.source_unit.clone()],
-                paired_rows: subset.paired_rows,
-                total_value: subset.paired_value,
-                total_weight,
-                value_per_weight: (total_weight > 0.0).then(|| subset.paired_value / total_weight),
-            }
-        }),
-        _ => None,
+    let ratio = |currency: &str, paired_rows: u64, paired_value: f64, paired_net: f64| {
+        net_unit.and_then(|unit| {
+            unit.factor_to_kg.map(|factor| {
+                let total_weight = paired_net * factor;
+                AnalyticsValuePerWeight {
+                    currency: currency.to_string(),
+                    normalized_weight_unit: "kg".to_string(),
+                    source_weight_units: vec![unit.source_unit.clone()],
+                    paired_rows,
+                    total_value: paired_value,
+                    total_weight,
+                    value_per_weight: (total_weight > 0.0).then(|| paired_value / total_weight),
+                }
+            })
+        })
     };
-    let compatible_value_total = currency.clone().filter(|total| total.known);
-    let compatible_value_per_net_weight = compatible_value_total
-        .as_ref()
-        .and_then(|_| value_per_weight.clone());
+    let (currency_totals, value_per_net_weight) = match inherited {
+        // No split available: the query-level bucket relabelled onto the
+        // subset's own sums, exactly as before there was a split.
+        Some(bucket) => {
+            let pairs: Vec<AnalyticsValuePerWeight> = bucket
+                .as_ref()
+                .and_then(|bucket| {
+                    ratio(
+                        &bucket.currency,
+                        subset.paired_rows,
+                        subset.paired_value,
+                        subset.paired_net_source,
+                    )
+                })
+                .into_iter()
+                .collect();
+            (bucket.into_iter().collect::<Vec<_>>(), pairs)
+        }
+        None => {
+            let pairs = subset
+                .own_currencies
+                .iter()
+                .filter(|bucket| bucket.paired_rows > 0)
+                .filter_map(|bucket| {
+                    ratio(
+                        &bucket.currency,
+                        bucket.paired_rows,
+                        bucket.paired_value,
+                        bucket.paired_net_source,
+                    )
+                })
+                .collect();
+            (own, pairs)
+        }
+    };
+    let compatible_value_total = single_bucket(&currency_totals)
+        .filter(|total| total.known)
+        .cloned();
+    let compatible_value_per_net_weight = compatible_value_total.as_ref().and_then(|total| {
+        value_per_net_weight
+            .iter()
+            .find(|pair| pair.currency == total.currency)
+            .cloned()
+    });
 
     AnalyticsMeasures {
-        currency_totals: currency.into_iter().collect(),
+        currency_totals,
         net_weight_totals,
         gross_weight_totals,
-        value_per_net_weight: value_per_weight.into_iter().collect(),
+        value_per_net_weight,
         compatible_value_total,
         compatible_value_per_net_weight,
         // Exclusion counters stay query-level: they answer "what did the whole
@@ -565,9 +671,9 @@ pub(crate) fn months(
     let net = cols
         .number(SemanticField::NetWeight)
         .unwrap_or_else(|| "NULL".to_string());
-    // One extra pair of aggregates, no extra scan: how many currencies the
-    // month's valued rows span, and which one when they span exactly one.
     let currency = cols.measures().currency_key;
+    let per_currency =
+        per_currency_columns(&query_measures.currency_totals, &value, &currency, &net);
     let month_filter = format!("{month} <> ''");
     let filter_sql = if where_sql.is_empty() {
         format!(" WHERE {month_filter}")
@@ -587,9 +693,7 @@ pub(crate) fn months(
             COALESCE(SUM(CASE WHEN {value} IS NOT NULL AND ({net}) > 0
                 THEN {value} END), 0.0) AS paired_value,
             COALESCE(SUM(CASE WHEN {value} IS NOT NULL AND ({net}) > 0
-                THEN ({net}) END), 0.0) AS paired_net,
-            COUNT(DISTINCT CASE WHEN {value} IS NOT NULL THEN {currency} END) AS currencies,
-            MIN(CASE WHEN {value} IS NOT NULL THEN {currency} END) AS one_currency
+                THEN ({net}) END), 0.0) AS paired_net{per_currency}
          FROM records r{joins}{filter_sql}
          GROUP BY {month}
          ORDER BY {month} DESC
@@ -617,7 +721,7 @@ pub(crate) fn months(
                     paired_rows: row.get::<_, i64>(7)? as u64,
                     paired_value: row.get(8)?,
                     paired_net_source: row.get(9)?,
-                    own_currency: single_currency(row, 10, 11)?,
+                    own_currencies: read_own_currencies(row, &query_measures.currency_totals, 10)?,
                 },
             ),
         })
@@ -662,6 +766,8 @@ pub(crate) fn section(
         .number(SemanticField::Quantity)
         .unwrap_or_else(|| "NULL".to_string());
     let currency = cols.measures().currency_key;
+    let per_currency =
+        per_currency_columns(&overview.measures.currency_totals, &value, &currency, &net);
     // A share of the total value is a fraction of one sum, so it needs that sum
     // to exist. Across two currencies it does not, and dividing a euro total by
     // dollars-plus-euros produced a percentage that looked like an answer.
@@ -695,9 +801,7 @@ pub(crate) fn section(
             COALESCE(SUM(CASE WHEN {value} IS NOT NULL AND ({net}) > 0
                 THEN {value} END), 0.0) AS paired_value,
             COALESCE(SUM(CASE WHEN {value} IS NOT NULL AND ({net}) > 0
-                THEN ({net}) END), 0.0) AS paired_net,
-            COUNT(DISTINCT CASE WHEN {value} IS NOT NULL THEN {currency} END) AS currencies,
-            MIN(CASE WHEN {value} IS NOT NULL THEN {currency} END) AS one_currency
+                THEN ({net}) END), 0.0) AS paired_net{per_currency}
          FROM records r{joins}{filter_sql}
          GROUP BY {label_sql}
          ORDER BY total_value_usd DESC, total_net_kg DESC, rows_count DESC, label COLLATE NOCASE
@@ -756,7 +860,11 @@ pub(crate) fn section(
                     paired_rows: row.get::<_, i64>(11)? as u64,
                     paired_value: row.get(12)?,
                     paired_net_source: row.get(13)?,
-                    own_currency: single_currency(row, 14, 15)?,
+                    own_currencies: read_own_currencies(
+                        row,
+                        &overview.measures.currency_totals,
+                        14,
+                    )?,
                 },
             ),
         })

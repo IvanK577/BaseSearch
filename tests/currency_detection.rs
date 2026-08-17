@@ -337,6 +337,43 @@ fn a_company_keeps_its_own_currency_when_the_workspace_has_several() {
         );
     }
 
+    // The row that covers both suppliers is the one the smoke test caught
+    // reporting a plain zero: it holds 22 780 in two currencies, and an empty
+    // bucket list is indistinguishable from having no money at all. It has to
+    // carry both buckets, so the cell can say the currencies differ and the
+    // hover can show what they are.
+    let buyers = analytics
+        .company_sections
+        .iter()
+        .find(|section| section.kind == AnalyticsSectionKind::Recipients)
+        .expect("the recipients section is part of the company sections");
+    let everyone = buyers
+        .rows
+        .iter()
+        .find(|row| row.label.contains("Buyer A"))
+        .expect("one buyer bought everything");
+    assert!(
+        everyone.measures.single_currency_total().is_none(),
+        "this row spans two currencies and has no single total"
+    );
+    let mut split: Vec<(&str, f64)> = everyone
+        .measures
+        .currency_totals
+        .iter()
+        .map(|total| (total.currency.as_str(), total.total_value))
+        .collect();
+    split.sort_by(|left, right| left.0.cmp(right.0));
+    assert_eq!(
+        split,
+        vec![("EUR", 20_380.0), ("USD", 2_400.0)],
+        "and must report each currency it does hold, not a zero"
+    );
+    assert_eq!(
+        everyone.measures.value_per_net_weight.len(),
+        2,
+        "value per kilogram splits the same way"
+    );
+
     // A share of the total value needs that total to exist. It does not here,
     // so the shares fall back to weight — each supplier carries half the
     // kilograms — instead of dividing euros by euros-plus-dollars.
@@ -358,5 +395,62 @@ fn a_company_keeps_its_own_currency_when_the_workspace_has_several() {
         month.measures.single_currency_total().is_none(),
         "a month holding both contracts has no single total: {:?}",
         month.measures.currency_totals
+    );
+}
+
+/// Currency keys are built from whatever the cell says, and `normalize_text_key`
+/// keeps punctuation. An apostrophe therefore reaches the statement that splits
+/// a row by currency, where an unescaped one ends the string literal and takes
+/// the whole query down with it.
+#[test]
+fn a_currency_written_with_an_apostrophe_does_not_break_the_query() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("odd-currency.csv");
+    let mut csv = String::from("Order Date,Invoice No,Supplier,Amount,Net weight,Currency\n");
+    for index in 0..20 {
+        let odd = index % 2 == 0;
+        csv.push_str(&format!(
+            "2024-03-15,INV-{index:03},{},{},10,{}\n",
+            if odd { "ODD TRADER" } else { "PLAIN TRADER" },
+            100 + index,
+            if odd { "O'DOLLAR" } else { "USD" },
+        ));
+    }
+    std::fs::write(&source, csv).unwrap();
+
+    let mut db = Db::open(&dir.path().join("odd.db")).unwrap();
+    assert_eq!(
+        import::import_file(&mut db, &source, &AtomicBool::new(false), &mut |_, _, _| {}).error,
+        None
+    );
+    for (column, semantic) in [
+        ("order_date", SemanticField::Date),
+        ("invoice_no", SemanticField::DeclarationNumber),
+        ("supplier", SemanticField::Sender),
+        ("amount", SemanticField::Value),
+        ("net_weight", SemanticField::NetWeight),
+        ("currency", SemanticField::Currency),
+    ] {
+        assert!(db.set_column_semantic(column, Some(semantic)), "{column}");
+    }
+
+    let analytics = db
+        .analytics(&Query::default(), 10)
+        .expect("the apostrophe must be escaped, not executed");
+    let senders = analytics
+        .company_sections
+        .iter()
+        .find(|section| section.kind == AnalyticsSectionKind::Senders)
+        .expect("the senders section is part of the company sections");
+    let odd = senders
+        .rows
+        .iter()
+        .find(|row| row.label.contains("ODD"))
+        .expect("the odd trader has rows");
+    assert_eq!(
+        odd.measures.currency_totals.len(),
+        1,
+        "and its rows still resolve to their one bucket: {:?}",
+        odd.measures.currency_totals
     );
 }

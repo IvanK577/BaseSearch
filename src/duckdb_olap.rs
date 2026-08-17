@@ -1418,7 +1418,7 @@ fn rollup_months(
                             // The projection does not group by currency, so its rows keep the
                             // query-level bucket they have always used. Passing anything else
                             // here would make this engine and SQLite report different money.
-                            own_currency: None,
+                            own_currencies: Vec::new(),
                         },
                     ),
                 })
@@ -1548,7 +1548,7 @@ fn rollup_section(
                             // The projection does not group by currency, so its rows keep the
                             // query-level bucket they have always used. Passing anything else
                             // here would make this engine and SQLite report different money.
-                            own_currency: None,
+                            own_currencies: Vec::new(),
                         },
                     ),
                 })
@@ -2625,7 +2625,7 @@ fn projection_months(
                         // The projection does not group by currency, so its rows keep the
                         // query-level bucket they have always used. Passing anything else
                         // here would make this engine and SQLite report different money.
-                        own_currency: None,
+                        own_currencies: Vec::new(),
                     },
                 ),
             })
@@ -2779,7 +2779,7 @@ fn projection_section(
                         // The projection does not group by currency, so its rows keep the
                         // query-level bucket they have always used. Passing anything else
                         // here would make this engine and SQLite report different money.
-                        own_currency: None,
+                        own_currencies: Vec::new(),
                     },
                 ),
             })
