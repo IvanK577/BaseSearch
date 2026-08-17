@@ -98,6 +98,12 @@ something in it.
   reader's language and the tests name the case instead of matching English
   prose — a test that checks the wording keeps passing after the wording stops
   being English.
+- **The first run is in your language, not in English.** Every screen shown
+  before a database is open took its language from the POSIX locale variables,
+  which on Windows are almost always unset — so the very first start, where you
+  decide where your data lives, was in English whatever the system was set to.
+  Windows is now asked directly for the language it is set to. Your own choice,
+  once made, still outranks it.
 - **The repository no longer carries a prebuilt Windows folder.** The copy in
   `dist\` had drifted to an older build while the documented quick start still
   pointed at it, and mixing the two rebuilt the whole search index on every

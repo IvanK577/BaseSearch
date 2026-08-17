@@ -136,19 +136,84 @@ fn stable_database_path(
 const UI_LANGUAGE_FILE: &str = "ui-language-v1.txt";
 
 /// The language the prompts that appear *before* a database is open should
-/// speak — choosing a workspace, and any failure to open one.
+/// speak — choosing a workspace, any failure to open one, and the whole
+/// launcher window.
 ///
 /// The chosen language is stored inside the database, which is exactly what
 /// these prompts are still deciding, so it is mirrored to a plain file beside
 /// the default workspace whenever it changes. On the very first run no such
-/// file exists and the operating system's locale is the only hint; English is
-/// the last resort. On Windows the locale variables are usually unset, so a
-/// person who has never opened the app there does see these two prompts in
-/// English — the file makes every later run correct.
+/// file exists, and the operating system is the only hint: Windows is asked
+/// directly, everywhere else the locale variables are read. English is the
+/// last resort, not the first guess.
 pub fn prompt_language() -> Lang {
-    stored_prompt_language()
-        .or_else(Lang::from_environment)
-        .unwrap_or_default()
+    resolve_prompt_language(
+        stored_prompt_language(),
+        system_language(),
+        Lang::from_environment(),
+    )
+}
+
+/// The order the three hints are trusted in, separated from reading them so it
+/// can be asserted without a database, an operating system, or an environment.
+///
+/// A stored answer is the person's own choice and outranks everything. The
+/// operating system comes next; the locale variables are last, because on
+/// Windows they are usually absent and elsewhere they *are* the system answer.
+fn resolve_prompt_language(
+    stored: Option<Lang>,
+    system: Option<Lang>,
+    environment: Option<Lang>,
+) -> Lang {
+    stored.or(system).or(environment).unwrap_or_default()
+}
+
+/// The language Windows itself is set to.
+///
+/// The POSIX locale variables this used to rely on are almost always unset on
+/// Windows, so a person who had never opened the app saw its first two screens
+/// — where they decide what happens to their data — in English, whatever their
+/// system was set to. Windows keeps the answer in an API rather than the
+/// environment, so that is where it has to be asked.
+#[cfg(windows)]
+fn system_language() -> Option<Lang> {
+    // LOCALE_NAME_MAX_LENGTH from winnls.h: the longest name the API returns,
+    // terminator included.
+    const LOCALE_NAME_MAX_LENGTH: usize = 85;
+
+    // kernel32, present on every supported Windows. Writes a BCP-47 name such
+    // as "uk-UA" and returns the characters written, the terminator included;
+    // zero means it could not answer.
+    unsafe extern "system" {
+        fn GetUserDefaultLocaleName(name: *mut u16, size: i32) -> i32;
+    }
+
+    let mut buffer = [0u16; LOCALE_NAME_MAX_LENGTH];
+    // Safety: the call writes at most `size` UTF-16 units into `name`, and the
+    // buffer is exactly that long.
+    let written = unsafe { GetUserDefaultLocaleName(buffer.as_mut_ptr(), buffer.len() as i32) };
+    Lang::from_locale_tag(&locale_tag(&buffer, written)?)
+}
+
+/// The name Windows wrote, as text.
+///
+/// Split out because the arithmetic is the part that can be wrong and the API
+/// call is the part that cannot be tested: `written` counts the terminating
+/// null as well, so the last unit has to be dropped. Keeping it would leave a
+/// null inside the tag, which happens to survive parsing a name like `en-US`
+/// and does not survive one like `en` — a bug that hides on most machines.
+#[cfg(windows)]
+fn locale_tag(buffer: &[u16], written: i32) -> Option<String> {
+    let length = usize::try_from(written).ok()?.checked_sub(1)?;
+    let name = buffer.get(..length)?;
+    let tag = String::from_utf16_lossy(name);
+    (!tag.is_empty() && !tag.contains('\0')).then_some(tag)
+}
+
+/// Elsewhere the locale variables are the operating system's answer, so this
+/// step has nothing of its own to add and defers to the one after it.
+#[cfg(not(windows))]
+fn system_language() -> Option<Lang> {
+    None
 }
 
 fn ui_language_path() -> Option<PathBuf> {
@@ -884,5 +949,95 @@ mod tests {
             "a path that is not a Base Search database must be refused"
         );
         let _ = stable;
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_locale_tests {
+    use super::{locale_tag, system_language};
+    use crate::i18n::Lang;
+
+    /// Exercises the real API rather than trusting the declaration.
+    ///
+    /// The answer depends on how this machine is set up, so the assertion is
+    /// not about which language comes back. It is that the call returns at all,
+    /// that the length arithmetic around the terminator does not run off the
+    /// buffer, and that whatever comes back is either a language this program
+    /// speaks or an honest `None` — never a panic and never mojibake.
+    #[test]
+    fn windows_is_asked_what_language_it_is_set_to() {
+        let answer = system_language();
+        if let Some(lang) = answer {
+            assert!(
+                Lang::ALL.contains(&lang),
+                "the API returned something outside the language set: {lang:?}"
+            );
+        }
+        // Calling twice must give the same answer: the buffer is written from
+        // scratch each time, so a stale terminator would show up here.
+        assert_eq!(answer, system_language());
+    }
+
+    /// What the API writes, without needing the API to write it.
+    ///
+    /// Each case below is written so that exactly one guard can answer it. An
+    /// earlier version used a buffer with a null in it for every case, so the
+    /// bounds check was never what rejected the out-of-range count — the null
+    /// check was, and removing the bounds check changed nothing the test saw.
+    #[test]
+    fn the_terminator_is_dropped_and_a_refusal_is_believed() {
+        let name: Vec<u16> = "uk-UA\u{0}padding".encode_utf16().collect();
+        // Five characters and the terminator, the way the API counts them.
+        assert_eq!(locale_tag(&name, 6).as_deref(), Some("uk-UA"));
+        // A name with no region is where keeping the terminator would show:
+        // "de\u{0}" parses to nothing, while "de" is a language.
+        let short: Vec<u16> = "de\u{0}aaaa".encode_utf16().collect();
+        assert_eq!(locale_tag(&short, 3).as_deref(), Some("de"));
+
+        // Zero is how the API says it could not answer, and a negative count
+        // cannot be true of anything.
+        assert_eq!(locale_tag(&name, 0), None);
+        assert_eq!(locale_tag(&name, -1), None);
+
+        // A count past the end, in a buffer holding no null at all, so nothing
+        // but the bounds check can reject it.
+        let unterminated: Vec<u16> = "uk-UA".encode_utf16().collect();
+        assert_eq!(locale_tag(&unterminated, 9_999), None);
+
+        // A count of one leaves an empty name behind the terminator, and a
+        // null inside the name means the count did not match what was written.
+        assert_eq!(locale_tag(&[0u16; 4], 1), None);
+        let embedded: Vec<u16> = "a\u{0}b".encode_utf16().collect();
+        assert_eq!(locale_tag(&embedded, 4), None);
+    }
+}
+
+#[cfg(test)]
+mod language_order_tests {
+    use super::resolve_prompt_language;
+    use crate::i18n::Lang;
+
+    /// The order matters and nothing else asserts it: these three hints are
+    /// read from three places that cannot all be arranged in one test.
+    #[test]
+    fn the_person_own_choice_outranks_the_machine() {
+        assert_eq!(
+            resolve_prompt_language(Some(Lang::Ua), Some(Lang::De), Some(Lang::Fr)),
+            Lang::Ua
+        );
+        assert_eq!(
+            resolve_prompt_language(None, Some(Lang::De), Some(Lang::Fr)),
+            Lang::De,
+            "the operating system outranks the locale variables"
+        );
+        assert_eq!(
+            resolve_prompt_language(None, None, Some(Lang::Fr)),
+            Lang::Fr
+        );
+        assert_eq!(
+            resolve_prompt_language(None, None, None),
+            Lang::En,
+            "English is the last resort, not the first guess"
+        );
     }
 }
