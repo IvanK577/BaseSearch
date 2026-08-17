@@ -1,6 +1,7 @@
 use super::analytics_groups::section_title;
 use super::format::{
-    fmt_compact, fmt_decimal, fmt_money_compact, fmt_money_exact, fmt_money_per_kg,
+    currency_breakdown, fmt_compact, fmt_decimal, fmt_money_compact, fmt_money_exact,
+    fmt_money_per_kg,
 };
 use super::month_chart::{MonthMetric, months_chart};
 use super::price_view::price_metric_title;
@@ -65,6 +66,11 @@ pub(super) fn report_markdown(analytics: &Analytics, query: &Query, lang: Lang) 
         "- Total value: {}\n",
         fmt_money_exact(&analytics.overview.measures, lang)
     ));
+    // A report is read away from the program, so "several currencies" with
+    // nothing beside it cannot be resolved by hovering anything.
+    if let Some(breakdown) = currency_breakdown(&analytics.overview.measures, lang) {
+        out.push_str(&format!("- {}: {breakdown}\n", tr(lang).currency_breakdown));
+    }
     out.push_str(&format!(
         "- Net weight: {:.3} kg\n",
         analytics.overview.total_net_kg
@@ -73,9 +79,9 @@ pub(super) fn report_markdown(analytics: &Analytics, query: &Query, lang: Lang) 
         "- Average value/kg: {}\n\n",
         fmt_money_per_kg(&analytics.overview.measures, lang)
     ));
-    append_report_sections(&mut out, "Companies", &analytics.company_sections);
-    append_report_sections(&mut out, "Goods", &analytics.product_sections);
-    append_report_sections(&mut out, "Countries", &analytics.country_sections);
+    append_report_sections(&mut out, "Companies", &analytics.company_sections, lang);
+    append_report_sections(&mut out, "Goods", &analytics.product_sections, lang);
+    append_report_sections(&mut out, "Countries", &analytics.country_sections, lang);
     out
 }
 
@@ -116,6 +122,13 @@ pub(super) fn report_html(analytics: &Analytics, query: &Query, lang: Lang) -> S
             "<article><span>{}</span><strong>{}</strong></article>",
             esc_html(label),
             esc_html(&value)
+        ));
+    }
+    if let Some(breakdown) = currency_breakdown(&analytics.overview.measures, lang) {
+        body.push_str(&format!(
+            "<article><span>{}</span><strong>{}</strong></article>",
+            esc_html(tr(lang).currency_breakdown),
+            esc_html(&breakdown)
         ));
     }
     body.push_str("</section>");
@@ -237,21 +250,21 @@ fn report_section(ui: &mut egui::Ui, title: &str, sections: &[AnalyticsSection],
                         .small(),
                 );
                 for row in section.rows.iter().take(5) {
-                    report_group_row(ui, row);
+                    report_group_row(ui, row, lang);
                 }
                 ui.add_space(4.0);
             }
         });
 }
 
-fn report_group_row(ui: &mut egui::Ui, row: &AnalyticsGroupRow) {
+fn report_group_row(ui: &mut egui::Ui, row: &AnalyticsGroupRow, lang: Lang) {
     ui.horizontal(|ui| {
         ui.label(trunc_label(&row.label, 38));
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             ui.label(
                 egui::RichText::new(format!(
                     "{} · {}%",
-                    fmt_compact(row.total_value_usd),
+                    fmt_money_compact(&row.measures, lang),
                     fmt_decimal(row.share_percent, 1)
                 ))
                 .monospace(),
@@ -298,9 +311,9 @@ fn append_html_sections(out: &mut String, title: &str, sections: &[AnalyticsSect
         ));
         for row in section.rows.iter().take(10) {
             out.push_str(&format!(
-                "<tr><td>{}</td><td>{:.2}</td><td>{:.3}</td><td>{}</td><td>{:.1}%</td></tr>",
+                "<tr><td>{}</td><td>{}</td><td>{:.3}</td><td>{}</td><td>{:.1}%</td></tr>",
                 esc_html(&row.label),
-                row.total_value_usd,
+                esc_html(&fmt_money_exact(&row.measures, lang)),
                 row.total_net_kg,
                 row.rows,
                 row.share_percent
@@ -364,16 +377,118 @@ fn esc_html(value: &str) -> String {
         .replace('"', "&quot;")
 }
 
-fn append_report_sections(out: &mut String, title: &str, sections: &[AnalyticsSection]) {
+fn append_report_sections(
+    out: &mut String,
+    title: &str,
+    sections: &[AnalyticsSection],
+    lang: Lang,
+) {
     out.push_str(&format!("## {title}\n"));
     for section in sections.iter().filter(|s| !s.rows.is_empty()).take(3) {
         out.push_str(&format!("### {:?}\n", section.kind));
         for row in section.rows.iter().take(10) {
             out.push_str(&format!(
-                "- {}: value {:.2}, net {:.3} kg, rows {}, share {:.1}%\n",
-                row.label, row.total_value_usd, row.total_net_kg, row.rows, row.share_percent
+                "- {}: value {}, net {:.3} kg, rows {}, share {:.1}%\n",
+                row.label,
+                fmt_money_exact(&row.measures, lang),
+                row.total_net_kg,
+                row.rows,
+                row.share_percent
             ));
         }
     }
     out.push('\n');
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{report_html, report_markdown};
+    use crate::db::{
+        Analytics, AnalyticsCurrencyTotal, AnalyticsGroupRow, AnalyticsMeasures, AnalyticsOverview,
+        AnalyticsSection, AnalyticsSectionKind, Query,
+    };
+    use crate::i18n::Lang;
+
+    fn measures(buckets: Vec<(&str, f64)>) -> AnalyticsMeasures {
+        AnalyticsMeasures {
+            currency_totals: buckets
+                .iter()
+                .map(|(currency, total)| AnalyticsCurrencyTotal {
+                    currency: (*currency).to_string(),
+                    known: true,
+                    valued_rows: 1,
+                    total_value: *total,
+                })
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    /// One company in dollars, one in euros, and a workspace total that is
+    /// neither. The exported report is the artefact that leaves the program and
+    /// gets forwarded, so an unlabelled number in it is the hardest to catch.
+    fn mixed_analytics() -> Analytics {
+        Analytics {
+            overview: AnalyticsOverview {
+                row_count: 4,
+                total_value_usd: 1500.0,
+                measures: measures(vec![("USD", 1000.0), ("EUR", 500.0)]),
+                ..Default::default()
+            },
+            company_sections: vec![AnalyticsSection {
+                kind: AnalyticsSectionKind::Senders,
+                rows: vec![
+                    AnalyticsGroupRow {
+                        label: "SHENZHEN TECH".to_string(),
+                        rows: 2,
+                        total_value_usd: 1000.0,
+                        measures: measures(vec![("USD", 1000.0)]),
+                        ..Default::default()
+                    },
+                    AnalyticsGroupRow {
+                        label: "HAMBURG HANDEL".to_string(),
+                        rows: 2,
+                        total_value_usd: 500.0,
+                        measures: measures(vec![("EUR", 500.0)]),
+                        ..Default::default()
+                    },
+                ],
+            }],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn the_markdown_report_labels_every_company_with_its_own_currency() {
+        let report = report_markdown(&mixed_analytics(), &Query::default(), Lang::En);
+        assert!(report.contains("1\u{202F}000 USD"), "{report}");
+        assert!(report.contains("500 EUR"), "{report}");
+        assert!(
+            report.contains("Total value: Several currencies"),
+            "the workspace total spans two and must say so: {report}"
+        );
+        assert!(
+            report.contains("By currency: 1000 USD  ·  500 EUR"),
+            "and then say which two, since the reader cannot hover a file: {report}"
+        );
+        assert!(
+            !report.contains("1500") && !report.contains("1\u{202F}500"),
+            "the cross-currency sum reached the report: {report}"
+        );
+    }
+
+    #[test]
+    fn the_html_report_does_the_same() {
+        let report = report_html(&mixed_analytics(), &Query::default(), Lang::En);
+        assert!(report.contains("1\u{202F}000 USD"), "{report}");
+        assert!(report.contains("500 EUR"), "{report}");
+        assert!(
+            report.contains("1000 USD  ·  500 EUR"),
+            "the breakdown belongs in the exported file too: {report}"
+        );
+        assert!(
+            !report.contains(">1500<") && !report.contains("1500.00"),
+            "the cross-currency sum reached the report: {report}"
+        );
+    }
 }

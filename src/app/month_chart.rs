@@ -2,7 +2,7 @@ use crate::db::AnalyticsMonthRow;
 use crate::i18n::{Lang, group_digits, tr};
 
 use super::ACCENT;
-use super::format::{fmt_compact, fmt_decimal, short_month};
+use super::format::{fmt_compact, fmt_decimal, fmt_money_exact, fmt_money_per_kg, short_month};
 
 /// Metric displayed in the monthly dynamics chart.
 #[derive(Clone, Copy, PartialEq, Eq, Default)]
@@ -221,18 +221,12 @@ fn draw_month_popup(
     ));
 
     let t = tr(lang);
-    let metric_value = metric.of(month);
-    let price = if month.total_net_kg > 0.0 {
-        month.total_value_usd / month.total_net_kg
-    } else {
-        0.0
-    };
     let lines = [
         month.month.clone(),
         format!(
             "{}: {}",
             month_metric_label(metric, lang),
-            month_metric_value(metric, metric_value)
+            month_metric_value(metric, month, lang)
         ),
         format!("{}: {}", t.chart_rows, group_digits(month.rows)),
         format!(
@@ -243,14 +237,14 @@ fn draw_month_popup(
         format!(
             "{}: {}",
             t.chart_value,
-            fmt_decimal(month.total_value_usd, 0)
+            fmt_money_exact(&month.measures, lang)
         ),
         format!(
             "{}: {} kg  |  {}: {}",
             t.chart_net_weight,
             fmt_decimal(month.total_net_kg, 0),
             t.metric_price,
-            fmt_decimal(price, 2)
+            fmt_money_per_kg(&month.measures, lang)
         ),
     ];
     for (idx, line) in lines.iter().enumerate() {
@@ -284,11 +278,92 @@ fn month_metric_label(metric: MonthMetric, lang: Lang) -> &'static str {
     }
 }
 
-fn month_metric_value(metric: MonthMetric, value: f64) -> String {
+/// The hovered month's figure as text.
+///
+/// Bar heights stay on the raw sums — a bar needs a scalar — but the numbers a
+/// person reads come from the month's own currency bucket, so a month is either
+/// labelled with its currency or reported as mixed. It is never a bare number
+/// standing for two currencies added together.
+fn month_metric_value(metric: MonthMetric, month: &AnalyticsMonthRow, lang: Lang) -> String {
     match metric {
-        MonthMetric::Rows => group_digits(value as u64),
-        MonthMetric::AvgPrice => fmt_decimal(value, 2),
-        MonthMetric::NetWeight => format!("{} kg", fmt_decimal(value, 0)),
-        MonthMetric::Value => fmt_decimal(value, 0),
+        MonthMetric::Rows => group_digits(month.rows),
+        MonthMetric::AvgPrice => fmt_money_per_kg(&month.measures, lang),
+        MonthMetric::NetWeight => format!("{} kg", fmt_decimal(month.total_net_kg, 0)),
+        MonthMetric::Value => fmt_money_exact(&month.measures, lang),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{MonthMetric, month_metric_value};
+    use crate::db::{
+        AnalyticsCurrencyTotal, AnalyticsMeasures, AnalyticsMonthRow, AnalyticsValuePerWeight,
+    };
+    use crate::i18n::Lang;
+
+    fn month(buckets: Vec<(&str, f64)>, raw_sum: f64) -> AnalyticsMonthRow {
+        let currency_totals: Vec<AnalyticsCurrencyTotal> = buckets
+            .iter()
+            .map(|(currency, total)| AnalyticsCurrencyTotal {
+                currency: (*currency).to_string(),
+                known: true,
+                valued_rows: 1,
+                total_value: *total,
+            })
+            .collect();
+        AnalyticsMonthRow {
+            month: "2024-03".to_string(),
+            rows: 2,
+            // Still the bar's height, and still never printed as text.
+            total_value_usd: raw_sum,
+            total_net_kg: 100.0,
+            measures: AnalyticsMeasures {
+                value_per_net_weight: currency_totals
+                    .iter()
+                    .map(|total| AnalyticsValuePerWeight {
+                        currency: total.currency.clone(),
+                        normalized_weight_unit: "kg".to_string(),
+                        source_weight_units: vec!["kg".to_string()],
+                        paired_rows: 1,
+                        total_value: total.total_value,
+                        total_weight: 100.0,
+                        value_per_weight: Some(total.total_value / 100.0),
+                    })
+                    .collect(),
+                currency_totals,
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_month_in_one_currency_is_read_out_with_it() {
+        let march = month(vec![("EUR", 900.0)], 900.0);
+        assert_eq!(
+            month_metric_value(MonthMetric::Value, &march, Lang::En),
+            "900 EUR"
+        );
+        assert_eq!(
+            month_metric_value(MonthMetric::AvgPrice, &march, Lang::En),
+            "9 EUR"
+        );
+    }
+
+    /// Hovering a bar is how a person checks a number they are about to use.
+    /// The bar can only have one height, but the figure under the cursor must
+    /// not claim that height means one amount of money.
+    #[test]
+    fn a_month_holding_two_currencies_names_neither() {
+        let march = month(vec![("USD", 600.0), ("EUR", 300.0)], 900.0);
+        for metric in [MonthMetric::Value, MonthMetric::AvgPrice] {
+            let shown = month_metric_value(metric, &march, Lang::En);
+            assert_eq!(shown, "Several currencies");
+        }
+        assert_eq!(
+            month_metric_value(MonthMetric::NetWeight, &march, Lang::En),
+            "100 kg",
+            "weight is not money and keeps its number"
+        );
     }
 }

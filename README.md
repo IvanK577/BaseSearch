@@ -169,6 +169,14 @@ internal placeholder. Weight units are normalized only when the unit is known.
 Price-risk results are signals for review, not legal, accounting, or valuation
 advice.
 
+A source that names no currency in any column can still have one worked out
+from its own numbers, when the file states the same amount in two ways and the
+two agree across enough rows. Anything short of that stays unlabelled rather
+than guessed. A currency stated by hand under **Data > Columns** always wins.
+Each source keeps its own answer, so a group or a month that sits in one
+currency is reported in it even when the workspace as a whole holds several;
+only a figure that genuinely spans two says so, and then it shows both.
+
 Production packages ship one local engine:
 
 - **SQLite + FTS5** is the source of truth, the text-search engine, and the

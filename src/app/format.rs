@@ -64,7 +64,7 @@ pub(super) fn fmt_decimal(value: f64, decimals: usize) -> String {
 /// right number only while every row happens to share a currency. When they do
 /// not, no scalar is true of them, and saying so is the only honest option —
 /// the per-currency breakdown is in `measures.currency_totals`.
-pub(super) fn fmt_money_compact(measures: &AnalyticsMeasures, lang: Lang) -> String {
+pub fn fmt_money_compact(measures: &AnalyticsMeasures, lang: Lang) -> String {
     label_money(
         measures.single_currency_total(),
         measures.currency_totals.is_empty(),
@@ -74,7 +74,7 @@ pub(super) fn fmt_money_compact(measures: &AnalyticsMeasures, lang: Lang) -> Str
 }
 
 /// Money per kilogram on the same rule.
-pub(super) fn fmt_money_per_kg(measures: &AnalyticsMeasures, lang: Lang) -> String {
+pub fn fmt_money_per_kg(measures: &AnalyticsMeasures, lang: Lang) -> String {
     label_money(
         measures.single_currency_per_net_kg(),
         measures.value_per_net_weight.is_empty(),
@@ -84,7 +84,7 @@ pub(super) fn fmt_money_per_kg(measures: &AnalyticsMeasures, lang: Lang) -> Stri
 }
 
 /// Money at full precision, for report tables and tooltips.
-pub(super) fn fmt_money_exact(measures: &AnalyticsMeasures, lang: Lang) -> String {
+pub fn fmt_money_exact(measures: &AnalyticsMeasures, lang: Lang) -> String {
     label_money(
         measures.single_currency_total(),
         measures.currency_totals.is_empty(),
@@ -111,6 +111,34 @@ fn label_money(
     }
 }
 
+/// Every currency in these rows with its own total: `1.0M USD · 480K EUR`.
+///
+/// `None` when there is nothing to explain — no money at all, or one currency,
+/// which the figure itself already carries. This is what turns "several
+/// currencies" from a refusal into an answer. The person came to read numbers,
+/// and the numbers exist; it is only their sum that does not.
+pub fn currency_breakdown(measures: &AnalyticsMeasures, lang: Lang) -> Option<String> {
+    if measures.currency_totals.len() < 2 {
+        return None;
+    }
+    let unstated = tr(lang).unstated_currency;
+    Some(
+        measures
+            .currency_totals
+            .iter()
+            .map(|total| {
+                let code = if total.known {
+                    total.currency.as_str()
+                } else {
+                    unstated
+                };
+                format!("{} {code}", fmt_compact(total.total_value))
+            })
+            .collect::<Vec<_>>()
+            .join("  ·  "),
+    )
+}
+
 /// Value per document, which is only meaningful inside a single currency.
 pub(super) fn value_per_document(measures: &AnalyticsMeasures, documents: u64) -> Option<f64> {
     let (total, _) = measures.single_currency_total()?;
@@ -120,8 +148,8 @@ pub(super) fn value_per_document(measures: &AnalyticsMeasures, documents: u64) -
 #[cfg(test)]
 mod tests {
     use super::{
-        fmt_compact, fmt_decimal, fmt_money_compact, fmt_money_exact, short_month,
-        value_per_document,
+        currency_breakdown, fmt_compact, fmt_decimal, fmt_money_compact, fmt_money_exact,
+        short_month, value_per_document,
     };
     use crate::db::{AnalyticsCurrencyTotal, AnalyticsMeasures};
     use crate::i18n::Lang;
@@ -174,6 +202,44 @@ mod tests {
             None,
             "a per-document average across currencies is not a number"
         );
+    }
+
+    /// Refusing to add two currencies is only half an answer. The other half
+    /// is telling the person which two, and how much of each — otherwise the
+    /// figures they came for have simply disappeared.
+    #[test]
+    fn several_currencies_are_then_shown_one_by_one() {
+        let mixed = measures(vec![
+            bucket("USD", true, 1000.0),
+            bucket("EUR", true, 500.0),
+        ]);
+        assert_eq!(
+            currency_breakdown(&mixed, Lang::En).as_deref(),
+            Some("1000 USD  ·  500 EUR")
+        );
+    }
+
+    #[test]
+    fn a_bucket_without_a_stated_currency_is_named_as_such() {
+        let mixed = measures(vec![
+            bucket("USD", true, 1000.0),
+            bucket("__unknown__", false, 500.0),
+        ]);
+        assert_eq!(
+            currency_breakdown(&mixed, Lang::En).as_deref(),
+            Some("1000 USD  ·  500 currency not stated")
+        );
+    }
+
+    /// One currency needs no breakdown: the figure beside it already says so,
+    /// and repeating it would be noise on every ordinary workspace.
+    #[test]
+    fn one_currency_has_nothing_to_break_down() {
+        assert_eq!(
+            currency_breakdown(&measures(vec![bucket("USD", true, 1000.0)]), Lang::En),
+            None
+        );
+        assert_eq!(currency_breakdown(&measures(vec![]), Lang::En), None);
     }
 
     #[test]

@@ -6,6 +6,7 @@ use std::process::ExitCode;
 use std::sync::atomic::AtomicBool;
 use std::time::Instant;
 
+use base_search::app::{fmt_money_exact, fmt_money_per_kg};
 use base_search::db::{
     AnalyticsGroupRow, AnalyticsPriceMetric, AnalyticsSection, AnalyticsSectionKind,
     DatabaseStorageInfo, Db, Filters, PriceMetricKind, Query,
@@ -13,6 +14,7 @@ use base_search::db::{
 #[cfg(feature = "duckdb-olap")]
 use base_search::duckdb_olap;
 use base_search::export;
+use base_search::i18n::Lang;
 use base_search::import::{self, ImportPhase};
 use base_search::olap::{OlapBenchmarkOptions, OlapBenchmarkReport, run_sqlite_benchmark};
 use base_search::search::FieldInfo;
@@ -600,11 +602,11 @@ fn cmd_analytics(db_path: &Path, args: &[String]) -> Result<(), String> {
         analytics.overview.distinct_edrpou
     );
     println!(
-        "Value: {:.2}  net: {:.3} kg  gross: {:.3} kg  value/kg: {:.2}  quantity: {:.3}",
-        analytics.overview.total_value_usd,
+        "Value: {}  net: {:.3} kg  gross: {:.3} kg  value/kg: {}  quantity: {:.3}",
+        fmt_money_exact(&analytics.overview.measures, Lang::En),
         analytics.overview.total_net_kg,
         analytics.overview.total_gross_kg,
-        analytics.overview.avg_value_per_net_kg,
+        fmt_money_per_kg(&analytics.overview.measures, Lang::En),
         analytics.overview.total_quantity
     );
     println!(
@@ -843,15 +845,15 @@ fn print_group(rows: &[AnalyticsGroupRow]) {
     }
     for row in rows {
         println!(
-            "  {} | rows {} | decl {} | companies {} | share {:.1}% | value {:.2} | net {:.3} kg | value/kg {:.2}",
+            "  {} | rows {} | decl {} | companies {} | share {:.1}% | value {} | net {:.3} kg | value/kg {}",
             row.label,
             row.rows,
             row.declarations,
             row.companies,
             row.share_percent,
-            row.total_value_usd,
+            fmt_money_exact(&row.measures, Lang::En),
             row.total_net_kg,
-            row.avg_value_per_net_kg
+            fmt_money_per_kg(&row.measures, Lang::En)
         );
     }
 }

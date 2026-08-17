@@ -1,4 +1,6 @@
-use super::format::{fmt_compact, fmt_decimal};
+use super::format::{
+    fmt_compact, fmt_decimal, fmt_money_compact, fmt_money_exact, fmt_money_per_kg,
+};
 use super::ui_text::query_summary;
 use crate::db::{Analytics, Query};
 use crate::i18n::{Lang, group_digits, tr};
@@ -95,12 +97,13 @@ pub(super) fn compare_ui(
                         right.overview.declaration_count as f64,
                         0,
                     );
-                    compare_metric_row(
+                    let (lm, rm) = (&left.overview.measures, &right.overview.measures);
+                    compare_money_row(
                         ui,
                         tr(lang).total_value,
-                        left.overview.total_value_usd,
-                        right.overview.total_value_usd,
-                        2,
+                        (&fmt_money_exact(lm, lang), lm.single_currency_total()),
+                        (&fmt_money_exact(rm, lang), rm.single_currency_total()),
+                        lang,
                     );
                     compare_metric_row(
                         ui,
@@ -109,12 +112,12 @@ pub(super) fn compare_ui(
                         right.overview.total_net_kg,
                         2,
                     );
-                    compare_metric_row(
+                    compare_money_row(
                         ui,
                         tr(lang).avg_value_kg,
-                        left.overview.avg_value_per_net_kg,
-                        right.overview.avg_value_per_net_kg,
-                        2,
+                        (&fmt_money_per_kg(lm, lang), lm.single_currency_per_net_kg()),
+                        (&fmt_money_per_kg(rm, lang), rm.single_currency_per_net_kg()),
+                        lang,
                     );
                     compare_metric_row(
                         ui,
@@ -141,7 +144,7 @@ fn compare_side_card(ui: &mut egui::Ui, title: String, analytics: &Analytics, la
             ui.label(format!(
                 "{}: {}",
                 tr(lang).total_value,
-                fmt_compact(analytics.overview.total_value_usd)
+                fmt_money_compact(&analytics.overview.measures, lang)
             ));
             ui.label(format!(
                 "{}: {} kg",
@@ -151,7 +154,7 @@ fn compare_side_card(ui: &mut egui::Ui, title: String, analytics: &Analytics, la
             ui.label(format!(
                 "{}: {}",
                 tr(lang).avg_value_kg,
-                fmt_decimal(analytics.overview.avg_value_per_net_kg, 2)
+                fmt_money_per_kg(&analytics.overview.measures, lang)
             ));
         });
 }
@@ -182,6 +185,49 @@ fn compare_metric_row(ui: &mut egui::Ui, label: &str, left: f64, right: f64, dec
     ui.end_row();
 }
 
+/// A money row of the difference grid.
+///
+/// Two totals can be subtracted only when both sides are a single, identical
+/// currency. Otherwise the two figures are still shown — that is the point of
+/// the comparison — but the difference column says the currencies do not line
+/// up rather than printing a subtraction that stands for nothing.
+fn compare_money_row(
+    ui: &mut egui::Ui,
+    label: &str,
+    left: (&str, Option<(f64, &str)>),
+    right: (&str, Option<(f64, &str)>),
+    lang: Lang,
+) {
+    ui.label(label);
+    ui.label(egui::RichText::new(left.0).monospace());
+    ui.label(egui::RichText::new(right.0).monospace());
+    ui.label(
+        egui::RichText::new(money_difference(left.1, right.1, lang))
+            .monospace()
+            .strong(),
+    );
+    ui.end_row();
+}
+
+fn money_difference(left: Option<(f64, &str)>, right: Option<(f64, &str)>, lang: Lang) -> String {
+    let (Some((before, left_code)), Some((after, right_code))) = (left, right) else {
+        return tr(lang).mixed_currencies.to_string();
+    };
+    if left_code != right_code {
+        return tr(lang).mixed_currencies.to_string();
+    }
+    let delta = after - before;
+    let shown = match left_code {
+        "" => fmt_decimal(delta, 2),
+        code => format!("{} {code}", fmt_decimal(delta, 2)),
+    };
+    if before.abs() > f64::EPSILON {
+        format!("{shown} ({:+.1}%)", delta / before * 100.0)
+    } else {
+        shown
+    }
+}
+
 fn format_metric(value: f64, decimals: usize) -> String {
     if decimals == 0 {
         let rounded = value.round();
@@ -192,5 +238,52 @@ fn format_metric(value: f64, decimals: usize) -> String {
         }
     } else {
         fmt_decimal(value, decimals)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::money_difference;
+    use crate::i18n::Lang;
+
+    #[test]
+    fn two_totals_in_the_same_currency_subtract() {
+        assert_eq!(
+            money_difference(Some((1000.0, "USD")), Some((1250.0, "USD")), Lang::En),
+            "250 USD (+25.0%)"
+        );
+    }
+
+    /// The whole point of the comparison is the difference column, so it is
+    /// exactly where a subtraction across currencies would do the most damage:
+    /// a number with a percentage next to it reads as a finding.
+    #[test]
+    fn a_dollar_total_is_never_subtracted_from_a_euro_one() {
+        assert_eq!(
+            money_difference(Some((1000.0, "USD")), Some((1250.0, "EUR")), Lang::En),
+            "Several currencies"
+        );
+    }
+
+    #[test]
+    fn a_side_that_spans_currencies_has_no_difference_to_report() {
+        assert_eq!(
+            money_difference(None, Some((1250.0, "EUR")), Lang::En),
+            "Several currencies"
+        );
+        assert_eq!(
+            money_difference(Some((1000.0, "USD")), None, Lang::En),
+            "Several currencies"
+        );
+    }
+
+    /// Both sides unlabelled is the ordinary case for a source that never
+    /// stated a currency, and it has always subtracted. It still does.
+    #[test]
+    fn two_unlabelled_totals_still_subtract() {
+        assert_eq!(
+            money_difference(Some((100.0, "")), Some((80.0, "")), Lang::En),
+            "-20 (-20.0%)"
+        );
     }
 }

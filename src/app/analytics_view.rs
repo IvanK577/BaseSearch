@@ -3,7 +3,7 @@ use super::compare_view::{
     analytics_compare_label, compare_empty, compare_hint, compare_previous_year_label,
     compare_run_label, compare_text_label, compare_ui,
 };
-use super::format::{fmt_compact, fmt_decimal};
+use super::format::{currency_breakdown, fmt_compact, fmt_money_compact, fmt_money_per_kg};
 use super::month_chart::{MonthMetric, months_chart};
 use super::overview_view::{
     overview_dispatch_countries_help, overview_dispatch_countries_label, overview_edrpou_help,
@@ -166,7 +166,7 @@ pub(super) fn analytics_view_panel(
                     t.mini_summary,
                     &[
                         &group_digits(analytics.overview.row_count),
-                        &fmt_compact(analytics.overview.total_value_usd),
+                        &fmt_money_compact(&analytics.overview.measures, lang),
                         &fmt_compact(analytics.overview.total_net_kg),
                     ],
                 ))
@@ -189,6 +189,15 @@ pub(super) fn analytics_view_panel(
                 );
             }
         });
+        // When the figures above read "several currencies", this is where the
+        // person finds out which ones and how much of each. Absent on the
+        // ordinary single-currency workspace, where it would be noise.
+        if let Some(breakdown) = currency_breakdown(&analytics.overview.measures, lang) {
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new(t.currency_breakdown).weak().small());
+                ui.label(egui::RichText::new(breakdown).small().strong());
+            });
+        }
         egui::CollapsingHeader::new(analytics_calc_title(lang))
             .id_salt("analytics_calculation_notes")
             .show(ui, |ui| {
@@ -469,7 +478,7 @@ fn overview_panel(
         kpi_tile(
             ui,
             t.total_value,
-            fmt_compact(analytics.overview.total_value_usd),
+            fmt_money_compact(&analytics.overview.measures, lang),
             t.total_value_help,
         );
         kpi_tile(
@@ -493,7 +502,7 @@ fn overview_panel(
         kpi_tile(
             ui,
             t.avg_value_kg,
-            fmt_decimal(analytics.overview.avg_value_per_net_kg, 2),
+            fmt_money_per_kg(&analytics.overview.measures, lang),
             t.avg_value_kg_help,
         );
         kpi_tile(

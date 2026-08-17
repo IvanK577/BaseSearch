@@ -54,6 +54,10 @@ use dialogs::{
     ResultsEmptyAction, SettingsAction, SettingsWindowInput, card_window, confirm_clear_window,
     help_window, results_empty_state, settings_window, startup_state,
 };
+/// The one place the rule for printing money lives. The CLI reports the
+/// same figures as the windows, and two implementations of "can these rows
+/// be added up" would eventually disagree.
+pub use format::{fmt_money_compact, fmt_money_exact, fmt_money_per_kg};
 use import_report_view::import_report_window;
 use month_chart::MonthMetric;
 use pivot_view::pivot_tsv;

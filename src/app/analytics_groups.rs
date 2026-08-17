@@ -1,6 +1,7 @@
 use super::ACCENT;
 use super::format::{
-    fmt_compact, fmt_decimal, fmt_money_compact, fmt_money_exact, fmt_money_per_kg,
+    currency_breakdown, fmt_compact, fmt_decimal, fmt_money_compact, fmt_money_exact,
+    fmt_money_per_kg,
 };
 use super::ui_text::trunc_label;
 use crate::db::{AnalyticsFilterAction, AnalyticsGroupRow, AnalyticsSection, AnalyticsSectionKind};
@@ -223,17 +224,17 @@ pub(super) fn group_rows_tsv(rows: &[&AnalyticsGroupRow], lang: Lang) -> String 
     for row in rows {
         out.push('\n');
         out.push_str(&format!(
-            "{}\t{}\t{}\t{}\t{:.2}\t{:.2}\t{:.2}\t{:.2}\t{:.2}\t{:.2}",
+            "{}\t{}\t{}\t{}\t{}\t{:.2}\t{:.2}\t{:.2}\t{:.2}\t{}",
             row.label,
             row.rows,
             row.declarations,
             row.companies,
-            row.total_value_usd,
+            fmt_money_exact(&row.measures, lang),
             row.total_net_kg,
             row.total_gross_kg,
             row.total_quantity,
             row.share_percent,
-            row.avg_value_per_net_kg
+            fmt_money_per_kg(&row.measures, lang)
         ));
     }
     out
@@ -406,6 +407,11 @@ fn analytics_row_tooltip_ui(ui: &mut egui::Ui, row: &AnalyticsGroupRow, lang: La
                 tr(lang).total_value,
                 fmt_money_exact(&row.measures, lang),
             );
+            // The cell above can only say "several currencies". The hover is
+            // where this row's actual money is, so it belongs here.
+            if let Some(breakdown) = currency_breakdown(&row.measures, lang) {
+                tooltip_metric(ui, tr(lang).currency_breakdown, breakdown);
+            }
             tooltip_metric(
                 ui,
                 tr(lang).net_weight,
@@ -565,8 +571,12 @@ pub(super) fn group_explorer_table(
                                 group_numeric_cell(ui, group_digits(row.companies), row, lang);
                         });
                         table_row.col(|ui| {
-                            clicked |=
-                                group_numeric_cell(ui, fmt_compact(row.total_value_usd), row, lang);
+                            clicked |= group_numeric_cell(
+                                ui,
+                                fmt_money_compact(&row.measures, lang),
+                                row,
+                                lang,
+                            );
                         });
                         table_row.col(|ui| {
                             clicked |=
@@ -591,7 +601,7 @@ pub(super) fn group_explorer_table(
                         table_row.col(|ui| {
                             clicked |= group_numeric_cell(
                                 ui,
-                                fmt_decimal(row.avg_value_per_net_kg, 2),
+                                fmt_money_per_kg(&row.measures, lang),
                                 row,
                                 lang,
                             );
@@ -750,14 +760,101 @@ fn row_hover_text(row: &AnalyticsGroupRow, lang: Lang) -> String {
         &[
             &row.label,
             &counts,
-            &fmt_decimal(row.total_value_usd, 2),
+            &fmt_money_exact(&row.measures, lang),
             &fmt_decimal(row.total_net_kg, 3),
             &fmt_decimal(row.share_percent, 2),
-            &fmt_decimal(row.avg_value_per_net_kg, 2),
+            &fmt_money_per_kg(&row.measures, lang),
         ],
     )
 }
 
 fn pivot_click_hint(lang: Lang) -> &'static str {
     tr(lang).pivot_click_hint
+}
+
+#[cfg(test)]
+mod tests {
+    use super::group_rows_tsv;
+    use crate::db::{
+        AnalyticsCurrencyTotal, AnalyticsGroupRow, AnalyticsMeasures, AnalyticsValuePerWeight,
+    };
+    use crate::i18n::Lang;
+
+    fn row(label: &str, buckets: Vec<(&str, bool, f64)>, raw_sum: f64) -> AnalyticsGroupRow {
+        let currency_totals: Vec<AnalyticsCurrencyTotal> = buckets
+            .iter()
+            .map(|(currency, known, total)| AnalyticsCurrencyTotal {
+                currency: (*currency).to_string(),
+                known: *known,
+                valued_rows: 1,
+                total_value: *total,
+            })
+            .collect();
+        AnalyticsGroupRow {
+            label: label.to_string(),
+            rows: 2,
+            // The scalar the table used to print. It stays populated on
+            // purpose: the point of these tests is that nothing renders it.
+            total_value_usd: raw_sum,
+            avg_value_per_net_kg: 4.0,
+            total_net_kg: 250.0,
+            measures: AnalyticsMeasures {
+                value_per_net_weight: currency_totals
+                    .iter()
+                    .map(|total| AnalyticsValuePerWeight {
+                        currency: total.currency.clone(),
+                        normalized_weight_unit: "kg".to_string(),
+                        source_weight_units: vec!["kg".to_string()],
+                        paired_rows: 1,
+                        total_value: total.total_value,
+                        total_weight: 100.0,
+                        value_per_weight: Some(total.total_value / 100.0),
+                    })
+                    .collect(),
+                currency_totals,
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    /// The table copies straight into Excel, so what it copies is what the
+    /// person then works from. A cross-currency sum pasted into a sheet is
+    /// worse than one on screen: it outlives the window that produced it.
+    #[test]
+    fn a_row_in_one_currency_is_copied_with_that_currency() {
+        let rows = [row("ACME", vec![("USD", true, 1500.0)], 1500.0)];
+        let tsv = group_rows_tsv(&rows.iter().collect::<Vec<_>>(), Lang::En);
+        let line = tsv.lines().nth(1).expect("one data line");
+        assert!(line.contains("\t1\u{202F}500 USD\t"), "{line}");
+        assert!(line.ends_with("\t15 USD"), "value per kg too: {line}");
+    }
+
+    #[test]
+    fn a_row_spanning_two_currencies_is_copied_as_neither() {
+        let rows = [row(
+            "GLOBEX",
+            vec![("USD", true, 1000.0), ("EUR", true, 500.0)],
+            1500.0,
+        )];
+        let tsv = group_rows_tsv(&rows.iter().collect::<Vec<_>>(), Lang::En);
+        let line = tsv.lines().nth(1).expect("one data line");
+        assert!(line.contains("Several currencies"), "{line}");
+        assert!(
+            !line.contains("1500"),
+            "the cross-currency sum reached the clipboard: {line}"
+        );
+    }
+
+    /// A source that never stated its currency still has one, and its number
+    /// has always been shown bare. Labelling it "several currencies" would be
+    /// a new lie in place of the old one.
+    #[test]
+    fn a_row_whose_currency_was_never_stated_still_shows_its_number() {
+        let rows = [row("NO-CODE", vec![("__unknown__", false, 800.0)], 800.0)];
+        let tsv = group_rows_tsv(&rows.iter().collect::<Vec<_>>(), Lang::En);
+        let line = tsv.lines().nth(1).expect("one data line");
+        assert!(line.contains("\t800\t"), "{line}");
+        assert!(!line.contains("Several currencies"), "{line}");
+    }
 }

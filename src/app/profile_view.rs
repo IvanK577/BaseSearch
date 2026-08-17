@@ -1,5 +1,5 @@
 use super::analytics_groups::{AnalyticsCardAction, analytics_cards_with_options};
-use super::format::{fmt_compact, fmt_decimal};
+use super::format::{fmt_compact, fmt_money_compact, fmt_money_per_kg};
 use super::month_chart::{MonthMetric, months_chart};
 use super::price_view::price_table;
 use super::ui_text::trunc_label;
@@ -83,16 +83,19 @@ pub(super) fn profile_view(
                         &mut cols[1],
                         profile_highlight_product(lang),
                         profile.top_products.first(),
+                        lang,
                     );
                     profile_highlight_row(
                         &mut cols[1],
                         profile_highlight_sender(lang),
                         profile.top_senders.first(),
+                        lang,
                     );
                     profile_highlight_row(
                         &mut cols[1],
                         profile_highlight_country(lang),
                         profile.top_origin_countries.first(),
+                        lang,
                     );
                 });
             });
@@ -115,7 +118,7 @@ pub(super) fn profile_view(
                 kpi_tile(
                     ui,
                     t.total_value,
-                    fmt_compact(profile.overview.total_value_usd),
+                    fmt_money_compact(&profile.overview.measures, lang),
                     t.total_value_help,
                 );
                 kpi_tile(
@@ -127,7 +130,7 @@ pub(super) fn profile_view(
                 kpi_tile(
                     ui,
                     t.avg_value_kg,
-                    fmt_decimal(profile.overview.avg_value_per_net_kg, 2),
+                    fmt_money_per_kg(&profile.overview.measures, lang),
                     t.avg_value_kg_help,
                 );
                 kpi_tile(
@@ -223,13 +226,18 @@ fn profile_highlight_country(lang: Lang) -> &'static str {
     }
 }
 
-fn profile_highlight_row(ui: &mut egui::Ui, label: &str, row: Option<&AnalyticsGroupRow>) {
+fn profile_highlight_row(
+    ui: &mut egui::Ui,
+    label: &str,
+    row: Option<&AnalyticsGroupRow>,
+    lang: Lang,
+) {
     let value = row
         .map(|row| {
             format!(
                 "{} · {}",
                 trunc_label(&row.label, 34),
-                fmt_compact(row.total_value_usd)
+                fmt_money_compact(&row.measures, lang)
             )
         })
         .unwrap_or_else(|| "—".to_string());

@@ -38,13 +38,29 @@ something in it.
   meanings — and a stated answer outranks the recognized one. Each imported file
   keeps its own answer, so a workspace holding several sources no longer merges
   their money into one figure.
-- **The desktop stops adding money across currencies on its headline figures.**
-  It printed a plain sum over every currency with no label at all. The overview
-  cards, the ranking bars and their tooltips, and the report summaries now carry
-  the currency or say the rows span several, as the browser does. Several other
-  places — the KPI tiles beside the cards, the monthly chart, the group table
-  cells, Compare, the company dossier and the clipboard export — still print the
-  old unlabelled sum and are yet to be converted.
+- **The desktop stops adding money across currencies.** It printed a plain sum
+  over every currency with no label at all. Every money figure it shows now
+  carries its currency, or says the rows span several: the overview cards and
+  the KPI tiles beside them, the ranking bars and their tooltips, the group
+  table and the Excel clipboard export, the monthly chart's hover figures,
+  Compare — including its difference column, which no longer subtracts euros
+  from dollars — the company dossier, the report preview, the exported HTML and
+  Markdown reports, and `base-search-cli analytics`.
+- **A workspace holding two currencies still shows you numbers.** Group rows
+  and months are now grouped by currency as well, so a company that has only
+  ever traded in euros reports a euro total even when the workspace around it
+  also holds dollars. Only the figures that genuinely span two currencies say
+  so. Before, one mixed source blanked the money out of every row beside it.
+- **And where they genuinely do span several, it says which.** "Several
+  currencies" on its own is a refusal, not an answer, so the per-currency
+  figures are now shown beside it: under the analytics header, in every ranking
+  row's hover, and in the exported HTML and Markdown reports, which are read
+  where nothing can be hovered.
+- **A share of the total value is no longer a share of a meaningless sum.**
+  Ranking rows divided each row's value by the sum over every currency. When a
+  query spans more than one, the share is now computed on net weight, then on
+  row count — the same ladder the query already used when there was no money at
+  all.
 
 - **An existing database is never mistaken for a workspace.** Choosing one only
   checked for a table named `records`, which other applications have too, and
