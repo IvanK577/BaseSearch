@@ -9,12 +9,19 @@
 use std::path::Path;
 use std::sync::atomic::AtomicBool;
 
-use base_search::db::{Db, Query};
+use base_search::db::{AnalyticsSectionKind, Db, Query};
+use base_search::domain::table::SemanticField;
 use base_search::import;
 
 /// Writes a customs-shaped sheet where every row's value is `rate` times the
 /// dollar amount implied by `РФВ × Нетто`. `rate = 1.0` is a dollar contract.
 fn write_customs(path: &Path, rows: usize, rate: f64, with_rfv: bool) {
+    write_customs_as(path, rows, rate, with_rfv, "SHENZHEN TECH CO");
+}
+
+/// The same sheet under a named sender, so one workspace can hold two
+/// companies whose contracts are in different currencies.
+fn write_customs_as(path: &Path, rows: usize, rate: f64, with_rfv: bool, sender: &str) {
     let mut workbook = rust_xlsxwriter::Workbook::new();
     let sheet = workbook.add_worksheet();
     let mut headers = vec![
@@ -43,7 +50,7 @@ fn write_customs(path: &Path, rows: usize, rate: f64, with_rfv: bool) {
             .write_string(row, 0, format!("24UA1001100{index:05}U1"))
             .unwrap();
         sheet.write_string(row, 1, "15.03.2024").unwrap();
-        sheet.write_string(row, 2, "SHENZHEN TECH CO").unwrap();
+        sheet.write_string(row, 2, sender).unwrap();
         sheet.write_string(row, 3, "33333333").unwrap();
         sheet.write_string(row, 4, "ТОВ «АЛЬФА»").unwrap();
         sheet.write_string(row, 5, "8517130000").unwrap();
@@ -211,5 +218,145 @@ fn each_source_keeps_its_own_currency_in_a_mixed_workspace() {
     assert!(
         totals.iter().any(|total| !total.known),
         "the order rows stay unknown rather than borrowing it"
+    );
+}
+
+/// A workspace with two currencies in it is not a workspace without numbers.
+///
+/// The query as a whole spans two, so no single total is true of it — but a
+/// company that has only ever traded in one still has an honest total, and that
+/// is the number a person opens the program to read. Before this, every group
+/// row in such a workspace looked for the query-level bucket, found none, and
+/// reported nothing at all.
+#[test]
+fn a_company_keeps_its_own_currency_when_the_workspace_has_several() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("two-currencies.xlsx");
+    let mut workbook = rust_xlsxwriter::Workbook::new();
+    let sheet = workbook.add_worksheet();
+    for (column, header) in [
+        "Order Date",
+        "Invoice No",
+        "Supplier",
+        "Buyer",
+        "SKU",
+        "Amount",
+        "Net weight",
+        "Currency",
+        "Weight unit",
+    ]
+    .iter()
+    .enumerate()
+    {
+        sheet.write_string(0, column as u16, *header).unwrap();
+    }
+    // Two suppliers, one invoicing in dollars and one in euros, in one month.
+    for index in 0..40u32 {
+        let euros = index % 2 == 0;
+        let row = [
+            "2024-03-15".to_string(),
+            format!("INV-{index:03}"),
+            if euros {
+                "HAMBURG HANDEL"
+            } else {
+                "SHENZHEN TECH"
+            }
+            .to_string(),
+            "Buyer A".to_string(),
+            "SKU-1".to_string(),
+            // Deliberately far apart, so a share computed on value cannot be
+            // mistaken for one computed on weight.
+            if euros { 1000 + index } else { 100 + index }.to_string(),
+            "10".to_string(),
+            if euros { "EUR" } else { "USD" }.to_string(),
+            "kg".to_string(),
+        ];
+        for (column, value) in row.iter().enumerate() {
+            sheet.write_string(index + 1, column as u16, value).unwrap();
+        }
+    }
+    workbook.save(&source).unwrap();
+
+    let mut db = Db::open(&dir.path().join("two-currencies.db")).unwrap();
+    assert_eq!(
+        import::import_file(&mut db, &source, &AtomicBool::new(false), &mut |_, _, _| {}).error,
+        None
+    );
+    for (column, semantic) in [
+        ("order_date", SemanticField::Date),
+        ("invoice_no", SemanticField::DeclarationNumber),
+        ("supplier", SemanticField::Sender),
+        ("buyer", SemanticField::Recipient),
+        ("sku", SemanticField::ProductCode),
+        ("amount", SemanticField::Value),
+        ("net_weight", SemanticField::NetWeight),
+        ("currency", SemanticField::Currency),
+        ("weight_unit", SemanticField::WeightUnit),
+    ] {
+        assert!(
+            db.set_column_semantic(column, Some(semantic)),
+            "missing shape column {column}"
+        );
+    }
+
+    let analytics = db.analytics(&Query::default(), 10).unwrap();
+    assert!(
+        analytics
+            .overview
+            .measures
+            .single_currency_total()
+            .is_none(),
+        "the workspace itself spans two currencies: {:?}",
+        analytics.overview.measures.currency_totals
+    );
+
+    let senders = analytics
+        .company_sections
+        .iter()
+        .find(|section| section.kind == AnalyticsSectionKind::Senders)
+        .expect("the senders section is part of the company sections");
+    let row_for = |needle: &str| {
+        senders
+            .rows
+            .iter()
+            .find(|row| row.label.contains(needle))
+            .unwrap_or_else(|| panic!("no row for {needle} in {:?}", senders.rows))
+    };
+
+    for (supplier, code) in [("SHENZHEN", "USD"), ("HAMBURG", "EUR")] {
+        let row = row_for(supplier);
+        let (total, shown) = row
+            .measures
+            .single_currency_total()
+            .unwrap_or_else(|| panic!("{supplier} trades in one currency and must report it"));
+        assert_eq!(shown, code, "{supplier} is labelled with its own currency");
+        assert!(total > 0.0, "{supplier} carries its own total");
+        assert!(
+            total < analytics.overview.total_value_usd,
+            "and not the whole workspace's"
+        );
+    }
+
+    // A share of the total value needs that total to exist. It does not here,
+    // so the shares fall back to weight — each supplier carries half the
+    // kilograms — instead of dividing euros by euros-plus-dollars.
+    for supplier in ["SHENZHEN", "HAMBURG"] {
+        let share = row_for(supplier).share_percent;
+        assert!(
+            (share - 50.0).abs() < 0.01,
+            "{supplier} moved half the weight, so its share is 50%, not {share}"
+        );
+    }
+
+    // Both suppliers ship in the same month, so that month really does span two
+    // currencies and must not be handed one.
+    let month = analytics
+        .months
+        .first()
+        .expect("every row lands in one month");
+    assert!(
+        month.measures.single_currency_total().is_none(),
+        "a month holding both contracts has no single total: {:?}",
+        month.measures.currency_totals
     );
 }

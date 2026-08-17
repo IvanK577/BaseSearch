@@ -1415,6 +1415,10 @@ fn rollup_months(
                             paired_rows: row.get::<_, i64>(11)?.max(0) as u64,
                             paired_value: row.get::<_, Option<f64>>(12)?.unwrap_or(0.0),
                             paired_net_source: row.get::<_, Option<f64>>(13)?.unwrap_or(0.0),
+                            // The projection does not group by currency, so its rows keep the
+                            // query-level bucket they have always used. Passing anything else
+                            // here would make this engine and SQLite report different money.
+                            own_currency: None,
                         },
                     ),
                 })
@@ -1541,6 +1545,10 @@ fn rollup_section(
                             paired_rows: row.get::<_, i64>(16)?.max(0) as u64,
                             paired_value: row.get::<_, Option<f64>>(17)?.unwrap_or(0.0),
                             paired_net_source: row.get::<_, Option<f64>>(18)?.unwrap_or(0.0),
+                            // The projection does not group by currency, so its rows keep the
+                            // query-level bucket they have always used. Passing anything else
+                            // here would make this engine and SQLite report different money.
+                            own_currency: None,
                         },
                     ),
                 })
@@ -2614,6 +2622,10 @@ fn projection_months(
                         paired_rows: row.get::<_, i64>(10)?.max(0) as u64,
                         paired_value: row.get::<_, Option<f64>>(11)?.unwrap_or(0.0),
                         paired_net_source: row.get::<_, Option<f64>>(12)?.unwrap_or(0.0),
+                        // The projection does not group by currency, so its rows keep the
+                        // query-level bucket they have always used. Passing anything else
+                        // here would make this engine and SQLite report different money.
+                        own_currency: None,
                     },
                 ),
             })
@@ -2764,6 +2776,10 @@ fn projection_section(
                         paired_rows: row.get::<_, i64>(15)?.max(0) as u64,
                         paired_value: row.get::<_, Option<f64>>(16)?.unwrap_or(0.0),
                         paired_net_source: row.get::<_, Option<f64>>(17)?.unwrap_or(0.0),
+                        // The projection does not group by currency, so its rows keep the
+                        // query-level bucket they have always used. Passing anything else
+                        // here would make this engine and SQLite report different money.
+                        own_currency: None,
                     },
                 ),
             })

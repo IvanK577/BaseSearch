@@ -298,6 +298,29 @@ pub(crate) struct SubsetTotals {
     pub(crate) paired_rows: u64,
     pub(crate) paired_value: f64,
     pub(crate) paired_net_source: f64,
+    /// The currency key every valued row in this subset shares, when they do
+    /// share one, from the subset's own `GROUP BY`.
+    ///
+    /// It outranks the query-level bucket. A workspace holding dollars and
+    /// euros has no query-level bucket at all, so before this every group and
+    /// month row read "mixed currencies" — including the many rows that were
+    /// never mixed, like a company that has only ever traded in euros. `None`
+    /// falls back to the query-level bucket, which is what a caller that
+    /// cannot group by currency should pass.
+    pub(crate) own_currency: Option<String>,
+}
+
+/// The subset's own currency bucket, or `None` when its valued rows span
+/// several — or when it has none, in which case there is nothing to label.
+fn single_currency(
+    row: &rusqlite::Row<'_>,
+    count_index: usize,
+    key_index: usize,
+) -> rusqlite::Result<Option<String>> {
+    if row.get::<_, i64>(count_index)? != 1 {
+        return Ok(None);
+    }
+    row.get::<_, Option<String>>(key_index)
 }
 
 fn subset_weight(
@@ -339,12 +362,23 @@ pub(crate) fn inherited_measures(
     query: &AnalyticsMeasures,
     subset: SubsetTotals,
 ) -> AnalyticsMeasures {
-    let currency = single_bucket(&query.currency_totals).map(|bucket| AnalyticsCurrencyTotal {
-        known: bucket.known,
-        currency: bucket.currency.clone(),
-        valued_rows: subset.valued_rows,
-        total_value: subset.total_value,
-    });
+    let currency = subset
+        .own_currency
+        .as_ref()
+        .map(|key| AnalyticsCurrencyTotal {
+            known: currency_is_known(key),
+            currency: key.clone(),
+            valued_rows: subset.valued_rows,
+            total_value: subset.total_value,
+        })
+        .or_else(|| {
+            single_bucket(&query.currency_totals).map(|bucket| AnalyticsCurrencyTotal {
+                known: bucket.known,
+                currency: bucket.currency.clone(),
+                valued_rows: subset.valued_rows,
+                total_value: subset.total_value,
+            })
+        });
     let net_unit = single_bucket(&query.net_weight_totals);
     let net_weight_totals = net_unit
         .map(|bucket| subset_weight(bucket, subset.net_rows, subset.total_net_source))
@@ -531,6 +565,9 @@ pub(crate) fn months(
     let net = cols
         .number(SemanticField::NetWeight)
         .unwrap_or_else(|| "NULL".to_string());
+    // One extra pair of aggregates, no extra scan: how many currencies the
+    // month's valued rows span, and which one when they span exactly one.
+    let currency = cols.measures().currency_key;
     let month_filter = format!("{month} <> ''");
     let filter_sql = if where_sql.is_empty() {
         format!(" WHERE {month_filter}")
@@ -550,7 +587,9 @@ pub(crate) fn months(
             COALESCE(SUM(CASE WHEN {value} IS NOT NULL AND ({net}) > 0
                 THEN {value} END), 0.0) AS paired_value,
             COALESCE(SUM(CASE WHEN {value} IS NOT NULL AND ({net}) > 0
-                THEN ({net}) END), 0.0) AS paired_net
+                THEN ({net}) END), 0.0) AS paired_net,
+            COUNT(DISTINCT CASE WHEN {value} IS NOT NULL THEN {currency} END) AS currencies,
+            MIN(CASE WHEN {value} IS NOT NULL THEN {currency} END) AS one_currency
          FROM records r{joins}{filter_sql}
          GROUP BY {month}
          ORDER BY {month} DESC
@@ -578,6 +617,7 @@ pub(crate) fn months(
                     paired_rows: row.get::<_, i64>(7)? as u64,
                     paired_value: row.get(8)?,
                     paired_net_source: row.get(9)?,
+                    own_currency: single_currency(row, 10, 11)?,
                 },
             ),
         })
@@ -621,6 +661,14 @@ pub(crate) fn section(
     let quantity = cols
         .number(SemanticField::Quantity)
         .unwrap_or_else(|| "NULL".to_string());
+    let currency = cols.measures().currency_key;
+    // A share of the total value is a fraction of one sum, so it needs that sum
+    // to exist. Across two currencies it does not, and dividing a euro total by
+    // dollars-plus-euros produced a percentage that looked like an answer.
+    // Weight, then row count, are the honest fallbacks — the same ladder the
+    // query already walks when there is no money at all.
+    let share_on_value =
+        overview.total_value_usd > 0.0 && overview.measures.single_currency_total().is_some();
     let joins = &plan.joins;
     let where_sql = &plan.where_sql;
     let mut params = plan.params;
@@ -647,7 +695,9 @@ pub(crate) fn section(
             COALESCE(SUM(CASE WHEN {value} IS NOT NULL AND ({net}) > 0
                 THEN {value} END), 0.0) AS paired_value,
             COALESCE(SUM(CASE WHEN {value} IS NOT NULL AND ({net}) > 0
-                THEN ({net}) END), 0.0) AS paired_net
+                THEN ({net}) END), 0.0) AS paired_net,
+            COUNT(DISTINCT CASE WHEN {value} IS NOT NULL THEN {currency} END) AS currencies,
+            MIN(CASE WHEN {value} IS NOT NULL THEN {currency} END) AS one_currency
          FROM records r{joins}{filter_sql}
          GROUP BY {label_sql}
          ORDER BY total_value_usd DESC, total_net_kg DESC, rows_count DESC, label COLLATE NOCASE
@@ -661,14 +711,14 @@ pub(crate) fn section(
         let total_net_kg: f64 = row.get(5)?;
         let total_gross_kg: f64 = row.get(6)?;
         let total_quantity: f64 = row.get(7)?;
-        let share_base = if overview.total_value_usd > 0.0 {
+        let share_base = if share_on_value {
             overview.total_value_usd
         } else if overview.total_net_kg > 0.0 {
             overview.total_net_kg
         } else {
             overview.row_count as f64
         };
-        let share_value = if overview.total_value_usd > 0.0 {
+        let share_value = if share_on_value {
             total_value_usd
         } else if overview.total_net_kg > 0.0 {
             total_net_kg
@@ -706,6 +756,7 @@ pub(crate) fn section(
                     paired_rows: row.get::<_, i64>(11)? as u64,
                     paired_value: row.get(12)?,
                     paired_net_source: row.get(13)?,
+                    own_currency: single_currency(row, 14, 15)?,
                 },
             ),
         })
