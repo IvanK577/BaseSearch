@@ -49,9 +49,11 @@ something in it.
 - **A workspace holding two currencies still shows you numbers.** Group rows
   and months are now grouped by currency as well, so a company that has only
   ever traded in euros reports a euro total even when the workspace around it
-  also holds dollars. Only the figures that genuinely span two currencies say
-  so. Before, one mixed source blanked the money out of every row beside it.
-- **And where they genuinely do span several, it says which.** "Several
+  also holds dollars. A row that really does hold both now reports both, where
+  it used to print a plain `0` — indistinguishable from having no money at all,
+  and the figure a top-level row like a buyer or a product code would show.
+  Before this, one mixed source emptied the money column of every row beside it.
+- **And where a figure genuinely spans several, it says which.** "Several
   currencies" on its own is a refusal, not an answer, so the per-currency
   figures are now shown beside it: under the analytics header, in every ranking
   row's hover, and in the exported HTML and Markdown reports, which are read
