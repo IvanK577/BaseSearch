@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 
 use base_search::app::prompt_language;
 use base_search::db::StartupPhase;
-use base_search::i18n::{startup_phase_label, tr};
+use base_search::i18n::{Tr, startup_phase_label, tr};
 use base_search::server::network::{
     TrustedIpv4Interface, discover_trusted_ipv4_interfaces, is_trusted_lan_ipv4,
     local_workspace_url, trusted_lan_workspace_url,
@@ -52,21 +52,79 @@ fn workspace_urls(mode: WorkspaceMode, port: u16, lan_address: Option<Ipv4Addr>)
     }
 }
 
+/// A refusal the launcher itself produces.
+///
+/// Kept as a value rather than a sentence for two reasons: the window renders
+/// it in the reader's language, and a test can name the case instead of
+/// matching English prose — which is a test of the wording, and passes by
+/// accident anywhere the wording is not English.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Refusal {
+    UsernameEmpty,
+    UsernameTooLong,
+    PasswordTooShort,
+    PasswordMismatch,
+    AccountsAlreadyExist,
+    OwnerAccountRequired,
+    LanNotConfirmed,
+    AddressNotPrivate(Ipv4Addr),
+    NoUsableInterface,
+    PortOutOfRange,
+    StopBeforeChanging,
+    DatabaseFolder(String),
+    InterfacesUnreadable(String),
+    OwnerNotReloaded,
+    /// Something the operating system or the server already put into words.
+    Reported(String),
+}
+
+impl Refusal {
+    fn message(&self, t: &Tr) -> String {
+        match self {
+            Refusal::UsernameEmpty => t.launcher_msg_username_empty.to_string(),
+            Refusal::UsernameTooLong => t.launcher_msg_username_long.to_string(),
+            Refusal::PasswordTooShort => t.launcher_msg_password_short.to_string(),
+            Refusal::PasswordMismatch => t.launcher_msg_password_mismatch.to_string(),
+            Refusal::AccountsAlreadyExist => t.launcher_msg_accounts_exist.to_string(),
+            Refusal::OwnerAccountRequired => t.launcher_msg_owner_required.to_string(),
+            Refusal::LanNotConfirmed => t.launcher_msg_confirm_required.to_string(),
+            Refusal::AddressNotPrivate(address) => t
+                .launcher_msg_address_not_private
+                .replace("{}", &address.to_string()),
+            Refusal::NoUsableInterface => t.launcher_msg_no_interface.to_string(),
+            Refusal::PortOutOfRange => t.launcher_msg_port_range.to_string(),
+            Refusal::StopBeforeChanging => t.launcher_msg_stop_first.to_string(),
+            Refusal::DatabaseFolder(error) => t.launcher_msg_db_folder.replace("{}", error),
+            Refusal::InterfacesUnreadable(error) => {
+                t.launcher_msg_interfaces_unreadable.replace("{}", error)
+            }
+            Refusal::OwnerNotReloaded => t.launcher_msg_owner_reload_failed.to_string(),
+            Refusal::Reported(text) => text.clone(),
+        }
+    }
+
+    /// The sentence to show right now, in the language this window is using.
+    fn shown(&self) -> String {
+        self.message(tr(prompt_language()))
+    }
+}
+
+impl From<String> for Refusal {
+    fn from(text: String) -> Self {
+        Refusal::Reported(text)
+    }
+}
+
 fn selected_bind_host(
     mode: WorkspaceMode,
     lan_address: Option<Ipv4Addr>,
-) -> Result<Ipv4Addr, String> {
+) -> Result<Ipv4Addr, Refusal> {
     match mode {
         WorkspaceMode::Personal => Ok(Ipv4Addr::LOCALHOST),
         WorkspaceMode::TrustedLan => match lan_address {
             Some(address) if is_trusted_lan_ipv4(address) => Ok(address),
-            Some(address) => Err(format!(
-                "The selected address {address} is not a private LAN or CGNAT VPN address."
-            )),
-            None => Err(
-                "No usable private LAN or VPN IPv4 interface is available. Connect this computer to a trusted network and refresh interfaces."
-                    .to_string(),
-            ),
+            Some(address) => Err(Refusal::AddressNotPrivate(address)),
+            None => Err(Refusal::NoUsableInterface),
         },
     }
 }
@@ -189,24 +247,24 @@ fn bootstrap_first_owner_with(
     confirmation: &str,
     list_accounts: impl FnOnce(&Path) -> Result<Vec<AccountSummary>, String>,
     add_account: impl FnOnce(&Path, &str, &str, &str) -> Result<(), String>,
-) -> Result<(), String> {
+) -> Result<(), Refusal> {
     let username = username.trim();
     if username.is_empty() {
-        return Err("Username cannot be empty.".to_string());
+        return Err(Refusal::UsernameEmpty);
     }
     if username.chars().count() > 128 {
-        return Err("Username cannot exceed 128 characters.".to_string());
+        return Err(Refusal::UsernameTooLong);
     }
     if password.len() < 8 {
-        return Err("Password must be at least 8 characters.".to_string());
+        return Err(Refusal::PasswordTooShort);
     }
     if password != confirmation {
-        return Err("Password and confirmation must match.".to_string());
+        return Err(Refusal::PasswordMismatch);
     }
     if !list_accounts(db_path)?.is_empty() {
-        return Err("Workspace accounts already exist.".to_string());
+        return Err(Refusal::AccountsAlreadyExist);
     }
-    add_account(db_path, username, password, "owner")
+    Ok(add_account(db_path, username, password, "owner")?)
 }
 
 fn bootstrap_first_owner(
@@ -214,13 +272,12 @@ fn bootstrap_first_owner(
     username: &str,
     password: &str,
     confirmation: &str,
-) -> Result<(), String> {
+) -> Result<(), Refusal> {
     if let Some(parent) = db_path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
     {
-        fs::create_dir_all(parent)
-            .map_err(|error| format!("Cannot create the database folder: {error}"))?;
+        fs::create_dir_all(parent).map_err(|error| Refusal::DatabaseFolder(error.to_string()))?;
     }
     bootstrap_first_owner_with(
         db_path,
@@ -237,15 +294,15 @@ fn validate_start_requirements(
     lan_confirmed: bool,
     account_ready: bool,
     lan_address: Option<Ipv4Addr>,
-) -> Result<(), String> {
+) -> Result<(), Refusal> {
     if mode == WorkspaceMode::Personal {
         return Ok(());
     }
     if !account_ready {
-        return Err("Create the first owner account before starting LAN mode.".to_string());
+        return Err(Refusal::OwnerAccountRequired);
     }
     if !lan_confirmed {
-        return Err("Please confirm that this is a trusted LAN or VPN.".to_string());
+        return Err(Refusal::LanNotConfirmed);
     }
     selected_bind_host(mode, lan_address).map(|_| ())
 }
@@ -478,16 +535,16 @@ impl LauncherModel {
     fn begin_start(&mut self) -> u64 {
         self.generation = self.generation.wrapping_add(1).max(1);
         self.status = LaunchStatus::Starting;
-        self.stage = "Preparing the local workspace".to_string();
+        self.stage = tr(prompt_language()).launcher_stage_preparing.to_string();
         self.local_url = None;
         self.lan_url = None;
         self.browser_opened = false;
         self.generation
     }
 
-    fn set_mode(&mut self, mode: WorkspaceMode) -> Result<(), String> {
+    fn set_mode(&mut self, mode: WorkspaceMode) -> Result<(), Refusal> {
         if matches!(self.status, LaunchStatus::Starting | LaunchStatus::Ready) {
-            return Err("Stop the workspace before changing its mode.".to_string());
+            return Err(Refusal::StopBeforeChanging);
         }
         self.mode = mode;
         Ok(())
@@ -511,7 +568,7 @@ impl LauncherModel {
     fn stop(&mut self) -> u64 {
         self.generation = self.generation.wrapping_add(1).max(1);
         self.status = LaunchStatus::Stopped;
-        self.stage = "Local server stopped".to_string();
+        self.stage = tr(prompt_language()).launcher_stage_stopped.to_string();
         self.local_url = None;
         self.lan_url = None;
         self.generation
@@ -550,7 +607,7 @@ impl LauncherModel {
             LaunchEvent::Output(_) => None,
             LaunchEvent::Ready => {
                 self.status = LaunchStatus::Ready;
-                self.stage = "Workspace ready".to_string();
+                self.stage = tr(prompt_language()).launcher_stage_ready.to_string();
                 if self.open_on_ready && !self.browser_opened {
                     let url = self.local_url.clone()?;
                     self.browser_opened = true;
@@ -617,15 +674,15 @@ impl LauncherController {
         &mut self,
         mode: WorkspaceMode,
         preferred_port: u16,
-    ) -> Result<(), String> {
+    ) -> Result<(), Refusal> {
         if preferred_port == 0 {
-            return Err("Preferred port must be between 1 and 65535.".to_string());
+            return Err(Refusal::PortOutOfRange);
         }
         if matches!(
             self.model.status,
             LaunchStatus::Starting | LaunchStatus::Ready
         ) {
-            return Err("Stop the workspace before changing launcher settings.".to_string());
+            return Err(Refusal::StopBeforeChanging);
         }
         let preferences = LauncherPreferences {
             version: LAUNCHER_PREFERENCES_VERSION,
@@ -699,7 +756,7 @@ impl LauncherController {
                 .process
                 .is_running_for_generation(self.model.generation)
         {
-            self.set_error("The local server stopped unexpectedly. Restart it to continue.");
+            self.set_error(tr(prompt_language()).launcher_msg_server_stopped);
         }
     }
 
@@ -708,7 +765,9 @@ impl LauncherController {
             LaunchAction::OpenBrowser(url) => {
                 if let Err(error) = open_url(&url) {
                     self.push_log(format!("Could not open the default browser: {error}"));
-                    self.model.stage = "Workspace ready; open the URL below manually".to_string();
+                    self.model.stage = tr(prompt_language())
+                        .launcher_stage_ready_manual
+                        .to_string();
                 }
             }
         }
@@ -826,16 +885,16 @@ impl LauncherApp {
                             .first()
                             .map(|interface| interface.address)
                     });
-                self.lan_interface_error = self.lan_interfaces.is_empty().then(|| {
-                    "No private LAN or VPN IPv4 interface is available. Connect to a trusted network, then refresh interfaces."
-                        .to_string()
-                });
+                self.lan_interface_error = self
+                    .lan_interfaces
+                    .is_empty()
+                    .then(|| Refusal::NoUsableInterface.shown());
             }
             Err(error) => {
                 self.lan_interfaces.clear();
                 self.selected_lan_address = None;
                 self.lan_interface_error =
-                    Some(format!("Network interfaces could not be read: {error}"));
+                    Some(Refusal::InterfacesUnreadable(error.to_string()).shown());
             }
         }
         self.controller
@@ -850,7 +909,7 @@ impl LauncherApp {
             && let Err(error) = fs::create_dir_all(parent)
         {
             self.lan_account_state =
-                LanAccountState::Error(format!("Cannot create the database folder: {error}"));
+                LanAccountState::Error(Refusal::DatabaseFolder(error.to_string()).shown());
             return;
         }
         self.lan_account_state = match base_search::server::list_accounts(db_path) {
@@ -860,7 +919,7 @@ impl LauncherApp {
         };
     }
 
-    fn create_first_owner(&mut self) -> Result<(), String> {
+    fn create_first_owner(&mut self) -> Result<(), Refusal> {
         let result = bootstrap_first_owner(
             &self.controller.model.db_path,
             &self.owner_username,
@@ -873,18 +932,16 @@ impl LauncherApp {
                 self.owner_confirmation.clear();
                 self.refresh_lan_accounts();
                 if self.lan_account_state != LanAccountState::Ready {
-                    let error =
-                        "The owner account was created but could not be reloaded.".to_string();
-                    self.owner_feedback = Some(error.clone());
-                    return Err(error);
+                    self.owner_feedback = Some(Refusal::OwnerNotReloaded.shown());
+                    return Err(Refusal::OwnerNotReloaded);
                 }
                 self.owner_feedback =
-                    Some("Owner account created. LAN sign-in is ready.".to_string());
+                    Some(tr(prompt_language()).launcher_msg_owner_created.to_string());
                 Ok(())
             }
-            Err(error) => {
-                self.owner_feedback = Some(error.clone());
-                Err(error)
+            Err(refusal) => {
+                self.owner_feedback = Some(refusal.shown());
+                Err(refusal)
             }
         }
     }
@@ -919,7 +976,7 @@ impl LauncherApp {
                     }
                 }
             }
-            Err(error) => self.controller.push_log(error),
+            Err(refusal) => self.controller.push_log(refusal.shown()),
         }
     }
 
@@ -937,7 +994,7 @@ impl LauncherApp {
                     .set_lan_bind_address(self.selected_lan_address);
                 self.controller.start();
             }
-            Err(error) => self.owner_feedback = Some(error),
+            Err(refusal) => self.owner_feedback = Some(refusal.shown()),
         }
     }
 
@@ -964,11 +1021,14 @@ impl LauncherApp {
     }
 
     fn render_content(&mut self, ui: &mut egui::Ui) {
+        // Read once at the top: this window opens before any database does, so
+        // its language comes from the same file the pre-database prompts use.
+        let t = tr(prompt_language());
         ui.heading("Base Search");
-        ui.label("Choose how this workspace should run, then start it.");
+        ui.label(t.launcher_intro);
         ui.add_space(16.0);
 
-        ui.label(egui::RichText::new("Workspace mode").strong());
+        ui.label(egui::RichText::new(t.launcher_mode_title).strong());
         let can_configure = self.can_configure();
         let current_mode = self.controller.model.mode;
         let mut selected_mode = current_mode;
@@ -977,12 +1037,12 @@ impl LauncherApp {
                 ui.selectable_value(
                     &mut selected_mode,
                     WorkspaceMode::Personal,
-                    "Personal workspace",
+                    t.launcher_mode_personal,
                 );
                 ui.selectable_value(
                     &mut selected_mode,
                     WorkspaceMode::TrustedLan,
-                    "Trusted LAN workspace",
+                    t.launcher_mode_lan,
                 );
             });
         });
@@ -992,7 +1052,7 @@ impl LauncherApp {
 
         let mut preferred_port = self.controller.preferred_port;
         ui.horizontal(|ui| {
-            ui.label("Preferred port");
+            ui.label(t.launcher_port);
             let response = ui.add_enabled(
                 can_configure,
                 egui::DragValue::new(&mut preferred_port)
@@ -1006,25 +1066,23 @@ impl LauncherApp {
 
         match self.controller.model.mode {
             WorkspaceMode::Personal => {
-                ui.label("For one person on this computer. Sign-in is not required.");
+                ui.label(t.launcher_personal_note);
             }
             WorkspaceMode::TrustedLan => {
                 ui.add_space(8.0);
                 ui.colored_label(
                     egui::Color32::from_rgb(232, 166, 82),
-                    egui::RichText::new("Trusted network only").strong(),
+                    egui::RichText::new(t.launcher_lan_warning_title).strong(),
                 );
-                ui.label(
-                            "LAN mode shares this workspace over HTTP. Use it only on a trusted LAN or VPN; never expose the port directly to the public internet.",
-                        );
+                ui.label(t.launcher_lan_warning);
                 ui.add_space(8.0);
 
-                ui.label(egui::RichText::new("Network interface").strong());
+                ui.label(egui::RichText::new(t.launcher_interface_title).strong());
                 if self.lan_interfaces.is_empty() {
                     if let Some(error) = &self.lan_interface_error {
                         ui.colored_label(egui::Color32::from_rgb(225, 90, 80), error);
                     }
-                    if ui.button("Refresh interfaces").clicked() {
+                    if ui.button(t.launcher_refresh_interfaces).clicked() {
                         self.refresh_lan_interfaces();
                     }
                 } else {
@@ -1034,7 +1092,7 @@ impl LauncherApp {
                         .iter()
                         .find(|interface| Some(interface.address) == self.selected_lan_address)
                         .map(|interface| format!("{} - {}", interface.name, interface.address))
-                        .unwrap_or_else(|| "Select an interface".to_string());
+                        .unwrap_or_else(|| t.launcher_select_interface.to_string());
                     ui.horizontal(|ui| {
                         egui::ComboBox::from_id_salt("lan-interface")
                             .selected_text(selected_text)
@@ -1047,7 +1105,7 @@ impl LauncherApp {
                                     );
                                 }
                             });
-                        if ui.button("Refresh").clicked() {
+                        if ui.button(t.launcher_refresh).clicked() {
                             self.refresh_lan_interfaces();
                         }
                     });
@@ -1061,22 +1119,22 @@ impl LauncherApp {
 
                 match self.lan_account_state.clone() {
                     LanAccountState::NotChecked => {
-                        if ui.button("Check accounts").clicked() {
+                        if ui.button(t.launcher_check_accounts).clicked() {
                             self.refresh_lan_accounts();
                         }
                     }
                     LanAccountState::NeedsOwner => {
-                        ui.label(egui::RichText::new("Create the first owner").strong());
-                        ui.label("This account protects the workspace when other devices connect.");
+                        ui.label(egui::RichText::new(t.launcher_create_owner_title).strong());
+                        ui.label(t.launcher_create_owner_note);
                         ui.horizontal(|ui| {
-                            ui.label("Username");
+                            ui.label(t.launcher_username);
                             ui.add(
                                 egui::TextEdit::singleline(&mut self.owner_username)
                                     .desired_width(220.0),
                             );
                         });
                         ui.horizontal(|ui| {
-                            ui.label("Password");
+                            ui.label(t.launcher_password);
                             ui.add(
                                 egui::TextEdit::singleline(&mut self.owner_password)
                                     .password(true)
@@ -1084,23 +1142,23 @@ impl LauncherApp {
                             );
                         });
                         ui.horizontal(|ui| {
-                            ui.label("Confirm");
+                            ui.label(t.launcher_confirm);
                             ui.add(
                                 egui::TextEdit::singleline(&mut self.owner_confirmation)
                                     .password(true)
                                     .desired_width(220.0),
                             );
                         });
-                        if ui.button("Create owner").clicked() {
+                        if ui.button(t.launcher_create_owner).clicked() {
                             let _ = self.create_first_owner();
                         }
                     }
                     LanAccountState::Ready => {
-                        ui.label("Account protection is ready. LAN visitors must sign in.");
+                        ui.label(t.launcher_accounts_ready);
                     }
                     LanAccountState::Error(error) => {
                         ui.colored_label(egui::Color32::from_rgb(225, 90, 80), error);
-                        if ui.button("Check again").clicked() {
+                        if ui.button(t.launcher_check_again).clicked() {
                             self.refresh_lan_accounts();
                         }
                     }
@@ -1114,10 +1172,7 @@ impl LauncherApp {
                     };
                     ui.colored_label(color, feedback);
                 }
-                ui.checkbox(
-                    &mut self.lan_confirmed,
-                    "I confirm this is a trusted LAN or VPN.",
-                );
+                ui.checkbox(&mut self.lan_confirmed, t.launcher_lan_confirm);
             }
         }
 
@@ -1125,7 +1180,6 @@ impl LauncherApp {
         ui.separator();
         ui.add_space(12.0);
 
-        let t = tr(prompt_language());
         ui.horizontal(|ui| {
             if self.controller.model.status == LaunchStatus::Starting {
                 ui.spinner();
@@ -1199,7 +1253,7 @@ impl LauncherApp {
         }
 
         ui.add_space(14.0);
-        ui.label(egui::RichText::new("Database").strong());
+        ui.label(egui::RichText::new(t.launcher_database_title).strong());
         ui.add(
             egui::Label::new(
                 egui::RichText::new(self.controller.model.db_path.display().to_string())
@@ -1210,51 +1264,54 @@ impl LauncherApp {
         );
         ui.add_space(8.0);
         let ready = self.controller.model.status == LaunchStatus::Ready;
-        ui.label(egui::RichText::new("Local URL").strong());
+        ui.label(egui::RichText::new(t.launcher_local_url).strong());
         if let Some(url) = &self.controller.model.local_url {
             // The URL becomes a working link only once the server answered a
             // health check; before that it is informational text.
             if ready {
                 ui.hyperlink_to(url, url);
             } else {
-                ui.label(egui::RichText::new(format!("{url} (starting…)")).monospace());
+                ui.label(
+                    egui::RichText::new(format!("{url} ({})", t.launcher_url_starting)).monospace(),
+                );
             }
         } else {
-            ui.label("Available after the workspace starts");
+            ui.label(t.launcher_url_pending);
         }
         if self.controller.model.mode == WorkspaceMode::TrustedLan {
             ui.add_space(8.0);
-            ui.label(egui::RichText::new("LAN URL").strong());
+            ui.label(egui::RichText::new(t.launcher_lan_url).strong());
             if let Some(url) = &self.controller.model.lan_url {
                 if ready {
                     ui.hyperlink_to(url, url);
                 } else {
-                    ui.label(egui::RichText::new(format!("{url} (starting…)")).monospace());
+                    ui.label(
+                        egui::RichText::new(format!("{url} ({})", t.launcher_url_starting))
+                            .monospace(),
+                    );
                 }
             } else if self.controller.model.status == LaunchStatus::Ready {
-                ui.label(
-                            "A private LAN address could not be detected. Check this computer's network address.",
-                        );
+                ui.label(t.launcher_no_lan_address);
             } else {
-                ui.label("Available after the workspace starts");
+                ui.label(t.launcher_url_pending);
             }
         }
 
         ui.add_space(18.0);
         ui.horizontal(|ui| match self.controller.model.status.clone() {
             LaunchStatus::Starting => {
-                if ui.button("Stop").clicked() {
+                if ui.button(t.launcher_stop).clicked() {
                     self.stop_workspace();
                 }
             }
             LaunchStatus::Ready => {
-                if ui.button("Open workspace").clicked() {
+                if ui.button(t.launcher_open_workspace).clicked() {
                     self.controller.open_workspace();
                 }
-                if ui.button("Restart").clicked() {
+                if ui.button(t.launcher_restart).clicked() {
                     self.controller.restart();
                 }
-                if ui.button("Stop").clicked() {
+                if ui.button(t.launcher_stop).clicked() {
                     self.stop_workspace();
                 }
             }
@@ -1267,7 +1324,7 @@ impl LauncherApp {
                 )
                 .is_ok();
                 if ui
-                    .add_enabled(can_start, egui::Button::new("Start again"))
+                    .add_enabled(can_start, egui::Button::new(t.launcher_start_again))
                     .clicked()
                 {
                     self.start_selected_workspace();
@@ -1282,7 +1339,7 @@ impl LauncherApp {
                 )
                 .is_ok();
                 if ui
-                    .add_enabled(can_start, egui::Button::new("Start workspace"))
+                    .add_enabled(can_start, egui::Button::new(t.launcher_start))
                     .clicked()
                 {
                     self.start_selected_workspace();
@@ -1291,7 +1348,7 @@ impl LauncherApp {
         });
 
         ui.add_space(14.0);
-        egui::CollapsingHeader::new("Startup details")
+        egui::CollapsingHeader::new(t.launcher_details)
             .default_open(matches!(
                 &self.controller.model.status,
                 LaunchStatus::Starting | LaunchStatus::Error(_)
@@ -1302,7 +1359,7 @@ impl LauncherApp {
                     .stick_to_bottom(true)
                     .show(ui, |ui| {
                         if self.controller.logs.is_empty() {
-                            ui.label("Waiting for startup output...");
+                            ui.label(t.launcher_awaiting_output);
                         } else {
                             for line in &self.controller.logs {
                                 ui.monospace(line);
@@ -1312,13 +1369,10 @@ impl LauncherApp {
             });
 
         ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
-            if ui
-                .button("Open legacy desktop workspace (fallback)")
-                .clicked()
-            {
+            if ui.button(t.launcher_legacy_button).clicked() {
                 self.controller.open_legacy();
             }
-            ui.label("The legacy workspace is kept only as an explicit fallback.");
+            ui.label(t.launcher_legacy_note);
         });
     }
 }
@@ -1387,8 +1441,8 @@ fn start_server_worker(request: ServerWorkerRequest) {
     }
     let bind_host = match selected_bind_host(mode, lan_bind_address) {
         Ok(address) => address,
-        Err(error) => {
-            send_event(&events, generation, LaunchEvent::Failed(error));
+        Err(refusal) => {
+            send_event(&events, generation, LaunchEvent::Failed(refusal.shown()));
             return;
         }
     };
@@ -1845,7 +1899,7 @@ mod tests {
             },
         )
         .unwrap_err();
-        assert!(mismatch.contains("match"));
+        assert_eq!(mismatch, Refusal::PasswordMismatch);
 
         let existing = bootstrap_first_owner_with(
             Path::new("data/base_search.db"),
@@ -1865,7 +1919,7 @@ mod tests {
             },
         )
         .unwrap_err();
-        assert!(existing.contains("already"));
+        assert_eq!(existing, Refusal::AccountsAlreadyExist);
         assert_eq!(*add_calls.borrow(), 0);
     }
 
@@ -1929,7 +1983,7 @@ mod tests {
     #[test]
     fn selected_lan_bind_rejects_missing_or_public_interfaces_and_accepts_cgnat() {
         let missing = selected_bind_host(WorkspaceMode::TrustedLan, None).unwrap_err();
-        assert!(missing.contains("No usable private LAN or VPN"));
+        assert_eq!(missing, Refusal::NoUsableInterface);
 
         assert!(
             selected_bind_host(WorkspaceMode::TrustedLan, Some(Ipv4Addr::new(8, 8, 8, 8))).is_err()
@@ -2276,6 +2330,41 @@ mod tests {
         );
     }
 
+    /// The point of keeping a refusal as a value: the window renders it in the
+    /// reader's language. A test that matched the English wording would have
+    /// gone on passing after the wording stopped being English.
+    #[test]
+    fn a_refusal_is_worded_in_the_reader_language() {
+        use base_search::i18n::Lang;
+
+        let refusal = Refusal::PasswordMismatch;
+        assert_eq!(
+            refusal.message(tr(Lang::En)),
+            "Password and confirmation must match."
+        );
+        assert_eq!(
+            refusal.message(tr(Lang::Ua)),
+            "Пароль і підтвердження мають збігатися."
+        );
+
+        // The address goes wherever the sentence puts it, in every language.
+        let address = Refusal::AddressNotPrivate(Ipv4Addr::new(8, 8, 8, 8));
+        for lang in Lang::ALL {
+            let text = address.message(tr(lang));
+            assert!(text.contains("8.8.8.8"), "{lang:?}: {text}");
+            assert!(
+                !text.contains("{}"),
+                "{lang:?} left the placeholder unfilled: {text}"
+            );
+        }
+
+        // Something the operating system already worded is passed through.
+        assert_eq!(
+            Refusal::Reported("disk is full".to_string()).message(tr(Lang::De)),
+            "disk is full"
+        );
+    }
+
     #[test]
     fn trusted_lan_requires_an_account_and_explicit_confirmation() {
         assert!(validate_start_requirements(WorkspaceMode::Personal, false, false, None).is_ok());
@@ -2284,16 +2373,16 @@ mod tests {
         let no_account =
             validate_start_requirements(WorkspaceMode::TrustedLan, true, false, address)
                 .unwrap_err();
-        assert!(no_account.contains("owner"));
+        assert_eq!(no_account, Refusal::OwnerAccountRequired);
 
         let no_confirmation =
             validate_start_requirements(WorkspaceMode::TrustedLan, false, true, address)
                 .unwrap_err();
-        assert!(no_confirmation.contains("confirm"));
+        assert_eq!(no_confirmation, Refusal::LanNotConfirmed);
 
         let no_interface =
             validate_start_requirements(WorkspaceMode::TrustedLan, true, true, None).unwrap_err();
-        assert!(no_interface.contains("No usable private LAN or VPN"));
+        assert_eq!(no_interface, Refusal::NoUsableInterface);
 
         assert!(
             validate_start_requirements(WorkspaceMode::TrustedLan, true, true, address).is_ok()

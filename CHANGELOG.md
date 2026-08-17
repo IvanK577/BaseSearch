@@ -89,6 +89,15 @@ something in it.
 - The startup screen and both workspace prompts are translated into all eleven
   languages. They were English only, and they are where you decide what happens
   to your data.
+- **The launcher window is translated too.** It is the first thing that opens
+  and, in the default browser mode, the only window with any settings in it —
+  and all of it was English: the two workspace modes, the port, the trusted-
+  network warning, the network interface picker, creating the first owner
+  account, the addresses, every button, and every refusal it can give you.
+  Its refusals are now values rather than sentences, so they are worded in the
+  reader's language and the tests name the case instead of matching English
+  prose — a test that checks the wording keeps passing after the wording stops
+  being English.
 - **The repository no longer carries a prebuilt Windows folder.** The copy in
   `dist\` had drifted to an older build while the documented quick start still
   pointed at it, and mixing the two rebuilt the whole search index on every
