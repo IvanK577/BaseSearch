@@ -12,7 +12,7 @@ problem that may already be fixed.
 
 | Version | Security support |
 | --- | --- |
-| 2.0.x | Supported |
+| 2.2.x | Supported |
 | Older 2.x release | Update to the latest 2.x release |
 | 1.x and earlier | Unsupported |
 | Development snapshots and modified builds | No guaranteed support |

@@ -67,7 +67,7 @@ esac
 info "Operating system: $PLATFORM"
 if [ "$PLATFORM" != "macOS" ] && [ "$PLATFORM" != "Linux" ]; then
     fail "This guided script supports macOS and Linux."
-    info "On Windows, just run dist\\BaseSearch\\BaseSearch.exe instead."
+    info "On Windows, use a release package or scripts\\package-release.ps1."
     exit 1
 fi
 

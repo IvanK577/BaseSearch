@@ -2,7 +2,7 @@
 
 All notable changes to Base Search are documented in this file.
 
-## 2.2.0 - 2026-08-16
+## 2.2.0 - 2026-08-17
 
 The release that finally makes a second import fast. 2.1.0 claimed to fix the
 slow-import report and did not: it fixed reading the file and the first bulk
@@ -104,6 +104,14 @@ something in it.
   decide where your data lives, was in English whatever the system was set to.
   Windows is now asked directly for the language it is set to. Your own choice,
   once made, still outranks it.
+- **The package no longer describes an engine it does not contain.** Every
+  release README said the build "also includes DuckDB OLAP", while the manifest
+  in the same folder correctly listed only the browser workspace. The feature
+  set is now written down once and both files are generated from it, so the two
+  cannot drift apart again. The security policy's supported-version table, the
+  Linux and macOS packaging messages, and the Windows hint in `start.sh` — which
+  pointed at the prebuilt folder this release removed — were stale in the same
+  way and now say what is true.
 - **The repository no longer carries a prebuilt Windows folder.** The copy in
   `dist\` had drifted to an older build while the documented quick start still
   pointed at it, and mixing the two rebuilt the whole search index on every

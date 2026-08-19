@@ -66,7 +66,7 @@ echo '==> Building React assets for embedding'
 (cd web-ui && npm run build)
 test -f web-ui/dist/index.html
 
-echo '==> Building locked production binaries with browser and DuckDB OLAP'
+echo '==> Building locked production binaries with the browser workspace'
 cargo build --locked --release --no-default-features --features release-package \
   --bin BaseSearch --bin base-search-cli
 

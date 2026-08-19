@@ -74,10 +74,11 @@ not configure that security layer.
 
 Analytics engines
 -----------------
-SQLite and FTS5 are the source of truth and text-search engine. This production
-package also includes DuckDB OLAP. Its projection is built only when requested
-and is used only while it is current and consistent with SQLite; otherwise
-analytics fall back safely to SQLite. DuckDB is not required for normal use.
+SQLite and FTS5 are the source of truth, the text-search engine, and the engine
+every number in this package is computed by. There is no second analytics
+engine: an optional DuckDB projection exists in the source tree but is not
+built into a release, because it answered only queries carrying no free text
+and went stale the moment anything was imported.
 
 Command line (advanced)
 -----------------------
@@ -110,7 +111,7 @@ Release provenance
 ------------------
 Version: {{VERSION}}
 Source revision: {{GIT_SHA}}
-Features: browser, duckdb-olap
+Features: {{FEATURES}}
 Source date epoch: {{SOURCE_DATE_EPOCH}}
 
 {{PLATFORM_NOTE}}

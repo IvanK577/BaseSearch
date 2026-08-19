@@ -228,11 +228,18 @@ function normalizeTimes(root, epoch) {
   utimesSync(root, time, time);
 }
 
+// The one place the packaged feature set is written down. The manifest and
+// the README are both generated from it, because when they were typed
+// separately they disagreed: the README advertised a DuckDB engine that the
+// release profile has never contained.
+const PACKAGE_FEATURES = ["browser"];
+
 function renderReadme(args) {
   const platform = required(args, "platform");
   const signing = signingDeclaration(args, platform);
   const replacements = {
     "{{ARCH}}": required(args, "arch"),
+    "{{FEATURES}}": PACKAGE_FEATURES.join(", "),
     "{{GIT_SHA}}": required(args, "git-sha"),
     "{{PLATFORM}}": platform,
     "{{SOURCE_DATE_EPOCH}}": required(args, "epoch"),
@@ -297,7 +304,7 @@ function writeManifest(args) {
     arch: required(args, "arch"),
     git_sha: required(args, "git-sha"),
     source_date_epoch: epoch,
-    features: ["browser"],
+    features: PACKAGE_FEATURES,
     launcher_default: "browser",
     legacy_desktop_fallback: true,
     data_policy: {

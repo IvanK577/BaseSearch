@@ -22,8 +22,9 @@ duckdb-olap = ["dep:duckdb"]
 # in practice it stopped answering after the first import. Shipping a second
 # engine that has never run in front of users, and that has to agree with the
 # SQLite path on every number, is risk without a benefit anyone asked for. The
-# feature still builds and its parity tests still run; enable it again once the
-# projection is rebuilt automatically after an import.
+# feature and its parity tests still build, but CI does not enable it, so
+# nothing runs them; treat it as unverified until it is back in the workflow.
+# Enable it again once the projection is rebuilt automatically after an import.
 release-package = ["browser", "eframe/wgpu"]
 # Local browser workspace: an Axum server on 127.0.0.1 that serves the
 # embedded React UI and the /api endpoints on top of the same core.
