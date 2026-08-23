@@ -9,8 +9,14 @@ workspace. It imports tables, preserves their source columns, searches across
 all values, builds analytics, and exports filtered results. Your data stays on
 the computer running Base Search unless you deliberately share it.
 
+**Choose your system:** [Windows](#windows-download-and-run) |
+[macOS](#macos-first-download-and-run) | [Linux](#linux-first-download-and-run)
+
 The Windows download is ready to run. You do **not** need Rust, Node.js, npm,
 an installer, or a GitHub Release to use it.
+
+For macOS and Linux, use the dedicated first-run instructions below. Those
+platforms currently build Base Search locally from the source download.
 
 ## Windows: download and run
 
@@ -235,20 +241,213 @@ base-search-cli.exe browser <db> [--host 127.0.0.1] [--port 7833] [--no-open]
 base-search-cli.exe version
 ```
 
-## macOS and Linux
+## macOS: first download and run
 
-The repository ZIP currently includes a ready-to-run build for Windows. macOS
-and Linux users build from source with the guided launcher:
+The normal GitHub source ZIP does **not** currently contain a prebuilt macOS
+`.app`. The steps below compile Base Search on your Mac and then launch it. The
+first run needs an internet connection and can take several minutes; later
+runs reuse the downloaded Rust dependencies and compiled files.
+
+### 1. Install the one manual prerequisite
+
+Install the current Node.js LTS release from the
+[official download page](https://nodejs.org/en/download). The installer includes
+npm. Close and reopen Terminal after installation, then confirm both commands
+work:
+
+```bash
+node --version
+npm --version
+```
+
+Base Search is tested with Node.js `22.22.0`; a compatible newer LTS release is
+also suitable. The guided script checks Xcode Command Line Tools and Rust
+separately. If Rust is missing, the script installs it from `rustup.rs`.
+
+### 2. Download the source
+
+Use either method below.
+
+With Git:
 
 ```bash
 git clone https://github.com/IvanK577/BaseSearch.git
 cd BaseSearch
+```
+
+Without Git:
+
+1. On the repository page, click **Code**, then **Download ZIP**.
+2. Extract the complete ZIP.
+3. Open Terminal and enter `cd `, including the trailing space.
+4. Drag the extracted `BaseSearch-master` folder into Terminal and press
+   **Return**.
+
+### 3. Start Base Search
+
+From the repository folder, run:
+
+```bash
+chmod +x start.sh run.sh
 ./start.sh
 ```
 
-`start.sh` checks prerequisites, installs locked frontend dependencies, builds
-the browser assets and Rust application, and launches Base Search. `./run.sh`
-is the quieter equivalent after prerequisites are installed.
+The `chmod` command is harmless when the files are already executable. The
+guided script then:
+
+1. detects macOS;
+2. checks Xcode Command Line Tools;
+3. installs Rust when it is missing;
+4. installs the exact frontend dependencies from `package-lock.json`;
+5. builds the browser interface and Rust application;
+6. opens the Base Search launcher.
+
+If macOS opens the Xcode Command Line Tools installer, finish that installation
+and run `./start.sh` again. When the Base Search launcher appears, leave
+**Personal workspace** selected, click **Start workspace**, and wait for
+**Ready**. The workspace then opens in the default browser. Keep Terminal open
+while Base Search is running.
+
+### Later macOS launches
+
+From the same repository folder, use either:
+
+```bash
+./start.sh
+```
+
+to recheck and rebuild what is needed, or use the already-built executable for
+the fastest start:
+
+```bash
+./target/release/BaseSearch
+```
+
+Run `./start.sh` again after downloading application updates. To use the CLI:
+
+```bash
+./run.sh cli version
+```
+
+### macOS troubleshooting
+
+- `zsh: permission denied: ./start.sh`: run
+  `chmod +x start.sh run.sh`, then retry.
+- `node: command not found` or `npm: command not found`: install Node.js LTS,
+  reopen Terminal, and verify `node --version` and `npm --version`.
+- Xcode tools are still missing: run `xcode-select --install`, complete the
+  Apple installer, then rerun `./start.sh`.
+- A build error stops the script instead of launching an incomplete program.
+  Read the last error in Terminal, correct the missing prerequisite, and rerun
+  the same command.
+
+## Linux: first download and run
+
+The normal GitHub source ZIP does **not** currently contain a universal Linux
+binary. The guided script builds Base Search for the current computer. Use a
+graphical Linux desktop with X11 or Wayland, an internet connection for the
+first build, and several gigabytes of free space for dependencies and build
+output.
+
+### 1. Install Node.js, npm, Git, and curl
+
+Install Node.js `22` or a newer LTS release, npm, Git, and curl using your
+distribution or the
+[official Node.js download page](https://nodejs.org/en/download). For
+distributions whose repositories provide a suitable Node.js version, the basic
+commands are:
+
+Ubuntu or Debian:
+
+```bash
+sudo apt update
+sudo apt install -y nodejs npm git curl
+```
+
+Fedora:
+
+```bash
+sudo dnf install -y nodejs npm git curl
+```
+
+Arch Linux:
+
+```bash
+sudo pacman -S --needed nodejs npm git curl
+```
+
+Confirm the tools are available:
+
+```bash
+node --version
+npm --version
+git --version
+curl --version
+```
+
+If the distribution supplies an older Node.js release, install the current LTS
+from nodejs.org before continuing.
+
+### 2. Download the source
+
+With Git:
+
+```bash
+git clone https://github.com/IvanK577/BaseSearch.git
+cd BaseSearch
+```
+
+Alternatively, click **Code**, then **Download ZIP**, extract it, open a
+terminal in the extracted folder, and enter:
+
+```bash
+cd ~/Downloads/BaseSearch-master
+```
+
+Adjust that path if the folder was extracted somewhere else.
+
+### 3. Start Base Search
+
+```bash
+chmod +x start.sh run.sh
+./start.sh
+```
+
+When necessary, the script asks for the `sudo` password and installs the Linux
+compiler and GUI development libraries through `apt`, `dnf`, or `pacman`. It
+then installs Rust when missing, builds the frontend and Rust application, and
+opens the Base Search launcher. Leave **Personal workspace** selected, click
+**Start workspace**, and wait for **Ready**. The workspace then opens in the
+default browser. Keep the terminal open while the program runs.
+
+### Later Linux launches
+
+Use `./start.sh` to check and rebuild the application, or start the existing
+binary immediately:
+
+```bash
+./target/release/BaseSearch
+```
+
+Run `./start.sh` after pulling or downloading a newer Base Search version. CLI
+example:
+
+```bash
+./run.sh cli version
+```
+
+### Linux troubleshooting
+
+- `Permission denied`: run `chmod +x start.sh run.sh` and retry.
+- `node` or `npm` is missing: install a current Node.js LTS release and npm.
+- The script cannot detect a package manager: install a C compiler,
+  `pkg-config`, `libxkbcommon`, Wayland, and XCB development packages with the
+  distribution's own package manager, then rerun `./start.sh`.
+- `cannot open display`, Wayland, or X11 errors: start Base Search inside a
+  logged-in graphical desktop session. The desktop launcher is not intended to
+  run on a headless SSH server.
+- A failed build is not launched. Use the final Terminal error to correct the
+  missing library or network problem, then rerun `./start.sh`.
 
 ## Build from source
 
