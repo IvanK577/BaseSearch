@@ -164,10 +164,10 @@ function assertSafePackage(root, platform, manifestRequired, signing) {
     fail(`Package root is missing: ${root}`);
   }
   const dataDir = path.join(root, "data");
-  if (!existsSync(dataDir) || !statSync(dataDir).isDirectory()) {
-    fail("Package must contain an empty data directory");
+  if (existsSync(dataDir)) {
+    if (!statSync(dataDir).isDirectory()) fail("Package data path is not a directory");
+    if (readdirSync(dataDir).length !== 0) fail("Package data directory is not empty");
   }
-  if (readdirSync(dataDir).length !== 0) fail("Package data directory is not empty");
 
   const entries = walk(root);
   const files = entries

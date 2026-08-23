@@ -1,0 +1,32 @@
+{
+  "schema": 1,
+  "product": "Base Search",
+  "version": "2.2.0",
+  "platform": "windows",
+  "arch": "x86_64",
+  "git_sha": "2afff7ca0252",
+  "source_date_epoch": 1787151218,
+  "features": [
+    "browser"
+  ],
+  "launcher_default": "browser",
+  "legacy_desktop_fallback": true,
+  "data_policy": {
+    "default": "per-user-unversioned",
+    "existing_portable_database": "reuse-in-place",
+    "sibling_portable_database": "reuse-after-explicit-confirmation",
+    "automatic_database_move": false
+  },
+  "signing": {
+    "windows_authenticode": "unsigned",
+    "macos_codesign": "not-applicable",
+    "macos_notarization": "not-applicable"
+  },
+  "files_sha256": {
+    "base-search-cli.exe": "a38c9f78a5d7bcbbde755f4cb94f92a19d3c9b92f22910ef242f121abaf17494",
+    "BaseSearch.exe": "0264304aacef257f9c565b373cbf558a7b71e6d9e44b59e9cd399d3acfde3f9c",
+    "LICENSE": "2f83cc217df94dd2fef5b937de9968ac55b63a370571fe0f2a0912fffcb32f6b",
+    "Open Base Search.cmd": "5dee83a5c91f0d1a7d1ebbb1820bef3921c5ebaa827a3d64761e81115bf75fd9",
+    "README.txt": "1708fb3d328e3ea70d49a9a16d6ac5c6d0c0ff439bb37280f7290549a6a8285a"
+  }
+}

@@ -14,3 +14,11 @@
 *.html text eol=lf
 *.ps1 text eol=crlf
 *.cmd text eol=crlf
+
+# Package hashes are computed before commit. Keep checkout conversion from
+# changing the verified bytes, and make the binary treatment explicit.
+dist/BaseSearch/*.exe binary
+"dist/BaseSearch/Open Base Search.cmd" binary
+dist/BaseSearch/LICENSE text eol=lf
+dist/BaseSearch/README.txt text eol=lf
+dist/BaseSearch/release-manifest.json text eol=lf

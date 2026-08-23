@@ -81,6 +81,15 @@ something in it.
 
 ### Changed
 
+- **The GitHub source ZIP is usable as a Windows download again.** It contains
+  one allowlisted, manifest-verified `dist/BaseSearch` folder built from the
+  current 2.2.0 runtime sources. CI checks the file list, hashes, version,
+  source revision, and a real packaged HTTP startup so an old binary cannot
+  silently remain under a new README. Build caches, databases, old packages,
+  audits, and private datasets remain excluded.
+- The repository start guide is now maintained in English and Ukrainian, with
+  the download, extraction, first import, search, backup, and troubleshooting
+  path stated before developer build instructions.
 - **A first-open upgrade says what it is doing.** Opening a database from an
   older version rebuilds it, which is minutes of work on a large one, and the
   window used to show only a spinner and a rising seconds counter. It now names

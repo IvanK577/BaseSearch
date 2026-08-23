@@ -174,6 +174,25 @@ test("package verification rejects databases and source files", (context) => {
   }
 });
 
+test("portable packages do not require an untrackable empty data directory", (context) => {
+  const root = packageFixture(context, "windows");
+  rmSync(path.join(root, "data"), { recursive: true });
+
+  const write = invokeRelease(
+    "write-manifest",
+    manifestArgs(root, "windows", "unsigned", false),
+  );
+
+  assert.equal(write.status, 0, write.stderr);
+  const verify = invokeRelease("verify", [
+    "--root",
+    root,
+    "--platform",
+    "windows",
+  ]);
+  assert.equal(verify.status, 0, verify.stderr);
+});
+
 function packageFixture(context, platform) {
   const temp = mkdtempSync(path.join(tmpdir(), `base-search-${platform}-`));
   context.after(() => rmSync(temp, { recursive: true, force: true }));

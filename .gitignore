@@ -4,12 +4,19 @@
 
 /output/
 
-# Packaged application builds. Binaries are NOT committed: a checked-in
-# executable goes stale silently, and the one that used to live here stayed at
-# 2.0 while the source moved on, so the documented quick start handed people an
-# old build under a new version number. Releases and scripts/package-release.ps1
-# are the only ways a binary should reach anyone.
-/dist/
+# Keep exactly one verified Windows bundle in the repository so GitHub's
+# generated source ZIP can be launched without a compiler. Everything else
+# under dist remains local build output. CI verifies this allowlist, the
+# manifest hashes, the binary version, and runtime-source freshness.
+/dist/*
+!/dist/BaseSearch/
+/dist/BaseSearch/*
+!/dist/BaseSearch/BaseSearch.exe
+!/dist/BaseSearch/base-search-cli.exe
+!/dist/BaseSearch/Open Base Search.cmd
+!/dist/BaseSearch/README.txt
+!/dist/BaseSearch/LICENSE
+!/dist/BaseSearch/release-manifest.json
 /release_packages/
 
 # Local application data and SQLite sidecar files
@@ -41,6 +48,7 @@
 # Public documentation policy
 *.md
 !README.md
+!README.uk.md
 !LICENSE*.md
 
 # Local planning drafts and internal audits
