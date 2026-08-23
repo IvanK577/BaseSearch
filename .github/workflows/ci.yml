@@ -25,6 +25,10 @@ jobs:
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
+        with:
+          # The checked-in Windows bundle records the source commit it was
+          # built from, so the provenance test needs that commit available.
+          fetch-depth: 0
 
       - name: Install Linux build dependencies
         env:
@@ -143,6 +147,10 @@ jobs:
       BASE_SEARCH_REQUIRE_SIGNING: "0"
     steps:
       - uses: actions/checkout@v4
+        with:
+          # Keep the manifest's source revision available to the provenance
+          # check instead of testing against a one-commit shallow clone.
+          fetch-depth: 0
 
       - name: Install Node.js
         uses: actions/setup-node@v4

@@ -158,6 +158,29 @@ test("notarized macOS packages preserve the stapled ticket through archiving", (
   );
 });
 
+test("CI fetches the source revision needed by bundle provenance checks", () => {
+  const workflow = readFileSync(
+    path.join(repoRoot, ".github", "workflows", "ci.yml"),
+    "utf8",
+  );
+  const jobBoundaries = [
+    ["quality", "bundled-windows"],
+    ["bundled-windows", "packages"],
+  ];
+
+  for (const [job, nextJob] of jobBoundaries) {
+    const section = workflow.match(
+      new RegExp(`^  ${job}:[\\s\\S]*?(?=^  ${nextJob}:)`, "m"),
+    )?.[0];
+    assert.ok(section, `CI must define the ${job} job`);
+    assert.match(
+      section,
+      /uses: actions\/checkout@v4[\s\S]*?fetch-depth: 0/,
+      `${job} must fetch the manifest's recorded source commit`,
+    );
+  }
+});
+
 test("package verification rejects databases and source files", (context) => {
   for (const leaked of ["customer.db", "src/main.rs"]) {
     const root = packageFixture(context, "linux");
