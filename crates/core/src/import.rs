@@ -268,6 +268,8 @@ fn import_one(
                 return Err(changed_headers(&name));
             }
         }
+        op.check()?;
+        writer.finish()?;
     }
     drop(input);
     let final_metadata = file.metadata()?;

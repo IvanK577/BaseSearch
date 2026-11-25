@@ -16,7 +16,7 @@ use crate::model::{Column, IncomingColumn, NewSource, Role, Source, WorkspaceInf
 use crate::{Error, Result};
 
 const APPLICATION_ID: i64 = 0x4253_3130;
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 const WRITER_CACHE_KIB: i64 = 128 * 1024;
 const SCHEMA: &str = r#"
     CREATE TABLE workspace_meta (
@@ -77,9 +77,6 @@ const SCHEMA: &str = r#"
         cells, content='', tokenize='unicode61 remove_diacritics 2',
         prefix='2 3 4'
     );
-    CREATE TRIGGER count_source_rows AFTER INSERT ON records BEGIN
-        UPDATE sources SET rows = rows + 1 WHERE id = new.source_id;
-    END;
 "#;
 
 #[derive(Clone, Debug)]
@@ -104,10 +101,17 @@ impl Workspace {
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         if Self::is_workspace(&tx)? {
             let version: i64 = tx.pragma_query_value(None, "user_version", |row| row.get(0))?;
-            if version != SCHEMA_VERSION {
-                return Err(Error::Message(format!(
-                    "Версия хранилища {version} несовместима с этой версией приложения."
-                )));
+            match version {
+                1 => {
+                    tx.execute_batch("DROP TRIGGER IF EXISTS count_source_rows")?;
+                    tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+                }
+                SCHEMA_VERSION => {}
+                _ => {
+                    return Err(Error::Message(format!(
+                        "Версия хранилища {version} несовместима с этой версией приложения."
+                    )));
+                }
             }
         } else {
             let application_id: i64 =
@@ -331,17 +335,18 @@ pub fn publish(tx: &Transaction<'_>) -> Result<()> {
 pub struct RecordWriter<'conn> {
     insert_record: CachedStatement<'conn>,
     insert_fts: CachedStatement<'conn>,
-    layout: Option<SourceLayout>,
+    update_count: CachedStatement<'conn>,
+    layouts: HashMap<i64, SourceLayout>,
     search_text: String,
     raw: Vec<u8>,
 }
 
 struct SourceLayout {
-    source_id: i64,
     column_ids: Vec<String>,
     roles: HashMap<Role, usize>,
     fixed_currency: Option<String>,
     fixed_unit: Option<&'static str>,
+    pending_rows: i64,
 }
 
 struct RawRow<'a> {
@@ -360,7 +365,7 @@ impl serde::Serialize for RawRow<'_> {
 }
 
 impl SourceLayout {
-    fn new(source_id: i64, source: &NewSource) -> Self {
+    fn new(source: &NewSource) -> Self {
         let mut roles = HashMap::new();
         for (index, column) in source.columns.iter().enumerate() {
             if let Some(role) = column.role {
@@ -368,7 +373,6 @@ impl SourceLayout {
             }
         }
         Self {
-            source_id,
             column_ids: column_ids(&source.columns),
             roles,
             fixed_currency: source
@@ -379,6 +383,7 @@ impl SourceLayout {
                 .fixed_weight_unit
                 .as_deref()
                 .and_then(normalize_weight_unit),
+            pending_rows: 0,
         }
     }
 }
@@ -397,7 +402,8 @@ impl<'conn> RecordWriter<'conn> {
             )?,
             insert_fts: tx
                 .prepare_cached("INSERT INTO record_text(rowid, cells) VALUES (?1, ?2)")?,
-            layout: None,
+            update_count: tx.prepare_cached("UPDATE sources SET rows = rows + ?2 WHERE id = ?1")?,
+            layouts: HashMap::new(),
             search_text: String::new(),
             raw: Vec::new(),
         })
@@ -417,18 +423,14 @@ impl<'conn> RecordWriter<'conn> {
                 values.len()
             )));
         }
-        if self
-            .layout
-            .as_ref()
-            .is_none_or(|layout| layout.source_id != source_id)
-        {
-            self.layout = Some(SourceLayout::new(source_id, source));
-        }
-        let layout = self.layout.as_ref().expect("source layout initialized");
         let row_number = row_number
             .map(i64::try_from)
             .transpose()
             .map_err(|_| Error::Message("Номер строки выходит за допустимый диапазон.".into()))?;
+        let layout = self
+            .layouts
+            .entry(source_id)
+            .or_insert_with(|| SourceLayout::new(source));
         let get = |role| {
             let value = values[*layout.roles.get(&role)?].as_deref()?.trim();
             (!value.is_empty()).then_some(value)
@@ -483,7 +485,19 @@ impl<'conn> RecordWriter<'conn> {
             self.search_text.push('\n');
         }
         self.insert_fts.execute(params![record, self.search_text])?;
+        layout.pending_rows += 1;
         Ok(record)
+    }
+
+    /// Writes each source's accumulated count before the transaction is published.
+    pub fn finish(mut self) -> Result<()> {
+        for (source_id, layout) in self.layouts {
+            if layout.pending_rows > 0 {
+                self.update_count
+                    .execute(params![source_id, layout.pending_rows])?;
+            }
+        }
+        Ok(())
     }
 }
 

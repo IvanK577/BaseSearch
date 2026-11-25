@@ -48,7 +48,7 @@ fn load_source(workspace: &Workspace, source: &NewSource, rows: &[&[&str]]) {
             .insert(id, source, Some(i as u64 + 2), &values)
             .unwrap();
     }
-    drop(writer);
+    writer.finish().unwrap();
     publish(&tx).unwrap();
     tx.commit().unwrap();
 }
@@ -226,6 +226,84 @@ fn search_rejects_stale_revision_after_import() {
         Err(Error::StaleRevision { .. })
     ));
     assert_eq!(workspace.info().unwrap().row_count, 6);
+}
+
+#[test]
+fn reopening_v1_keeps_existing_counts_and_updates_interleaved_source_counts() {
+    let (_directory, workspace) = sample();
+    let before = workspace.info().unwrap();
+    let conn = workspace.connect().unwrap();
+    conn.execute_batch(
+        "CREATE TRIGGER IF NOT EXISTS count_source_rows AFTER INSERT ON records BEGIN
+             UPDATE sources SET rows = rows + 1 WHERE id = new.source_id;
+         END;
+         PRAGMA user_version = 1;",
+    )
+    .unwrap();
+    drop(conn);
+
+    let workspace = Workspace::open(workspace.path()).unwrap();
+    assert_eq!(workspace.info().unwrap(), before);
+    let mut conn = workspace.connect().unwrap();
+    let version: i64 = conn
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .unwrap();
+    assert_eq!(version, 2);
+    let legacy_trigger: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE name = 'count_source_rows')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(!legacy_trigger);
+
+    let tx = conn.transaction().unwrap();
+    let source = |name: &str| NewSource {
+        file_name: name.into(),
+        sheet: String::new(),
+        fingerprint: name.into(),
+        columns: vec![IncomingColumn {
+            name: "Message".into(),
+            role: None,
+        }],
+        fixed_currency: None,
+        fixed_weight_unit: None,
+    };
+    let first = source("first.csv");
+    let second = source("second.csv");
+    let first_id = add_source(&tx, &first).unwrap().unwrap();
+    let second_id = add_source(&tx, &second).unwrap().unwrap();
+    let mut writer = RecordWriter::new(&tx).unwrap();
+    for (id, source) in [(first_id, &first), (second_id, &second), (first_id, &first)] {
+        writer
+            .insert(id, source, None, &[Some("append".into())])
+            .unwrap();
+    }
+    writer.finish().unwrap();
+    publish(&tx).unwrap();
+    tx.commit().unwrap();
+
+    let after = workspace.info().unwrap();
+    assert_eq!(after.row_count, 8);
+    assert_eq!(
+        after
+            .sources
+            .iter()
+            .map(|source| source.rows)
+            .collect::<Vec<_>>(),
+        [5, 2, 1]
+    );
+    for (text, expected) in [("рідкісний", 2), ("append", 3)] {
+        let query = QuerySpec {
+            text: text.into(),
+            ..QuerySpec::default()
+        };
+        assert_eq!(
+            search(&workspace, &query, 0, 50).unwrap().total_rows,
+            expected
+        );
+    }
 }
 
 #[test]

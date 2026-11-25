@@ -203,6 +203,8 @@ pub fn migrate_legacy(
                 );
             }
         }
+        op.check()?;
+        writer.finish()?;
     }
     if copied != total {
         return Err(message("В старой базе изменилось число строк в снимке"));
