@@ -50,7 +50,9 @@ try {
     await mkdir(path.dirname(program));
     await copyFile(path.join(build, binary), program);
     if (system === "win32") {
-      run("tar.exe", ["-a", "-c", "-f", archive, "-C", scratch, packageName]);
+      // Git Bash can put GNU tar on PATH ahead of the Windows ZIP-capable tar.
+      const tar = path.join(process.env.SystemRoot || "C:\\Windows", "System32", "tar.exe");
+      run(tar, ["-a", "-c", "-f", archive, "-C", scratch, packageName]);
     } else {
       await chmod(program, 0o755);
       run("tar", ["-czf", archive, "-C", scratch, packageName]);
