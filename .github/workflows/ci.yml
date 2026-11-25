@@ -59,16 +59,16 @@ jobs:
       matrix:
         include:
           - os: windows-2025
-            bundle: nsis
+            build_args: --no-bundle
             asset: windows-x64
           - os: macos-15
-            bundle: dmg
+            build_args: --bundles app
             asset: macos-arm64
           - os: macos-15-intel
-            bundle: dmg
+            build_args: --bundles app
             asset: macos-x64
           - os: ubuntu-22.04
-            bundle: deb
+            build_args: --bundles deb
             asset: linux-x64
     steps:
       - uses: actions/checkout@v4
@@ -88,82 +88,71 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libwebkit2gtk-4.1-dev libssl-dev libxdo-dev \
             libayatana-appindicator3-dev librsvg2-dev xvfb xauth dbus-daemon
-      - name: Configure macOS release signing
-        if: runner.os == 'macOS' && github.ref_type == 'tag'
-        shell: bash
-        env:
-          APPLE_CERTIFICATE: ${{ secrets.MACOS_SIGNING_CERTIFICATE_BASE64 }}
-          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_SIGNING_CERTIFICATE_PASSWORD }}
-          APPLE_SIGNING_IDENTITY: ${{ secrets.MACOS_SIGNING_IDENTITY }}
-          APPLE_ID: ${{ secrets.APPLE_ID }}
-          APPLE_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-        run: |
-          set -euo pipefail
-          for name in APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD APPLE_SIGNING_IDENTITY APPLE_ID APPLE_PASSWORD APPLE_TEAM_ID; do
-            if [[ -z "${!name}" ]]; then
-              echo "Missing macOS release signing variable $name" >&2
-              exit 1
-            fi
-            delimiter=$(openssl rand -hex 24)
-            printf '%s<<%s\n%s\n%s\n' "$name" "$delimiter" "${!name}" "$delimiter" >> "$GITHUB_ENV"
-          done
       - run: npm ci
       - run: npm ci --prefix app-ui
       - name: Build desktop package
         shell: bash
-        run: npm run build -- --bundles "${{ matrix.bundle }}" --ci -- --locked
-      - name: Stage package file
+        run: npm run build -- ${{ matrix.build_args }} --ci -- --locked
+      - name: Create portable archive
         id: stage
         shell: bash
         run: |
-          file=$(node scripts/v1/stage-package.mjs "${{ matrix.asset }}")
+          file=$(node scripts/v1/stage-portable.mjs "${{ matrix.asset }}")
           printf 'file=%s\n' "$file" >> "$GITHUB_OUTPUT"
-      - name: Install and exercise Windows package
+      - name: Stage the optional Debian package
+        id: debian
+        if: runner.os == 'Linux'
+        run: |
+          file=$(node scripts/v1/stage-package.mjs linux-x64)
+          printf 'file=%s\n' "$file" >> "$GITHUB_OUTPUT"
+      - name: Unzip and exercise the Windows launcher
         if: runner.os == 'Windows'
         shell: pwsh
         env:
-          INSTALLER: ${{ steps.stage.outputs.file }}
+          ARCHIVE: ${{ steps.stage.outputs.file }}
         run: |
-          $installedPath = Join-Path $env:RUNNER_TEMP 'base-search-installed'
-          $installer = (Resolve-Path -LiteralPath $env:INSTALLER).Path
-          $install = Start-Process -FilePath $installer -ArgumentList @('/S', "/D=$installedPath") -WindowStyle Hidden -Wait -PassThru
-          if ($install.ExitCode -ne 0) { throw "Windows installation exited with $($install.ExitCode)" }
-          node scripts/v1/smoke-package.mjs (Join-Path $installedPath 'base-search.exe')
+          $folder = Join-Path $env:RUNNER_TEMP 'Base Search portable'
+          Expand-Archive -LiteralPath $env:ARCHIVE -DestinationPath $folder
+          $name = [IO.Path]::GetFileNameWithoutExtension($env:ARCHIVE)
+          node scripts/v1/smoke-package.mjs (Join-Path $folder $name 'Start Base Search.cmd')
           exit $LASTEXITCODE
-      - name: Mount and exercise macOS package
+      - name: Unzip and exercise the macOS launcher
         if: runner.os == 'macOS'
         shell: bash
         env:
-          INSTALLER: ${{ steps.stage.outputs.file }}
+          ARCHIVE: ${{ steps.stage.outputs.file }}
         run: |
-          set -euo pipefail
-          mount_dir=$(mktemp -d)
-          hdiutil attach -readonly -nobrowse -mountpoint "$mount_dir" "$INSTALLER"
-          trap 'hdiutil detach "$mount_dir"' EXIT
-          app_dir="$mount_dir/Base Search.app"
-          if [[ "$GITHUB_REF_TYPE" == tag ]]; then
-            codesign --verify --deep --strict "$app_dir"
-            xcrun stapler validate "$app_dir"
-          fi
-          node scripts/v1/smoke-package.mjs "$app_dir/Contents/MacOS/base-search"
-      - name: Install and exercise Ubuntu 22.04 package
+          folder="$RUNNER_TEMP/Base Search portable"
+          ditto -x -k "$ARCHIVE" "$folder"
+          filename=$(basename "$ARCHIVE")
+          package="$folder/${filename%.zip}"
+          codesign --verify --deep --strict "$package/Base Search.app"
+          node scripts/v1/smoke-package.mjs "$package/Start Base Search.command"
+      - name: Exercise the Ubuntu 22.04 launcher and Debian package
         if: runner.os == 'Linux'
         shell: bash
         env:
-          INSTALLER: ${{ steps.stage.outputs.file }}
+          ARCHIVE: ${{ steps.stage.outputs.file }}
+          INSTALLER: ${{ steps.debian.outputs.file }}
         run: |
+          folder="$RUNNER_TEMP/Base Search portable"
+          mkdir -p "$folder"
+          tar -xzf "$ARCHIVE" -C "$folder"
+          filename=$(basename "$ARCHIVE")
+          dbus-run-session -- xvfb-run -a node scripts/v1/smoke-package.mjs "$folder/${filename%.tar.gz}/Start Base Search.sh"
           sudo apt-get install -y "$GITHUB_WORKSPACE/$INSTALLER"
           dbus-run-session -- xvfb-run -a node scripts/v1/smoke-package.mjs "$(command -v base-search)"
       - uses: actions/upload-artifact@v4
         with:
           name: BaseSearch-${{ matrix.asset }}
-          path: ${{ steps.stage.outputs.file }}
+          path: |
+            ${{ steps.stage.outputs.file }}
+            ${{ steps.debian.outputs.file }}
           compression-level: 0
           if-no-files-found: error
 
   ubuntu-24:
-    name: Install the same package on Ubuntu 24.04
+    name: Exercise the Linux launcher on Ubuntu 24.04
     needs: packages
     runs-on: ubuntu-24.04
     steps:
@@ -175,10 +164,17 @@ jobs:
         with:
           name: BaseSearch-linux-x64
           path: release_packages
-      - run: |
+      - shell: bash
+        run: |
           sudo apt-get update
           sudo apt-get install -y xvfb xauth dbus-daemon "$GITHUB_WORKSPACE"/release_packages/*.deb
           dbus-run-session -- xvfb-run -a node scripts/v1/smoke-package.mjs "$(command -v base-search)"
+          folder="$RUNNER_TEMP/Base Search portable"
+          mkdir -p "$folder"
+          archives=(release_packages/*.tar.gz)
+          filename=$(basename "${archives[0]}")
+          tar -xzf "${archives[0]}" -C "$folder"
+          dbus-run-session -- xvfb-run -a node scripts/v1/smoke-package.mjs "$folder/${filename%.tar.gz}/Start Base Search.sh"
 
   release:
     name: Publish verified packages
@@ -201,4 +197,4 @@ jobs:
           cd release_assets
           sha256sum BaseSearch-* > SHA256SUMS.txt
           cd ..
-          gh release create "$GITHUB_REF_NAME" release_assets/* --verify-tag --generate-notes --title "Base Search $GITHUB_REF_NAME"
+          gh release create "$GITHUB_REF_NAME" release_assets/* --verify-tag --generate-notes --latest --title "Base Search $GITHUB_REF_NAME"

@@ -13,12 +13,14 @@ fn main() {
                 let _ = window.unminimize();
                 let _ = window.show();
                 let _ = window.set_focus();
+                smoke::record_process("relaunch-pid.txt");
             }
         }))
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             let state = commands::DesktopState::new(app)?;
             app.manage(state);
+            smoke::record_process("desktop-pid.txt");
             Ok(())
         })
         .on_page_load(|webview, payload| smoke::on_page_load(webview, payload.event()))

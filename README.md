@@ -4,13 +4,24 @@ Base Search хранит таблицы на вашем компьютере. Д
 
 [Українська коротка інструкція](README.uk.md)
 
-## Установка и первый запуск
+## Первый запуск
 
-1. На странице [Releases](https://github.com/IvanK577/BaseSearch/releases) выберите пакет своей системы. Проверочные пакеты ветки доступны в результатах GitHub Actions.
-2. На Windows 11 x64 запустите установщик `.exe`. На macOS 14 и новее откройте `.dmg` для Intel или Apple Silicon и перенесите Base Search в «Программы». На Ubuntu 22.04 и 24.04 x64 откройте `.deb` через менеджер пакетов.
-3. Откройте Base Search из меню приложений. Нажмите **Добавить файлы** или **Перенести базу 2.2.0**.
+1. Скачайте и полностью распакуйте архив для вашей системы. Выпуски находятся на странице [Releases](https://github.com/IvanK577/BaseSearch/releases). Проверочные архивы ветки доступны в результатах GitHub Actions.
+2. Откройте файл запуска из распакованной папки.
 
-Приложение работает в одном окне. Windows-установщик содержит автономную установку WebView2. Для открываемого обычным способом публичного пакета macOS используется Developer ID и нотарификация Apple.
+   | Система | Файл запуска |
+   |---|---|
+   | Windows 11 x64 | `Start Base Search.cmd` |
+   | macOS 14 и новее | `Start Base Search.command` в ZIP для Intel или Apple Silicon |
+   | Ubuntu 22.04 и 24.04 x64 | `Start Base Search.sh` в архиве `.tar.gz`. В терминале из этой папки выполните `./"Start Base Search.sh"`. |
+
+3. В окне программы нажмите **Добавить файлы** или **Перенести базу 2.2.0**.
+
+Запуск из архива открывает то же локальное приложение. Повторный запуск поднимает открытое окно. Рабочая база хранится в папке данных вашего профиля.
+
+Windows использует WebView2, который входит в Windows 11. На macOS может потребоваться подтверждение первого запуска **Base Search.app** в разделе **Конфиденциальность и безопасность**. Архив собирается с бесплатной локальной подписью. [WebView2](https://learn.microsoft.com/microsoft-edge/webview2/concepts/evergreen-vs-fixed-version) · [Первый запуск на macOS](https://support.apple.com/en-us/102445)
+
+На Ubuntu для запуска из архива нужны системные библиотеки `libwebkit2gtk-4.1-0` и `libgtk-3-0`. Пакет `.deb` устанавливает нужные зависимости через менеджер пакетов и добавляет приложение в меню.
 
 ## Работа с данными
 
@@ -33,7 +44,15 @@ npm ci --prefix app-ui
 npm run dev
 ```
 
-`npm run build -- --bundles nsis` собирает пакет Windows. На macOS используйте `dmg`, на Linux — `deb`. Автоматические проверки находятся в `.github/workflows/ci.yml`.
+Для создания архива соберите приложение на целевой системе и выполните `node scripts/v1/stage-portable.mjs` с идентификатором платформы из таблицы. Архив появится в `release_packages`.
+
+| Платформа | Команда сборки |
+|---|---|
+| `windows-x64` | `npm run build -- --no-bundle --ci -- --locked` |
+| `macos-arm64` или `macos-x64` | `npm run build -- --bundles app --ci -- --locked` |
+| `linux-x64` | `npm run build -- --bundles deb --ci -- --locked` |
+
+Автоматические проверки распаковывают архивы и запускают приложение через скрипты. Конфигурация находится в `.github/workflows/ci.yml`.
 
 ```sh
 npm --prefix app-ui run test:unit

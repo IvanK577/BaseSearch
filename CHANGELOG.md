@@ -4,7 +4,7 @@
 
 - Rebuilt the workspace as a Tauri desktop app with a single main window.
 - Added table preview and configurable field mapping, SQLite full-text search, query-scoped summaries, and CSV and XLSX export.
-- Added verified transfer from Base Search 2.2.0 and cross-platform installer smoke tests.
+- Added verified transfer from Base Search 2.2.0 and portable launchers tested on Windows, macOS, and Ubuntu.
 
 ## 2.2.0 - 2026-08-17
 
