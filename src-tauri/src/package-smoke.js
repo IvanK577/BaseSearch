@@ -78,7 +78,7 @@ async (directory) => {
     });
     document.querySelector("nav button[aria-label='Поиск']").click();
     const exportButton = await waitFor("export action", () => {
-      const candidate = button("Экспорт");
+      const candidate = button("Выгрузить");
       return candidate && !candidate.disabled && candidate;
     });
     exportButton.click();

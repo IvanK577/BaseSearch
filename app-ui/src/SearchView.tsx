@@ -386,7 +386,7 @@ export function SearchView({
               }}
             >
               <Download size={15} />
-              Экспорт
+              Выгрузить
             </button>
           </div>
         </header>

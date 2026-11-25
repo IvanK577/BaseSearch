@@ -74,6 +74,7 @@ export function App({ api = desktop }: { api?: Backend }) {
       last.current = info;
       setWorkspace(info);
       setError("");
+      return info;
     } catch (err) {
       if (request === sequence.current) setError(messageOf(err));
     }
@@ -87,7 +88,12 @@ export function App({ api = desktop }: { api?: Backend }) {
   const complete = useCallback(
     (job: Job) => {
       setRunning(false);
-      if (job.kind !== "export") void load();
+      if (job.kind === "export") return;
+      void load().then((info) => {
+        if (job.state !== "complete" || !job.result?.rows || !info) return;
+        setQuery((prev) => ({ ...prev, revision: info.revision }));
+        setView("search");
+      });
     },
     [load],
   );

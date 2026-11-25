@@ -186,7 +186,7 @@ describe("Рабочая область", () => {
       },
     ]);
     await waitFor(() => expect(api.workspace).toHaveBeenCalledTimes(2));
-    press("Поиск");
+    await screen.findByRole("heading", { name: "Поиск" });
     await screen.findByText("0007");
     fireEvent.change(screen.getByLabelText("Поисковый запрос"), {
       target: { value: "Север" },
@@ -221,7 +221,7 @@ describe("Рабочая область", () => {
     fireEvent.change(screen.getByLabelText("Поисковый запрос"), {
       target: { value: "другой черновик" },
     });
-    press("Экспорт");
+    press("Выгрузить");
     fireEvent.change(screen.getByLabelText("Формат файла"), {
       target: { value: "csv" },
     });
@@ -392,7 +392,7 @@ describe("Рабочая область", () => {
         workspace={{ ...imported, revision: 2 }}
       />,
     );
-    expect((btn("Экспорт") as HTMLButtonElement).disabled).toBe(true);
+    expect((btn("Выгрузить") as HTMLButtonElement).disabled).toBe(true);
     press("Повторить");
     expect(props.apply).toHaveBeenCalledWith({ ...newer, revision: 2 });
   });
@@ -462,7 +462,7 @@ describe("Рабочая область", () => {
     api.chooseExport.mockResolvedValue("/out/table.xlsx");
     render(<App api={api} />);
     await screen.findByText("0007");
-    press("Экспорт");
+    press("Выгрузить");
     press("Сохранить файл");
     expect(await screen.findByRole("alert")).toHaveProperty(
       "textContent",
