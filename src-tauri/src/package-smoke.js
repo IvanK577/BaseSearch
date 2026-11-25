@@ -53,13 +53,14 @@ async (directory) => {
       return;
     }
 
-    const input = await waitFor("search field", () => document.querySelector("input[aria-label='Поисковый запрос']"));
-    const nativeSet = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value").set;
-    nativeSet.call(input, "coffee");
-    input.dispatchEvent(new Event("input", { bubbles: true }));
-    // Give React a frame to commit the controlled field before submitting.
-    await pause(25);
-    button("Найти").click();
+    await waitFor("initial search results", () => {
+      const rows = document.querySelector("table.records tbody");
+      return rows?.textContent.includes("Coffee shipment") && rows.textContent.includes("Tea shipment");
+    });
+    const input = document.querySelector("input[aria-label='Поисковый запрос']");
+    ensure(input?.form, "Search field or form is missing");
+    input.value = "coffee";
+    input.form.requestSubmit();
     await waitFor("filtered search rows", () => {
       const rows = document.querySelector("table.records tbody");
       return rows?.textContent.includes("Coffee shipment") && !rows.textContent.includes("Tea shipment");

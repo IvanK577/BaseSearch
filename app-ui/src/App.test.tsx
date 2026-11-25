@@ -239,6 +239,28 @@ describe("Рабочая область", () => {
     );
   });
 
+  it("submits the current value in the search field even before a React change is committed", async () => {
+    const api = mockApi();
+    render(<App api={api} />);
+    await screen.findByText("0007");
+    const field = screen.getByRole<HTMLInputElement>("textbox", {
+      name: "Поисковый запрос",
+    });
+    const setValue = Object.getOwnPropertyDescriptor(
+      HTMLInputElement.prototype,
+      "value",
+    )?.set;
+    setValue?.call(field, "coffee");
+    fireEvent.submit(field.form!);
+    await waitFor(() =>
+      expect(api.search).toHaveBeenLastCalledWith(
+        expect.objectContaining({ text: "coffee" }),
+        0,
+        50,
+      ),
+    );
+  });
+
   it("preserves the source header spellings, duplicate labels and original order in the detail drawer", async () => {
     const api = mockApi();
     api.detail.mockResolvedValue({

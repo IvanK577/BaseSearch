@@ -159,7 +159,7 @@ export function SearchView({
     }
     apply({
       ...query,
-      text: draft.trim(),
+      text: (ref.current?.value ?? draft).trim(),
       filters: filters.map((f) => ({
         ...f,
         value: f.op === "empty" ? "" : f.value,
@@ -208,6 +208,7 @@ export function SearchView({
           <SearchIcon size={21} />
           <input
             ref={ref}
+            name="query"
             aria-label="Поисковый запрос"
             placeholder="Поиск по всем столбцам"
             value={draft}
