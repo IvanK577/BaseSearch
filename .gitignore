@@ -1,77 +1,56 @@
-# Rust build output
+# Local build output and package tooling
 /target/
-/target-*/
-
-/output/
-
-# Keep exactly one verified Windows bundle in the repository so GitHub's
-# generated source ZIP can be launched without a compiler. Everything else
-# under dist remains local build output. CI verifies this allowlist, the
-# manifest hashes, the binary version, and runtime-source freshness.
-/dist/*
-!/dist/BaseSearch/
-/dist/BaseSearch/*
-!/dist/BaseSearch/BaseSearch.exe
-!/dist/BaseSearch/base-search-cli.exe
-!/dist/BaseSearch/Open Base Search.cmd
-!/dist/BaseSearch/README.txt
-!/dist/BaseSearch/LICENSE
-!/dist/BaseSearch/release-manifest.json
 /release_packages/
+/output/
+node_modules/
+/app-ui/dist/
+/app-ui/coverage/
+/app-ui/*.tsbuildinfo
+/app-ui/test-results/
+/app-ui/playwright-report/
+/src-tauri/gen/
+/src-tauri/icons/android/
+/src-tauri/icons/ios/
+/src-tauri/icons/Square*.png
+/src-tauri/icons/StoreLogo.png
+/src-tauri/icons/64x64.png
+/src-tauri/icons/icon.png
 
-# Local application data and SQLite sidecar files
+# Build caches from the archived tree and tool-specific local state
+/legacy-v2/web-ui/dist/
+/legacy-v2/web-ui/test-results/
+/legacy-v2/web-ui/playwright-report/
+/BaseSearch-master/
+/.agents/
+/.claude/
+/.codex-preview/
+/.superpowers/
+/.vscode/
+/.idea/
+
+# Working data, reference inputs and exports
 /data/
+/uploads/
+/exports/
 *.db
+*.db-*
 *.sqlite
+*.sqlite-*
 *.sqlite3
+*.sqlite3-*
 *.duckdb
-*.db-wal
-*.db-shm
-*.sqlite-wal
-*.sqlite-shm
-*.sqlite3-wal
-*.sqlite3-shm
-
-# Source datasets and generated exports
-*.xlsx
-*.xls
-*.xlsb
+*.duckdb.wal
+*.bak
 *.csv
-
-# Local configuration, logs, and temporary files
-.env
-.env.*
+*.tsv
+*.xlsx
+*.xlsm
+*.xlsb
+*.xls
+*.ods
 *.log
 *.tmp
-*.temp
-
-# Public documentation policy
-*.md
-!README.md
-!README.uk.md
-!LICENSE*.md
-
-# Local planning drafts and internal audits
-/docs/
-/audit/
-
-# Browser workspace frontend: dependencies and build output are produced
-# locally by `npm install` / `npm run build`; the compiled assets are embedded
-# into the Rust binary at release build time.
-/web-ui/node_modules/
-/web-ui/dist/
-/web-ui/test-results/
-/web-ui/playwright-report/
-
-# Editor and OS files
-.claude/
-.vscode/
-.idea/
+.env
+.env.*
 .DS_Store
 Thumbs.db
-desktop.ini
-
-# Leftovers of the one-time move of the 2.0.x tree into the repository root.
-# Only build output and node_modules remain there; they are locked by a running
-# process and can be deleted once it exits.
-/BaseSearch-master/

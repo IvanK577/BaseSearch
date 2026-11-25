@@ -1,0 +1,19 @@
+[package]
+name = "base-search-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+calamine = { version = "0.35", features = ["dates"] }
+chrono = "0.4"
+csv = "1"
+rusqlite = { version = "0.40", features = ["bundled", "backup", "collation", "functions", "hooks"] }
+rust_decimal = "1"
+rust_xlsxwriter = { version = "0.95", features = ["constant_memory"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+tempfile = "3"
+thiserror = "2"

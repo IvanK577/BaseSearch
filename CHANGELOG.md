@@ -1,6 +1,10 @@
 # Changelog
 
-All notable changes to Base Search are documented in this file.
+## 1.0.0 — desktop rewrite
+
+- Rebuilt the workspace as a Tauri desktop app with a single main window.
+- Added table preview and configurable field mapping, SQLite full-text search, query-scoped summaries, and CSV and XLSX export.
+- Added verified transfer from Base Search 2.2.0 and cross-platform installer smoke tests.
 
 ## 2.2.0 - 2026-08-17
 

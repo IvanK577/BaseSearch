@@ -17,8 +17,11 @@
 
 # Package hashes are computed before commit. Keep checkout conversion from
 # changing the verified bytes, and make the binary treatment explicit.
-dist/BaseSearch/*.exe binary
-"dist/BaseSearch/Open Base Search.cmd" binary
-dist/BaseSearch/LICENSE text eol=lf
-dist/BaseSearch/README.txt text eol=lf
-dist/BaseSearch/release-manifest.json text eol=lf
+legacy-v2/dist/BaseSearch/*.exe binary
+"legacy-v2/dist/BaseSearch/Open Base Search.cmd" binary
+legacy-v2/dist/BaseSearch/LICENSE text eol=lf
+legacy-v2/dist/BaseSearch/README.txt text eol=lf
+legacy-v2/dist/BaseSearch/release-manifest.json text eol=lf
+*.yml text eol=lf
+legacy-v2 export-ignore
+legacy-v2/** export-ignore
